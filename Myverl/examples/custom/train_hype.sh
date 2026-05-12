@@ -5,36 +5,43 @@ unset ROCR_VISIBLE_DEVICES
 echo $HOME
 export RAY_DEDUP_LOGS=0
 export WANDB_MODE=offline
-train_path=$HOME/LLM/Train/data_0306/se_prompt/openr1_seprompt_split.parquet
-test_path=$HOME/LLM/Train/data/valid_with_aime25_new.parquet
-test1_path=$HOME/LLM/Train/data/split_by_source_new/aime.parquet
-test2_path=$HOME/LLM/Train/data/split_by_source_new/aime25.parquet
-test3_path=$HOME/LLM/Train/data/split_by_source/amc.parquet
-test4_path=$HOME/LLM/Train/data/split_by_source_new/olympiad_bench.parquet
+
+
+WORKER_DIR=$HOME
+MODEL_DIR=/home/shared
+# Experiment knobs.
+name="vanilla"
+off_policy_strategy="rl-sft"
+off_policy_reshape="low_sft_other_rl"
+suffix="hype3_"${off_policy_reshape}"_"${off_policy_strategy}
+
+
+# Data paths.
+train_path=$WORKER_DIR/LLM/Data/se_prompt/openr1_seprompt_split.parquet
+test_path=$WORKER_DIR/LLM/Data/valid_with_aime25_new.parquet
+test1_path=$WORKER_DIR/LLM/Data/split_by_source_new/aime.parquet
+test2_path=$WORKER_DIR/LLM/Data/split_by_source_new/aime25.parquet
+test3_path=$WORKER_DIR/LLM/Data/split_by_source/amc.parquet
+test4_path=$WORKER_DIR/LLM/Data/split_by_source_new/olympiad_bench.parquet
 train_files="['$train_path']"
 #val_files="['$test1_path', '$test2_path', '$test3_path', '$test4_path']"
 val_files="['$test3_path']"
 
-name="vanilla"
-off_policy_strategy="rl-sft"
-MODEL_DIR=/home/shared
-MODEL_PATH=$MODEL_DIR/${1:-"Qwen2.5-Math-7B-16k-think"} #Model/Qwen2.5-Math-7B-16k-think
+# Model path.
+MODEL_PATH=$MODEL_DIR/${1:-"Qwen2.5-Math-7B-16k-think"} #Model/Qwen2.5-Math-7B-16k-thinkk
 
-#MODEL_PATH=${1:-"$HOME/Model/Qwen2.5-Math-7B-16k-think"} #Model/Qwen2.5-Math-7B-16k-think
-off_policy_reshape="low_sft_other_rl"
-suffix="hype3_"${off_policy_reshape}"_"${off_policy_strategy}
 PROJECT_NAME="train_${name}_${suffix}_$(basename $MODEL_PATH)_$(basename $train_path .parquet)"
 #MODEL_PATH=$HOME/Model/Qwen2.5-Math-7B-16k-think
 #PROJECT_NAME="l_grpo_${name}_test1_$(basename $MODEL_PATH)"
 EXP_NAME="training1"
-LOG_DIR=$HOME/LLM/Train/verl/logs/${PROJECT_NAME}
+LOG_DIR=$HOME/LLM/logs/${PROJECT_NAME}
 mkdir -p ${LOG_DIR}
 LOG_PATH=${LOG_DIR}/${PROJECT_NAME}.log
 
 GPU_NUM=4
 TENSOR_PARALLEL=1
 
-DATA_DIR=$HOME/LLM/Train/data/
+#DATA_DIR=$HOME/LLM/Train/data/
 
 cd $HOME/LLM/Train/verl/
 echo "change to dir: $PWD"
