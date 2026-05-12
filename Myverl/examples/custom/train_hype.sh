@@ -13,7 +13,7 @@ MODEL_DIR=/home/shared
 name="vanilla"
 off_policy_strategy="rl-sft"
 off_policy_reshape="low_sft_other_rl"
-suffix="hype3_"${off_policy_reshape}"_"${off_policy_strategy}
+suffix="hype3_"${off_policy_strategy}"_"${off_policy_reshape}
 
 
 # Data paths.
@@ -43,7 +43,7 @@ TENSOR_PARALLEL=1
 
 #DATA_DIR=$HOME/LLM/Train/data/
 
-cd $HOME/LLM/Train/verl/
+#cd $HOME/LLM/Train/verl/
 echo "change to dir: $PWD"
 if [ -n "$1" ]; then
     shift
