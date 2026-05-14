@@ -478,16 +478,20 @@ def compute_token_on_off_sft_loss(
 
     # ---------------------------
     # 计算 off-policy token 的 loss
+    # 同时拆出 SFT 与 RL 两个分量,严格满足 off_losses = off_sft_losses + off_rl_losses,
+    # 用于后续 loss 组成统计;数学上与原实现等价,不改变最终损失数值
     # ---------------------------
+    off_sft_losses = torch.zeros_like(log_prob)
+    off_rl_losses = torch.zeros_like(log_prob)
     if off_policy_loss_type == "sft":
         if off_policy_reshape == 'vanilla':
-            off_losses = -log_prob
+            off_sft_losses = -log_prob
         elif off_policy_reshape == 'high_mask':
             high_mask = (torch.exp(log_prob) > 0.9).float()
-            off_losses = -log_prob * high_mask
+            off_sft_losses = -log_prob * high_mask
         elif off_policy_reshape == 'low_mask':
             low_mask = (torch.exp(log_prob) < 0.1).float()
-            off_losses = -log_prob * low_mask
+            off_sft_losses = -log_prob * low_mask
         elif off_policy_reshape == 'low_sft_other_rl':
             old_prob = torch.exp(old_log_prob.detach())
             tau = max(float(sft_gate_tau), 1e-6)
@@ -497,21 +501,23 @@ def compute_token_on_off_sft_loss(
             # Softly switch low-confidence off-policy tokens to SFT-style updates:
             # L_off = - (g_sft * [A]_+ + g_rl * A) * log pi_theta(y_t | x, y_<t).
             sft_advantages = torch.clamp(advantages, min=0.0)
-            off_weight = g_sft * sft_advantages + g_rl * advantages
-            off_losses = -off_weight * log_prob
+            # 显式拆成 SFT 项与 RL 项,数学上等价于 -off_weight * log_prob
+            off_sft_losses = -g_sft * sft_advantages * log_prob
+            off_rl_losses = -g_rl * advantages * log_prob
         elif off_policy_reshape == 'reweight_f':
             w = weights if weights is not None else torch.ones_like(log_prob)
-            off_losses = -log_prob * w
+            off_sft_losses = -log_prob * w
         else:
-            off_losses = -log_prob
+            off_sft_losses = -log_prob
     elif off_policy_loss_type == "rl":
         negative_approx_kl = torch.clamp(log_prob - old_log_prob, min=-20.0, max=20.0)
         ratio = torch.exp(negative_approx_kl)
-        off_losses = -advantages * ratio
+        off_rl_losses = -advantages * ratio
     elif off_policy_loss_type == "none":
-        off_losses = torch.zeros_like(log_prob)
+        pass
     else:
         raise ValueError(f"Invalid off_policy_loss_type: {off_policy_loss_type}")
+    off_losses = off_sft_losses + off_rl_losses
 
     # 先分别统计 on/off 区域损失，再按 mask 合并
     off_pg_losses = off_losses * prefix_mask * reward_mask
@@ -535,6 +541,53 @@ def compute_token_on_off_sft_loss(
 
     pg_loss = verl_F.masked_mean(pg_losses, response_mask * reward_mask)
 
+    # ============= 统计 on/off 占比 + off 内 SFT/RL 占比 =============
+    # 仅用于日志,不参与反向。使用与 pg_loss 相同的分母,
+    # 保证 on_loss_contrib + off_loss_contrib == pg_loss(数值上)
+    with torch.no_grad():
+        total_mask = response_mask * reward_mask                  # 与 pg_loss 同分母
+        if all_max_clip is not None:
+            # all_max_clip 已在上方把 p_on_mask 乘进 response_mask,这里 total_mask 自动同步
+            on_region_losses = on_losses * (1.0 - prefix_mask) * reward_mask * response_mask
+            off_region_losses = off_losses * prefix_mask * reward_mask * response_mask
+            off_sft_region_losses = off_sft_losses * prefix_mask * reward_mask * response_mask
+            off_rl_region_losses = off_rl_losses * prefix_mask * reward_mask * response_mask
+        else:
+            on_region_losses = on_losses * (1.0 - prefix_mask) * reward_mask
+            off_region_losses = off_losses * prefix_mask * reward_mask
+            off_sft_region_losses = off_sft_losses * prefix_mask * reward_mask
+            off_rl_region_losses = off_rl_losses * prefix_mask * reward_mask
+
+        denom = total_mask.sum().clamp(min=1.0)
+
+        # ---- 同分母下的"绝对贡献值",可直接相加 == pg_loss ----
+        on_loss_contrib = on_region_losses.sum() / denom
+        off_loss_contrib = off_region_losses.sum() / denom
+        off_sft_loss_contrib = off_sft_region_losses.sum() / denom
+        off_rl_loss_contrib = off_rl_region_losses.sum() / denom
+
+        # ---- 第一层: on vs off,占总 pg_loss ----
+        # 用 |pg_loss| 做分母,避免 loss 接近 0 或符号反转时占比失真
+        abs_total = pg_loss.detach().abs().clamp(min=1e-8)
+        on_loss_ratio = on_loss_contrib / abs_total
+        off_loss_ratio = off_loss_contrib / abs_total
+
+        # ---- 第二层: off 内部 SFT vs RL ----
+        abs_off = off_loss_contrib.detach().abs().clamp(min=1e-8)
+        off_sft_ratio_in_off = off_sft_loss_contrib / abs_off
+        off_rl_ratio_in_off = off_rl_loss_contrib / abs_off
+
+        # ---- 备用: SFT/RL 占总,用于跨实验对账 ----
+        off_sft_ratio_in_total = off_sft_loss_contrib / abs_total
+        off_rl_ratio_in_total = off_rl_loss_contrib / abs_total
+
+        # ---- off-policy 区域中 old_prob < sft_gate_threshold 的 token 占比 ----
+        off_region_mask = prefix_mask * total_mask               # off-policy 有效 token
+        off_token_count = off_region_mask.sum().clamp(min=1.0)
+        old_prob_for_stat = torch.exp(old_log_prob)
+        low_conf_mask = (old_prob_for_stat < sft_gate_threshold).float() * off_region_mask
+        off_low_conf_token_frac = low_conf_mask.sum() / off_token_count
+
     negative_approx_kl = torch.clamp(log_prob - old_log_prob, min=-20.0, max=20.0)
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
 
@@ -552,6 +605,22 @@ def compute_token_on_off_sft_loss(
         "ppo_kl": ppo_kl,
         "off_ratio_max_clip_frac": off_ratio_max_clip_frac,
         "off_ratio_min_clip_frac": off_ratio_min_clip_frac,
+        # ===== loss 组成分析(同分母,绝对贡献可加) =====
+        "on_loss_contrib": on_loss_contrib,
+        "off_loss_contrib": off_loss_contrib,
+        "off_sft_loss_contrib": off_sft_loss_contrib,
+        "off_rl_loss_contrib": off_rl_loss_contrib,
+        # 第一层: on/off 占总
+        "on_loss_ratio": on_loss_ratio,
+        "off_loss_ratio": off_loss_ratio,
+        # 第二层: off 内部 SFT/RL
+        "off_sft_ratio_in_off": off_sft_ratio_in_off,
+        "off_rl_ratio_in_off": off_rl_ratio_in_off,
+        # 备用: SFT/RL 占总
+        "off_sft_ratio_in_total": off_sft_ratio_in_total,
+        "off_rl_ratio_in_total": off_rl_ratio_in_total,
+        # off-policy 区域中 old_prob < sft_gate_threshold 的 token 占比
+        "off_low_conf_token_frac": off_low_conf_token_frac,
     }
 
 

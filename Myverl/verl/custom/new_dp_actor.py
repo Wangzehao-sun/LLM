@@ -393,6 +393,34 @@ class NewDataParallelPPOActor(DataParallelPPOActor):
                             metrics_data['actor/off_ratio_max_clip_frac'] = ret_dict['off_ratio_max_clip_frac'].detach().item()
                         if 'off_ratio_min_clip_frac' in ret_dict:
                             metrics_data['actor/off_ratio_min_clip_frac'] = ret_dict['off_ratio_min_clip_frac'].detach().item()
+                        # ===== loss 组成分析:on/off 占比 + off 内 SFT/RL 占比 =====
+                        # 绝对贡献(同分母,可加,数值上 on_loss_contrib + off_loss_contrib == pg_loss)
+                        if 'on_loss_contrib' in ret_dict:
+                            metrics_data['actor/on_loss_contrib'] = ret_dict['on_loss_contrib'].detach().item()
+                        if 'off_loss_contrib' in ret_dict:
+                            metrics_data['actor/off_loss_contrib'] = ret_dict['off_loss_contrib'].detach().item()
+                        if 'off_sft_loss_contrib' in ret_dict:
+                            metrics_data['actor/off_sft_loss_contrib'] = ret_dict['off_sft_loss_contrib'].detach().item()
+                        if 'off_rl_loss_contrib' in ret_dict:
+                            metrics_data['actor/off_rl_loss_contrib'] = ret_dict['off_rl_loss_contrib'].detach().item()
+                        # 第一层: on/off 占总
+                        if 'on_loss_ratio' in ret_dict:
+                            metrics_data['actor/on_loss_ratio'] = ret_dict['on_loss_ratio'].detach().item()
+                        if 'off_loss_ratio' in ret_dict:
+                            metrics_data['actor/off_loss_ratio'] = ret_dict['off_loss_ratio'].detach().item()
+                        # 第二层: off 内部 SFT/RL
+                        if 'off_sft_ratio_in_off' in ret_dict:
+                            metrics_data['actor/off_sft_ratio_in_off'] = ret_dict['off_sft_ratio_in_off'].detach().item()
+                        if 'off_rl_ratio_in_off' in ret_dict:
+                            metrics_data['actor/off_rl_ratio_in_off'] = ret_dict['off_rl_ratio_in_off'].detach().item()
+                        # 备用: SFT/RL 占总
+                        if 'off_sft_ratio_in_total' in ret_dict:
+                            metrics_data['actor/off_sft_ratio_in_total'] = ret_dict['off_sft_ratio_in_total'].detach().item()
+                        if 'off_rl_ratio_in_total' in ret_dict:
+                            metrics_data['actor/off_rl_ratio_in_total'] = ret_dict['off_rl_ratio_in_total'].detach().item()
+                        # off-policy 区域中 old_prob < sft_gate_threshold 的 token 占比
+                        if 'off_low_conf_token_frac' in ret_dict:
+                            metrics_data['actor/off_low_conf_token_frac'] = ret_dict['off_low_conf_token_frac'].detach().item()
                         append_to_dict(metrics, metrics_data)
                     else:
                         policy_loss_fn = get_policy_loss_fn(current_loss_mode)
