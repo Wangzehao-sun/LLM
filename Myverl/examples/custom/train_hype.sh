@@ -33,7 +33,7 @@ MODEL_PATH=$MODEL_DIR/${1:-"Qwen2.5-Math-7B-16k-think"} #Model/Qwen2.5-Math-7B-1
 PROJECT_NAME="train_${name}_${suffix}_$(basename $MODEL_PATH)_$(basename $train_path .parquet)"
 #MODEL_PATH=$HOME/Model/Qwen2.5-Math-7B-16k-think
 #PROJECT_NAME="l_grpo_${name}_test1_$(basename $MODEL_PATH)"
-EXP_NAME="training1"
+EXP_NAME="training_5014"
 LOG_DIR=$HOME/LLM/logs/${PROJECT_NAME}
 mkdir -p ${LOG_DIR}
 LOG_PATH=${LOG_DIR}/${PROJECT_NAME}.log
@@ -102,7 +102,7 @@ python -m verl.trainer.main_ppo_new \
     +actor_rollout_ref.actor.all_max_clip=10 \
     +actor_rollout_ref.actor.use_off_policy_probs=False \
     +actor_rollout_ref.actor.loss_remove_token_mean=True \
-    +actor_rollout_ref.actor.loss_remove_clip=True \
+    +actor_rollout_ref.actor.loss_remove_clip=False \
     actor_rollout_ref.rollout.tensor_model_parallel_size=$TENSOR_PARALLEL \
     actor_rollout_ref.rollout.max_num_batched_tokens=20480 \
     actor_rollout_ref.rollout.name=vllm \

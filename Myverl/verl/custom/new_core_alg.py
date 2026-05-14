@@ -493,17 +493,17 @@ def compute_token_on_off_sft_loss(
             low_mask = (torch.exp(log_prob) < 0.1).float()
             off_sft_losses = -log_prob * low_mask
         elif off_policy_reshape == 'low_sft_other_rl':
-            old_prob = torch.exp(old_log_prob.detach())
+            prob = torch.exp(log_prob.detach())
             tau = max(float(sft_gate_tau), 1e-6)
-            g_sft = torch.sigmoid((sft_gate_threshold - old_prob) / tau)
+            g_sft = torch.sigmoid((sft_gate_threshold - prob) / tau)
             g_rl = 1.0 - g_sft
 
             # Softly switch low-confidence off-policy tokens to SFT-style updates:
             # L_off = - (g_sft * [A]_+ + g_rl * A) * log pi_theta(y_t | x, y_<t).
             sft_advantages = torch.clamp(advantages, min=0.0)
             # 显式拆成 SFT 项与 RL 项,数学上等价于 -off_weight * log_prob
-            off_sft_losses = -g_sft * sft_advantages * log_prob
-            off_rl_losses = -g_rl * advantages * log_prob
+            off_sft_losses = -g_sft * sft_advantages * prob
+            off_rl_losses = -g_rl * advantages * prob
         elif off_policy_reshape == 'reweight_f':
             w = weights if weights is not None else torch.ones_like(log_prob)
             off_sft_losses = -log_prob * w
