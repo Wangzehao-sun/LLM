@@ -428,8 +428,8 @@ def compute_token_on_off_sft_loss(
     weights=None,
     on_policy_loss_type="rl", # "sft", "rl", "none"
     off_policy_loss_type="sft", # "sft", "none"
-    sft_gate_threshold=0.1,
-    sft_gate_tau=0.1,
+    sft_gate_threshold=0.2,
+    sft_gate_tau=0.01,
 ):
     """
     """
@@ -566,20 +566,19 @@ def compute_token_on_off_sft_loss(
         off_sft_loss_contrib = off_sft_region_losses.sum() / denom
         off_rl_loss_contrib = off_rl_region_losses.sum() / denom
 
-        # ---- 第一层: on vs off,占总 pg_loss ----
-        # 用 |pg_loss| 做分母,避免 loss 接近 0 或符号反转时占比失真
-        abs_total = pg_loss.detach().abs().clamp(min=1e-8)
-        on_loss_ratio = on_loss_contrib / abs_total
-        off_loss_ratio = off_loss_contrib / abs_total
+        # ---- 第一层: on vs off 绝对值比例,永远 ∈ [0,1] 且 sum=1 ----
+        abs_on = on_loss_contrib.abs()
+        abs_off = off_loss_contrib.abs()
+        abs_sum_on_off = (abs_on + abs_off).clamp(min=1e-8)
+        on_loss_ratio = abs_on / abs_sum_on_off
+        off_loss_ratio = abs_off / abs_sum_on_off
 
-        # ---- 第二层: off 内部 SFT vs RL ----
-        abs_off = off_loss_contrib.detach().abs().clamp(min=1e-8)
-        off_sft_ratio_in_off = off_sft_loss_contrib / abs_off
-        off_rl_ratio_in_off = off_rl_loss_contrib / abs_off
-
-        # ---- 备用: SFT/RL 占总,用于跨实验对账 ----
-        off_sft_ratio_in_total = off_sft_loss_contrib / abs_total
-        off_rl_ratio_in_total = off_rl_loss_contrib / abs_total
+        # ---- 第二层: off 内部 SFT vs RL 绝对值比例 ----
+        abs_off_sft = off_sft_loss_contrib.abs()
+        abs_off_rl = off_rl_loss_contrib.abs()
+        abs_sum_off_parts = (abs_off_sft + abs_off_rl).clamp(min=1e-8)
+        off_sft_ratio_in_off = abs_off_sft / abs_sum_off_parts
+        off_rl_ratio_in_off = abs_off_rl / abs_sum_off_parts
 
         # ---- off-policy 区域中 old_prob < sft_gate_threshold 的 token 占比 ----
         off_region_mask = prefix_mask * total_mask               # off-policy 有效 token
@@ -610,15 +609,12 @@ def compute_token_on_off_sft_loss(
         "off_loss_contrib": off_loss_contrib,
         "off_sft_loss_contrib": off_sft_loss_contrib,
         "off_rl_loss_contrib": off_rl_loss_contrib,
-        # 第一层: on/off 占总
+        # 第一层: on/off 绝对值比例 ∈ [0,1], sum=1
         "on_loss_ratio": on_loss_ratio,
         "off_loss_ratio": off_loss_ratio,
-        # 第二层: off 内部 SFT/RL
+        # 第二层: off 内部 SFT/RL 绝对值比例 ∈ [0,1], sum=1
         "off_sft_ratio_in_off": off_sft_ratio_in_off,
         "off_rl_ratio_in_off": off_rl_ratio_in_off,
-        # 备用: SFT/RL 占总
-        "off_sft_ratio_in_total": off_sft_ratio_in_total,
-        "off_rl_ratio_in_total": off_rl_ratio_in_total,
         # off-policy 区域中 old_prob < sft_gate_threshold 的 token 占比
         "off_low_conf_token_frac": off_low_conf_token_frac,
     }
