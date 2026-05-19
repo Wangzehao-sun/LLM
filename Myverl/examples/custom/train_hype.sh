@@ -70,6 +70,8 @@ python -m verl.trainer.main_ppo_new \
     +data.collect_failures=True \
     +data.failure_buffer_max_size=128 \
     +data.n_recycle_failure=3 \
+    +data.retain_hard_in_buffer=True \
+    +data.retain_accuracy_threshold=0.5\
     reward_model.reward_manager='math' \
     +se_model.enable=False \
     +actor_rollout_se.model.path=$MODEL_PATH \

@@ -958,6 +958,8 @@ class NewRayPPOTrainer(RayPPOTrainer):
         failed_questions_buffer = []
         extra_training_steps = 0
         failure_buffer_max_size = self.config.data.get('failure_buffer_max_size', 128)  # e.g., 64
+        retain_hard_in_buffer = self.config.data.get('retain_hard_in_buffer', False)
+        retain_accuracy_threshold = self.config.data.get('retain_accuracy_threshold', 0.5)
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
@@ -993,12 +995,15 @@ class NewRayPPOTrainer(RayPPOTrainer):
                              failed_batch_dict[key] = np.array([item[key] for item in failed_batch_items], dtype=object)
 
                     # Run training step on failed batch
-                    # collect_failures=False to avoid infinite recursion
+                    # collect_failures only on the last recycle step when retain_hard_in_buffer is enabled
                     n_recycle_failure = self.config.data.get('n_recycle_failure', 2)
                     print(f"Training on recycled failure batch of size {current_batch_size} for {n_recycle_failure} times")
+                    recycle_failed_items = []
                     for recycle_step in range(n_recycle_failure):
-                        is_last, val_mets, _ = self._train_step_internal(failed_batch_dict, epoch, logger_extra, progress_bar, collect_failures=False,is_failure_recycle_step=True)
-                        
+                        is_last_recycle = (recycle_step == n_recycle_failure - 1)
+                        collect_on_recycle = retain_hard_in_buffer and is_last_recycle
+                        is_last, val_mets, recycle_failed_items = self._train_step_internal(failed_batch_dict, epoch, logger_extra, progress_bar, collect_failures=collect_on_recycle,is_failure_recycle_step=True)
+
                         extra_training_steps += 1
                         print(f"Extra training steps performed: {extra_training_steps} (Recycle step {recycle_step + 1}/{n_recycle_failure})")
 
@@ -1006,6 +1011,11 @@ class NewRayPPOTrainer(RayPPOTrainer):
                             pprint(f"Final validation metrics: {val_mets}")
                             progress_bar.close()
                             return
+
+                    # After all recycle steps, retain hard questions back into buffer
+                    if retain_hard_in_buffer and recycle_failed_items:
+                        failed_questions_buffer.extend(recycle_failed_items)
+                        print(f"Retained {len(recycle_failed_items)} hard questions in buffer. Buffer size: {len(failed_questions_buffer)}")
 
                 # Normal training step
                 is_last_step, last_val_metrics, new_failed_items = self._train_step_internal(batch_dict, epoch, logger, progress_bar, collect_failures=self.config.data.get('collect_failures', False),is_failure_recycle_step=False)
@@ -1649,9 +1659,17 @@ class NewRayPPOTrainer(RayPPOTrainer):
                      # Get all rollouts for this question
                      mask = (orig_idx_np == idx_val)
                      rewards_for_q = reward_np[mask]
-                     
-                     if (rewards_for_q == fail_value).all():
-                         failed_original_indices.append(idx_val)
+
+                     if is_failure_recycle_step and self.config.data.get('retain_hard_in_buffer', False):
+                         # Recycle mode: retain questions with accuracy < threshold
+                         accuracy = (rewards_for_q == success_value).sum() / max(len(rewards_for_q), 1)
+                         retain_threshold = self.config.data.get('retain_accuracy_threshold', 0.5)
+                         if accuracy < retain_threshold:
+                             failed_original_indices.append(idx_val)
+                     else:
+                         # Normal mode: only collect when ALL rollouts failed
+                         if (rewards_for_q == fail_value).all():
+                             failed_original_indices.append(idx_val)
                 
                 # Now extract items from batch_dict
                 # batch_dict has keys like 'input_ids', etc.
