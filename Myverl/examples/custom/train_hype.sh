@@ -69,9 +69,11 @@ python -m verl.trainer.main_ppo_new \
     +data.use_se=False \
     +data.collect_failures=True \
     +data.failure_buffer_max_size=128 \
-    +data.n_recycle_failure=3 \
+    +data.n_recycle_failure=1 \
     +data.retain_hard_in_buffer=True \
-    +data.retain_accuracy_threshold=0.5\
+    +data.retain_accuracy_low=0.25 \
+    +data.retain_accuracy_high=0.75 \
+    +data.max_recycle_count=3 \
     reward_model.reward_manager='math' \
     +se_model.enable=False \
     +actor_rollout_se.model.path=$MODEL_PATH \

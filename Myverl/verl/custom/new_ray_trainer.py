@@ -959,7 +959,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
         extra_training_steps = 0
         failure_buffer_max_size = self.config.data.get('failure_buffer_max_size', 128)  # e.g., 64
         retain_hard_in_buffer = self.config.data.get('retain_hard_in_buffer', False)
-        retain_accuracy_threshold = self.config.data.get('retain_accuracy_threshold', 0.5)
+        max_recycle_count = self.config.data.get('max_recycle_count', 5)  # 超过此次数不再回收
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
@@ -1014,8 +1014,15 @@ class NewRayPPOTrainer(RayPPOTrainer):
 
                     # After all recycle steps, retain hard questions back into buffer
                     if retain_hard_in_buffer and recycle_failed_items:
-                        failed_questions_buffer.extend(recycle_failed_items)
-                        print(f"Retained {len(recycle_failed_items)} hard questions in buffer. Buffer size: {len(failed_questions_buffer)}")
+                        retained_count = 0
+                        for item in recycle_failed_items:
+                            # Increment recycle count
+                            item['_recycle_count'] = item.get('_recycle_count', 0) + 1
+                            if item['_recycle_count'] < max_recycle_count:
+                                failed_questions_buffer.append(item)
+                                retained_count += 1
+                        dropped_count = len(recycle_failed_items) - retained_count
+                        print(f"Retained {retained_count} hard questions in buffer (dropped {dropped_count} exceeding max_recycle_count={max_recycle_count}). Buffer size: {len(failed_questions_buffer)}")
 
                 # Normal training step
                 is_last_step, last_val_metrics, new_failed_items = self._train_step_internal(batch_dict, epoch, logger, progress_bar, collect_failures=self.config.data.get('collect_failures', False),is_failure_recycle_step=False)
@@ -1661,10 +1668,12 @@ class NewRayPPOTrainer(RayPPOTrainer):
                      rewards_for_q = reward_np[mask]
 
                      if is_failure_recycle_step and self.config.data.get('retain_hard_in_buffer', False):
-                         # Recycle mode: retain questions with accuracy < threshold
+                         # Recycle mode: retain questions with accuracy in (low_threshold, high_threshold)
+                         # Skip accuracy == 0 (completely unsolvable) and accuracy >= high (already learned)
                          accuracy = (rewards_for_q == success_value).sum() / max(len(rewards_for_q), 1)
-                         retain_threshold = self.config.data.get('retain_accuracy_threshold', 0.5)
-                         if accuracy < retain_threshold:
+                         retain_low_threshold = self.config.data.get('retain_accuracy_low', 0.25)
+                         retain_high_threshold = self.config.data.get('retain_accuracy_high', 0.75)
+                         if retain_low_threshold < accuracy < retain_high_threshold:
                              failed_original_indices.append(idx_val)
                      else:
                          # Normal mode: only collect when ALL rollouts failed
@@ -1678,6 +1687,8 @@ class NewRayPPOTrainer(RayPPOTrainer):
                     for f_idx in failed_original_indices:
                         item = {}
                         for k in keys_to_extract:
+                            if k == '_recycle_count':
+                                continue  # handled separately below
                             val = batch_dict[k]
                             # Handle tensor/list indexing
                             if isinstance(val, (torch.Tensor, np.ndarray, list)):
@@ -1689,6 +1700,11 @@ class NewRayPPOTrainer(RayPPOTrainer):
                                     item[k] = v
                                 except IndexError:
                                     pass # Should not happen if indices are correct
+                        # Inherit or initialize recycle count
+                        if '_recycle_count' in batch_dict:
+                            item['_recycle_count'] = int(batch_dict['_recycle_count'][f_idx])
+                        else:
+                            item['_recycle_count'] = 0
                         failed_items.append(item)
             # --------------------------------------------------------------------------------
             # END: Collect Failed Questions Logic

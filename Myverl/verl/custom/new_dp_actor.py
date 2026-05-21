@@ -409,10 +409,13 @@ class NewDataParallelPPOActor(DataParallelPPOActor):
                         if 'off_loss_ratio' in ret_dict:
                             metrics_data['actor/off_loss_ratio'] = ret_dict['off_loss_ratio'].detach().item()
                         # 第二层: off 内部 SFT/RL 绝对值比例 ∈ [0,1], sum=1
-                        if 'off_sft_ratio_in_off' in ret_dict:
-                            metrics_data['actor/off_sft_ratio_in_off'] = ret_dict['off_sft_ratio_in_off'].detach().item()
-                        if 'off_rl_ratio_in_off' in ret_dict:
-                            metrics_data['actor/off_rl_ratio_in_off'] = ret_dict['off_rl_ratio_in_off'].detach().item()
+                        # 仅在 off 区域有有效 loss 时记录,避免空 batch 的 0/0 拉低均值
+                        off_has_loss = ret_dict.get('off_has_loss', torch.tensor(True))
+                        if off_has_loss.item():
+                            if 'off_sft_ratio_in_off' in ret_dict:
+                                metrics_data['actor/off_sft_ratio_in_off'] = ret_dict['off_sft_ratio_in_off'].detach().item()
+                            if 'off_rl_ratio_in_off' in ret_dict:
+                                metrics_data['actor/off_rl_ratio_in_off'] = ret_dict['off_rl_ratio_in_off'].detach().item()
                         # off-policy 区域中 old_prob < sft_gate_threshold 的 token 占比
                         if 'off_low_conf_token_frac' in ret_dict:
                             metrics_data['actor/off_low_conf_token_frac'] = ret_dict['off_low_conf_token_frac'].detach().item()

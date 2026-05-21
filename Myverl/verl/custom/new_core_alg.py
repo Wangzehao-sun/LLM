@@ -507,6 +507,10 @@ def compute_token_on_off_sft_loss(
         elif off_policy_reshape == 'reweight_f':
             w = weights if weights is not None else torch.ones_like(log_prob)
             off_sft_losses = -log_prob * w
+        elif off_policy_reshape == 'sft_clip_adv':
+            # SFT loss weighted by clipped advantage: -log_prob * [A]_+
+            clipped_adv = torch.clamp(advantages, min=0.0)
+            off_sft_losses = -log_prob * clipped_adv
         else:
             off_sft_losses = -log_prob
     elif off_policy_loss_type == "rl":
@@ -576,9 +580,12 @@ def compute_token_on_off_sft_loss(
         # ---- 第二层: off 内部 SFT vs RL 绝对值比例 ----
         abs_off_sft = off_sft_loss_contrib.abs()
         abs_off_rl = off_rl_loss_contrib.abs()
-        abs_sum_off_parts = (abs_off_sft + abs_off_rl).clamp(min=1e-8)
-        off_sft_ratio_in_off = abs_off_sft / abs_sum_off_parts
-        off_rl_ratio_in_off = abs_off_rl / abs_sum_off_parts
+        abs_sum_off_parts = abs_off_sft + abs_off_rl
+        # 当 off 区域为空(两者均为0)时,标记为无效,不参与日志均值
+        off_has_loss = (abs_sum_off_parts > 1e-8)
+        abs_sum_off_parts_safe = abs_sum_off_parts.clamp(min=1e-8)
+        off_sft_ratio_in_off = abs_off_sft / abs_sum_off_parts_safe
+        off_rl_ratio_in_off = abs_off_rl / abs_sum_off_parts_safe
 
         # ---- off-policy 区域中 old_prob < sft_gate_threshold 的 token 占比 ----
         off_region_mask = prefix_mask * total_mask               # off-policy 有效 token
@@ -615,6 +622,8 @@ def compute_token_on_off_sft_loss(
         # 第二层: off 内部 SFT/RL 绝对值比例 ∈ [0,1], sum=1
         "off_sft_ratio_in_off": off_sft_ratio_in_off,
         "off_rl_ratio_in_off": off_rl_ratio_in_off,
+        # off 区域是否有有效 loss(为 False 时 ratio 无意义,不应记录)
+        "off_has_loss": off_has_loss,
         # off-policy 区域中 old_prob < sft_gate_threshold 的 token 占比
         "off_low_conf_token_frac": off_low_conf_token_frac,
     }
