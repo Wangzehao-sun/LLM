@@ -964,65 +964,65 @@ class NewRayPPOTrainer(RayPPOTrainer):
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 
-                # Check if buffer is full enough to trigger a training step with failed samples
+                # Check if buffer is full enough to trigger training on failed samples
                 if len(failed_questions_buffer) >= failure_buffer_max_size:
                     print(f"Failed questions buffer reached {len(failed_questions_buffer)} items. Training on failed samples...")
-                    
-                    # Prepare batch from buffer
-                    # We only consume chunks of size close to batch size (e.g. 16 or original batch size)
-                    current_batch_size = min(len(failed_questions_buffer), len(batch_dict['input_ids'])) 
-                    
-                    failed_batch_items = failed_questions_buffer[:current_batch_size]
-                    failed_questions_buffer = failed_questions_buffer[current_batch_size:]
-                    
-                    # Collate failed_batch_items into a single batch_dict
-                    failed_batch_dict = {}
-                    first_item = failed_batch_items[0]
-                    for key in first_item.keys():
-                        if isinstance(first_item[key], (torch.Tensor, np.ndarray, list)):
-                            # Stack them
-                            gathered = [item[key] for item in failed_batch_items]
-                            if isinstance(first_item[key], torch.Tensor):
-                                failed_batch_dict[key] = torch.stack(gathered).to(batch_dict['input_ids'].device) # Ensure device matches
-                            elif isinstance(first_item[key], np.ndarray):
-                                failed_batch_dict[key] = np.stack(gathered)
-                            else:
-                                # For list types, creating a numpy array might fail if elements are not uniform (inhomogeneous shape)
-                                # We treat them as object array (similar to how DataProto handles non-tensor data)
-                                failed_batch_dict[key] = np.array(gathered, dtype=object)
-                        else:
-                             # For other types, assume consistent properties and list them
-                             failed_batch_dict[key] = np.array([item[key] for item in failed_batch_items], dtype=object)
 
-                    # Run training step on failed batch
-                    # collect_failures only on the last recycle step when retain_hard_in_buffer is enabled
                     n_recycle_failure = self.config.data.get('n_recycle_failure', 2)
-                    print(f"Training on recycled failure batch of size {current_batch_size} for {n_recycle_failure} times")
-                    recycle_failed_items = []
-                    for recycle_step in range(n_recycle_failure):
-                        is_last_recycle = (recycle_step == n_recycle_failure - 1)
-                        collect_on_recycle = retain_hard_in_buffer and is_last_recycle
-                        is_last, val_mets, recycle_failed_items = self._train_step_internal(failed_batch_dict, epoch, logger_extra, progress_bar, collect_failures=collect_on_recycle,is_failure_recycle_step=True)
+                    train_batch_size = len(batch_dict['input_ids'])  # use normal batch size as chunk size
+                    buffer_round = 0
 
-                        extra_training_steps += 1
-                        print(f"Extra training steps performed: {extra_training_steps} (Recycle step {recycle_step + 1}/{n_recycle_failure})")
+                    # Loop through the buffer, consuming one batch at a time
+                    while len(failed_questions_buffer) >= train_batch_size:
+                        buffer_round += 1
+                        current_batch_size = train_batch_size
 
-                        if is_last:
-                            pprint(f"Final validation metrics: {val_mets}")
-                            progress_bar.close()
-                            return
+                        failed_batch_items = failed_questions_buffer[:current_batch_size]
+                        failed_questions_buffer = failed_questions_buffer[current_batch_size:]
 
-                    # After all recycle steps, retain hard questions back into buffer
-                    if retain_hard_in_buffer and recycle_failed_items:
-                        retained_count = 0
-                        for item in recycle_failed_items:
-                            # Increment recycle count
-                            item['_recycle_count'] = item.get('_recycle_count', 0) + 1
-                            if item['_recycle_count'] < max_recycle_count:
-                                failed_questions_buffer.append(item)
-                                retained_count += 1
-                        dropped_count = len(recycle_failed_items) - retained_count
-                        print(f"Retained {retained_count} hard questions in buffer (dropped {dropped_count} exceeding max_recycle_count={max_recycle_count}). Buffer size: {len(failed_questions_buffer)}")
+                        # Collate failed_batch_items into a single batch_dict
+                        failed_batch_dict = {}
+                        first_item = failed_batch_items[0]
+                        for key in first_item.keys():
+                            if isinstance(first_item[key], (torch.Tensor, np.ndarray, list)):
+                                gathered = [item[key] for item in failed_batch_items]
+                                if isinstance(first_item[key], torch.Tensor):
+                                    failed_batch_dict[key] = torch.stack(gathered).to(batch_dict['input_ids'].device)
+                                elif isinstance(first_item[key], np.ndarray):
+                                    failed_batch_dict[key] = np.stack(gathered)
+                                else:
+                                    failed_batch_dict[key] = np.array(gathered, dtype=object)
+                            else:
+                                failed_batch_dict[key] = np.array([item[key] for item in failed_batch_items], dtype=object)
+
+                        # Train on this chunk for n_recycle_failure times
+                        print(f"Buffer round {buffer_round}: training on batch of size {current_batch_size} for {n_recycle_failure} times (remaining buffer: {len(failed_questions_buffer)})")
+                        recycle_failed_items = []
+                        for recycle_step in range(n_recycle_failure):
+                            is_last_recycle = (recycle_step == n_recycle_failure - 1)
+                            collect_on_recycle = retain_hard_in_buffer and is_last_recycle
+                            is_last, val_mets, recycle_failed_items = self._train_step_internal(failed_batch_dict, epoch, logger_extra, progress_bar, collect_failures=collect_on_recycle,is_failure_recycle_step=True)
+
+                            extra_training_steps += 1
+                            print(f"Extra training steps performed: {extra_training_steps} (Round {buffer_round}, recycle step {recycle_step + 1}/{n_recycle_failure})")
+
+                            if is_last:
+                                pprint(f"Final validation metrics: {val_mets}")
+                                progress_bar.close()
+                                return
+
+                        # After all recycle steps for this chunk, retain hard questions back into buffer
+                        if retain_hard_in_buffer and recycle_failed_items:
+                            retained_count = 0
+                            for item in recycle_failed_items:
+                                item['_recycle_count'] = item.get('_recycle_count', 0) + 1
+                                if item['_recycle_count'] < max_recycle_count:
+                                    failed_questions_buffer.append(item)
+                                    retained_count += 1
+                            dropped_count = len(recycle_failed_items) - retained_count
+                            print(f"Round {buffer_round}: retained {retained_count} hard questions (dropped {dropped_count} exceeding max_recycle_count={max_recycle_count}). Buffer size: {len(failed_questions_buffer)}")
+
+                    print(f"Buffer training complete. {buffer_round} rounds processed. Remaining buffer: {len(failed_questions_buffer)}")
 
                 # Normal training step
                 is_last_step, last_val_metrics, new_failed_items = self._train_step_internal(batch_dict, epoch, logger, progress_bar, collect_failures=self.config.data.get('collect_failures', False),is_failure_recycle_step=False)
