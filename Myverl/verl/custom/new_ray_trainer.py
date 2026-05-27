@@ -1198,8 +1198,9 @@ class NewRayPPOTrainer(RayPPOTrainer):
                      })
                      
                      # Determine prefix_lens for this step if token_split_points is available
+                     # step_i == 0 always uses ratio=0 (pure on-policy, no prefix)
                      current_prefix_lens = None
-                     if token_split_points is not None and step_i < n_repeat - 1:
+                     if token_split_points is not None and step_i > 0 and step_i < n_repeat - 1:
                          current_prefix_lens = []
                          for b_i in range(train_batch_size):
                              points = token_split_points[b_i]
