@@ -9,7 +9,42 @@
 
 ## Data 目录
 
-`Data/` 主要用于把原始 parquet 数据加工成训练所需格式。
+`Data/` 主要用于把原始 parquet 数据加工成训练所需格式。整体流水线大致为：
+**下载 → 过滤/采样 → prompt 重写 / SE 模板 → 加 token split points**。
+
+### `Data/prepare_deepmath.py`
+
+从 HuggingFace 下载 `zwhe99/DeepMath-103K`（约 103K 条数学题，每题带 3 条 DeepSeek-R1 推理路径），并整理成与 `openr1.parquet` **完全一致**的 parquet schema：
+
+- `data_source` = `"DeepMath-103K"`
+- `prompt` = system + user 双轮，system 使用与 openr1 相同的 R1 风格指令
+- `target` = 从 `r1_solution_1/2/3` 中**随机抽取一条**（`SEED=42`），保证一行一个 target
+- `reward_model` = `{ground_truth: final_answer, style: 'rule'}`
+- `extra_info` 在 `index/split` 之外额外保留 `topic` 与 `difficulty`，便于下游过滤
+
+默认输出路径为 `/Users/zenohaoz/LLM/Data/deepmath.parquet`（约 720MB，103,022 行）。
+
+### `Data/filter_deepmath.py`
+
+按 `extra_info.difficulty` 阈值过滤 `deepmath.parquet`，并随机采样指定数量的样本。输出 schema 与输入完全一致，只是行数变少。
+
+关键参数：
+
+- `--min-difficulty`：难度阈值，默认 `6.0`。
+- `--inclusive`：使用 `>=` 而非严格 `>`。
+- `--num-samples`：采样数量，默认 `10000`。
+- `--seed`：随机种子，默认 `42`。
+- `--output`：未指定时按 `deepmath_d{gt|ge}{thr}_n{N}.parquet` 命名输出文件。
+
+示例：
+
+```bash
+# d>6 随机采 10k 条，写入 deepmath_dgt6_n10000.parquet
+python Data/filter_deepmath.py
+
+# d>=7 随机采 1k 条
+python Data/filter_deepmath.py --inclusive --min-difficulty 7 --num-samples 1000
+```
 
 ### `Data/prompt_rewrite.py`
 
@@ -18,17 +53,33 @@
 - system：默认 `"You are a helpful assistant."`
 - user：可选 `rewrite_problem_only` 或 `qa_style`
 
-如果未开启 `--thinking_mode`，脚本还会从 `target` 中提取 `<think>...</think>` 内部的推理过程，只保留 thinking 内容作为新的 target。常用于构造“只学习推理过程”的数据。
+target 改写支持 **三种模式**，通过 `--target_mode` 选择：
+
+| 模式 | 含义 |
+|------|------|
+| `think_only`（默认） | 只保留 `<think>...</think>` 之间的推理过程，去掉最终解答 |
+| `full` | 保留完整 target（推理 + 解答），不做修改 |
+| `solution_only` | 只保留 `</think>` 之后的最终解答，去掉推理过程 |
+
+旧的 `--thinking_mode` 标志保留为 deprecated alias，等价于 `--target_mode full`，旧脚本无需修改。
 
 示例：
 
 ```bash
+# 只学习推理过程
 python Data/prompt_rewrite.py \
   --input_file input.parquet \
-  --output_file output.parquet \
+  --output_file output_thinkonly.parquet \
   --prompt_key rewrite_problem_only \
+  --target_mode think_only \
   --backup_old_prompt \
   --backup_old_target
+
+# 只学习最终解答（蒸馏 no-think 模型常用）
+python Data/prompt_rewrite.py \
+  --input_file input.parquet \
+  --output_file output_solonly.parquet \
+  --target_mode solution_only
 ```
 
 ### `Data/se_template.py`
@@ -44,7 +95,7 @@ python Data/prompt_rewrite.py \
 
 ### `Data/add_token_split_points.py`
 
-用于为每条样本新增 `token_split_points` 字段。脚本会读取 `target` 或兼容字段中的 thinking 内容，按段落累计长度计算多个阶段的 token 切分点。
+用于为每条样本新增 `token_split_points` 字段。脚本会读取 `target` 或兼容字段中的 thinking 内容，按段落或句子累计长度计算多个阶段的 token 切分点。
 
 关键参数：
 
@@ -52,6 +103,15 @@ python Data/prompt_rewrite.py \
 - `--curve-power`：控制切分比例曲线，`1.0` 为线性，大于 `1` 时更偏向后段。
 - `--tokenizer-path`：用于计算 token 数的 HuggingFace tokenizer。
 - `--workers`：多进程处理 worker 数。
+- `--split-unit`：切分粒度，`sentence`（默认）按句子切分，`paragraph` 沿用旧的 `\n\n` 段落切分。
+
+**句子切分** 的实现细节：
+- 触发点为 `.`/`!`/`?` 后接空白，并允许 `)"'\]` 等闭合符号；
+- LaTeX 数学区（`$...$`、`$$...$$`、`\(...\)`、`\[...\]`）内部的 `.!?` 会被屏蔽，不会触发切分；
+- 显式数学块（如 `\[a = 1.\]`）后接空白 + 大写字母时会作为额外的句尾边界，避免“句号被埋在数学里”导致切分丢失；
+- `\n\n+` 段落分隔仍然算作句尾，保证列表/displayed equation 不会和正文粘在一起。
+
+在 DeepMath / OpenR1 风格的 R1 推理文本上，句子切分通常比段落切分多产生 ~4–5 倍的边界，得到的阶段长度更均匀，更适合 prefix / 阶段监督式训练。
 
 该字段用于训练时按推理进度构造 prefix、阶段监督或 off-policy 数据。
 

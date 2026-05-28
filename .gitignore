@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Data artefacts (large parquet files; regenerable from scripts)
+Data/*.parquet
+Data/tmp.md
+
+# Misc
+*.log

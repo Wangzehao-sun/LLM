@@ -68,11 +68,30 @@ def parse_args():
         help="Store original target in field old_target.",
     )
     parser.add_argument(
+        "--target_mode",
+        type=str,
+        default="think_only",
+        choices=["think_only", "full", "solution_only"],
+        help=(
+            "How to rewrite target[0].content:\n"
+            "  think_only   - keep only content INSIDE <think>...</think> (default)\n"
+            "  full         - keep target unchanged\n"
+            "  solution_only- keep only content OUTSIDE <think>...</think> "
+            "(everything after </think>)"
+        ),
+    )
+    parser.add_argument(
         "--thinking_mode",
         action="store_true",
-        help="If set, keep target unchanged. If not set, keep only content inside <think>...</think> in target.",
+        help="DEPRECATED alias for --target_mode full. Kept for backward compatibility.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    # Backward-compat: --thinking_mode overrides --target_mode to "full".
+    if args.thinking_mode:
+        args.target_mode = "full"
+
+    return args
 
 
 def _extract_problem_from_prompt(prompt):
@@ -88,7 +107,42 @@ def _extract_problem_from_prompt(prompt):
         return None
 
 
-def _target_keep_think_only(target):
+def _split_target_content(content: str):
+    """Split a target content string into (think, solution).
+
+    The expected format is ``<think>{think}</think>\n\n{solution}`` (with the
+    opening tag optional). When ``</think>`` is missing we fall back to
+    treating the whole string as the think portion with an empty solution,
+    which keeps callers safe regardless of input shape.
+    """
+    if not isinstance(content, str):
+        return "", ""
+
+    if "</think>" in content:
+        parts = content.split("</think>", 1)
+        think = parts[0]
+        solution = parts[1] if len(parts) > 1 else ""
+    else:
+        think = content
+        solution = ""
+
+    if "<think>" in think:
+        think = think.replace("<think>", "")
+
+    return think.strip(), solution.strip()
+
+
+def _rewrite_target_content(target, mode: str):
+    """Apply the requested ``target_mode`` transformation to target[0].content.
+
+    ``mode`` is one of:
+      * ``full``          - return target unchanged
+      * ``think_only``    - keep only the reasoning between <think>...</think>
+      * ``solution_only`` - keep only the solution after </think>
+    """
+    if mode == "full":
+        return target
+
     if isinstance(target, np.ndarray):
         target = target.tolist()
 
@@ -102,30 +156,18 @@ def _target_keep_think_only(target):
     content = first_item.get("content")
     if not isinstance(content, str):
         return target
-    if "</think>" in content:
-            parts = content.split("</think>")
-            think_content = parts[0].strip()
-            # If standard answer exists (len > 1), use it, otherwise empty string or handle gracefully
-            if len(parts) > 1:
-                standard_answer = parts[1].strip()
-            else:
-                standard_answer = ""
-                
-            if "<think>" in think_content:
-                think_content = think_content.replace("<think>", "").strip()
-    # start_tag = "<think>"
-    # end_tag = "</think>"
-    # start = content.find(start_tag)
-    # end = content.find(end_tag)
 
-    # if start != -1 and end != -1 and end >= start + len(start_tag):
-    #     think_content = content[start + len(start_tag):end].strip()
-    # else:
-    #     # Fallback for malformed samples: keep original text to avoid data loss.
-    #     think_content = content.strip()
+    think, solution = _split_target_content(content)
+
+    if mode == "think_only":
+        new_content = think
+    elif mode == "solution_only":
+        new_content = solution
+    else:
+        raise ValueError(f"Unknown target_mode: {mode!r}")
 
     new_target = deepcopy(target)
-    new_target[0]["content"] = think_content
+    new_target[0]["content"] = new_content
     return np.array(new_target)
 
 
@@ -135,7 +177,7 @@ def process_data(
     system_prompt,
     backup_old_prompt=False,
     backup_old_target=False,
-    thinking_mode=False,
+    target_mode="think_only",
 ):
     processed = []
 
@@ -164,8 +206,7 @@ def process_data(
             item["old_target"] = deepcopy(item.get("target"))
 
         item["prompt"] = np.array(new_prompt)
-        if not thinking_mode:
-            item["target"] = _target_keep_think_only(item.get("target"))
+        item["target"] = _rewrite_target_content(item.get("target"), target_mode)
 
         processed.append(item)
 
@@ -188,7 +229,7 @@ def main():
 
     print(f"Using prompt key: {args.prompt_key}")
     print(f"Using system key: {args.system_key}")
-    print(f"Thinking mode: {args.thinking_mode}")
+    print(f"Target mode: {args.target_mode}")
     print(f"Processing {len(dataset)} items...")
 
     processed_data = process_data(
@@ -197,7 +238,7 @@ def main():
         selected_system_prompt,
         backup_old_prompt=args.backup_old_prompt,
         backup_old_target=args.backup_old_target,
-        thinking_mode=args.thinking_mode,
+        target_mode=args.target_mode,
     )
     #打印一条数据样例
     
