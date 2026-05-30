@@ -30,6 +30,7 @@ from tqdm import tqdm
 # ---------------------------------------------------------------------------
 
 OUTPUT_PATH = Path("/Users/zenohaoz/LLM/Data/deepmath.parquet")
+LOCAL_PATH = Path.home() / "LLM" / "DeepMath-103K"  # if exists, load from here
 DATASET_NAME = "zwhe99/DeepMath-103K"
 SPLIT = "train"
 SEED = 42
@@ -136,8 +137,14 @@ def convert_row(row: dict, rng: random.Random) -> dict:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    print(f"Loading {DATASET_NAME} (split={SPLIT}) from Hugging Face Hub...")
-    dataset = load_dataset(DATASET_NAME, split=SPLIT)
+    local_files = sorted((LOCAL_PATH / "data").glob("*.parquet")) if (LOCAL_PATH / "data").is_dir() \
+        else sorted(LOCAL_PATH.glob("*.parquet")) if LOCAL_PATH.is_dir() else []
+    if local_files:
+        print(f"Loading {len(local_files)} local parquet file(s) from {LOCAL_PATH}")
+        dataset = load_dataset("parquet", data_files=[str(f) for f in local_files], split="train")
+    else:
+        print(f"Loading {DATASET_NAME} (split={SPLIT}) from Hugging Face Hub...")
+        dataset = load_dataset(DATASET_NAME, split=SPLIT)
     print(f"  -> {len(dataset):,} rows; columns: {dataset.column_names}")
 
     rng = random.Random(SEED)
