@@ -10,7 +10,7 @@
 ## Data 目录
 
 `Data/` 主要用于把原始 parquet 数据加工成训练所需格式。整体流水线大致为：
-**下载 → 过滤/采样 → prompt 重写 / SE 模板 → 加 token split points**。
+**下载 → 难度过滤/采样 → 推理筛 hard set → prompt 重写 / SE 模板 → 加 token split points**。
 
 ### `Data/prepare_deepmath.py`
 
@@ -23,6 +23,8 @@
 - `extra_info` 在 `index/split` 之外额外保留 `topic` 与 `difficulty`，便于下游过滤
 
 默认输出路径为 `/Users/zenohaoz/LLM/Data/deepmath.parquet`（约 720MB，103,022 行）。
+
+如果本地已经 git-clone 过 HF 数据集到 `~/LLM/DeepMath-103K`（含 `data/*.parquet`），脚本会自动跳过 HF Hub 下载、直接从本地加载；否则才走联网下载。
 
 ### `Data/filter_deepmath.py`
 
@@ -44,6 +46,36 @@ python Data/filter_deepmath.py
 
 # d>=7 随机采 1k 条
 python Data/filter_deepmath.py --inclusive --min-difficulty 7 --num-samples 1000
+```
+
+### `Data/filter_by_accuracy.py`
+
+读取 `verl.trainer.main_generation` 输出目录里的 per-batch parquet（`0.parquet`, `1.parquet`, …），合并后按 `test_score.mean_score`（默认）或 `max_score` 过滤，**丢弃模型已经会做的 instance**，留下 hard set 给下一轮训练。
+
+前置条件：generation 必须以 `is_eval=True` 运行（这样 `test_score` 才会写入），见 `Myverl/examples/custom/generation_deepmath.sh`。每行的 `test_score` 形如：
+
+```python
+{
+  "scores_per_response": [s_1, ..., s_n],  # n_samples 个 0/1 分数
+  "mean_score": float,                     # 准确率
+  "max_score":  float,                     # 至少答对一次?
+}
+```
+
+关键参数：
+
+- `--input-dir`：generation 输出目录（保存 batch parquet 的位置）。
+- `--output`：合并 + 过滤后的单个 parquet 路径。
+- `--threshold`：保留 `metric <= threshold` 的样本，默认 `0.5`。
+- `--metric`：`mean_score`（默认）或 `max_score`。
+- `--drop-test-score`：输出时去掉 `test_score` 字段，文件更小。
+
+示例：
+
+```bash
+python Data/filter_by_accuracy.py \
+  --input-dir $HOME/LLM/Train/verl/logs/eval_Qwen2.5-Math-7B-16k-think_deepmath_dgt6_n10000/save_data \
+  --output    $HOME/LLM/Data/deepmath_hard.parquet
 ```
 
 ### `Data/prompt_rewrite.py`
@@ -265,6 +297,28 @@ $HOME/LLM/Train/data_0306/openr1_prompt_rewritten_nothinking.parquet
 bash Myverl/examples/custom/train_luffy.sh Qwen2.5-Math-7B-16k-think \
   data.train_batch_size=64 \
   trainer.test_freq=10
+```
+
+### `Myverl/examples/custom/generation_deepmath.sh`
+
+由 `generation.sh` 派生，用于在 DeepMath 子集上跑 vLLM 批量生成 + 在线打分（`is_eval=True`），输出 per-batch parquet 到 `$HOME/LLM/Train/verl/logs/<PROJECT_NAME>/save_data/`。每行带 `test_score = {scores_per_response, mean_score, max_score}`，可直接喂给 `Data/filter_by_accuracy.py` 提取 hard set。
+
+主要差异（相对 `generation.sh`）：
+
+- 默认 `data_path=$HOME/LLM/Data/deepmath_dgt6_n10000.parquet`；可用环境变量 `DATA_PATH=...` 覆盖。
+- `N_SAMPLES`、`MAX_STEPS` 改为环境变量可调（默认 128 / 100）。
+- 模型、reward 版本（`reward_impl_version=4`，no-think math-verify）、采样温度等保持与 `generation.sh` 一致。
+
+示例：
+
+```bash
+# 默认 10k DeepMath 子集，128 个采样
+bash Myverl/examples/custom/generation_deepmath.sh Qwen2.5-Math-7B-16k-think
+
+# 换数据源 + 减少采样数
+DATA_PATH=$HOME/LLM/Data/deepmath_dgt6_n1000.parquet \
+N_SAMPLES=32 \
+bash Myverl/examples/custom/generation_deepmath.sh Qwen2.5-Math-7B-16k-think
 ```
 
 ### 辅助文件
