@@ -46,7 +46,7 @@ def parse_args():
     parser.add_argument(
         "--prompt_key",
         type=str,
-        default="rewrite_problem_only",
+        default="qa_style",
         choices=USER_PROMPTS.keys(),
         help="User prompt template key.",
     )
