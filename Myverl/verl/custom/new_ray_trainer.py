@@ -705,8 +705,13 @@ class NewRayPPOTrainer(RayPPOTrainer):
         for i in range(off_len):
             if mode == "summarize":
                 # response = 仅 model 自己生成的部分（不 concat teacher prefix）
-                # prefix_mask[i] 保持全 0 → loss 公式自动走 on-policy 分支
+                # explain-style: prefix_mask 在有效 response token 上全 1，让 loss 走
+                # off-policy 公式；上层会注入 target_probs = exp(actor_under_long_prompt)，
+                # 这样 off_ratio = exp(log_prob) / target_probs 自然就是 IS ratio
+                # = exp(actor_under_short - actor_under_long) 的 prompt-shift 修正项。
                 final_responses.append(torch.tensor(off_responses_list[i], dtype=dtype))
+                response_len = min(len(off_responses_list[i]), max_response_len)
+                prefix_mask[i, :response_len] = 1
             else:
                 # 'concat' —— 现有 prefix 续写逻辑
                 # If it is the last element in the group, only use the prefix
@@ -1355,6 +1360,20 @@ class NewRayPPOTrainer(RayPPOTrainer):
                      # explain-style: summarize 模式下传 mode='summarize' + 原始短 prompt 作为 loss_prompts，
                      # 让 actor forward 在原始 prompt 下重新算 log_prob（rollout 用的是长 summarize prompt）。
                      if loss_prompts_for_summarize is not None:
+                         # explain-style: 在 build 替换 prompt 之前，先用此时 gen_batch_output
+                         # 的 input_ids（= [长 summarize prompt, response]）算一份 actor log_prob。
+                         # exp 后作为 target_probs 注入，让 off-policy 公式
+                         # off_ratio = exp(log_prob) / target_probs
+                         # 自动等价于 IS ratio = exp(actor_under_short - actor_under_long)。
+                         # 这就是 explain-style 的 prompt-shift 修正项。
+                         with marked_timer("summarize_target_log_prob", timing_raw, color="blue"):
+                             _tmp = self.actor_rollout_wg.compute_log_prob(gen_batch_output)
+                             summarize_long_log_prob = _tmp.batch.pop('old_log_probs')
+                             # compute_log_prob 副产物 entropys 不需要，丢掉
+                             if 'entropys' in _tmp.batch.keys():
+                                 _tmp.batch.pop('entropys')
+                             del _tmp
+
                          gen_batch_output = self._build_hybrid_off_policy_output(
                              n_divide=self.config.actor_rollout_ref.rollout.n_prefix,
                              n_repeat=self.config.actor_rollout_ref.rollout.n_prefix,
@@ -1365,6 +1384,12 @@ class NewRayPPOTrainer(RayPPOTrainer):
                              mode="summarize",
                              loss_prompts=loss_prompts_for_summarize,
                          )
+                         # target_probs.shape 必须等于 log_prob.shape == [B*K, response_length]
+                         # summarize_long_log_prob 来自 compute_log_prob 返回，shape 已经一致。
+                         gen_batch_output.batch['target_probs'] = torch.exp(summarize_long_log_prob)
+                         # 同时存一份 off_old_log_probs 给下游 metrics / ESS 路径使用
+                         # （SE 流程也是这么用的，避免 actor 再次 forward）
+                         gen_batch_output.batch['off_old_log_probs'] = summarize_long_log_prob
                      else:
                          gen_batch_output = self._build_hybrid_off_policy_output(
                              n_divide=self.config.actor_rollout_ref.rollout.n_prefix,
@@ -1789,40 +1814,40 @@ class NewRayPPOTrainer(RayPPOTrainer):
             # END: Collect Failed Questions Logic
             # --------------------------------------------------------------------------------
 
-            if self.config.actor_rollout_ref.actor.policy_loss.loss_mode=="se_luffy":
-                #将off_policy中所有错误的样本替换为相应的gen_batch_off_standard中的样本
+            # if self.config.actor_rollout_ref.actor.policy_loss.loss_mode=="se_luffy":
+            #     #将off_policy中所有错误的样本替换为相应的gen_batch_off_standard中的样本
                 
-                reward_standard,_ = compute_reward(gen_batch_off_output_standard, self.reward_fn)
-                gen_batch_off_output_standard.batch['token_level_scores'] = reward_standard
+            #     reward_standard,_ = compute_reward(gen_batch_off_output_standard, self.reward_fn)
+            #     gen_batch_off_output_standard.batch['token_level_scores'] = reward_standard
                 
-                # 在 off-policy 样本中，找到奖励为错误值的样本
-                incorrect_off_policy_mask = (
-                    (reward_sum_per_sample == fail_value)
-                ) & off_policy_mask
+            #     # 在 off-policy 样本中，找到奖励为错误值的样本
+            #     incorrect_off_policy_mask = (
+            #         (reward_sum_per_sample == fail_value)
+            #     ) & off_policy_mask
                 
-                # 2. 找到长度过短的样本,最小长度为当前se的平均长度
-                min_response_len = 1000 #int((batch.batch['response_mask'][off_policy_mask]).sum().item())/ (off_policy_mask.sum().item() + 1e-6)
-                #print(f"Minimum response length for off-policy samples: {min_response_len:.2f}")
-                response_lengths = batch.batch["response_mask"].sum(dim=1)
-                short_off_policy_mask = (response_lengths < min_response_len) & off_policy_mask
-                replace_mask = incorrect_off_policy_mask | short_off_policy_mask
-                #统计一下 正确但太短的样本数量
-                num_short_but_correct = (short_off_policy_mask & (reward_sum_per_sample == success_value)).sum().item()
-                metrics['batch/off_short_but_correct'] = num_short_but_correct
+            #     # 2. 找到长度过短的样本,最小长度为当前se的平均长度
+            #     min_response_len = 1000 #int((batch.batch['response_mask'][off_policy_mask]).sum().item())/ (off_policy_mask.sum().item() + 1e-6)
+            #     #print(f"Minimum response length for off-policy samples: {min_response_len:.2f}")
+            #     response_lengths = batch.batch["response_mask"].sum(dim=1)
+            #     short_off_policy_mask = (response_lengths < min_response_len) & off_policy_mask
+            #     replace_mask = incorrect_off_policy_mask | short_off_policy_mask
+            #     #统计一下 正确但太短的样本数量
+            #     num_short_but_correct = (short_off_policy_mask & (reward_sum_per_sample == success_value)).sum().item()
+            #     metrics['batch/off_short_but_correct'] = num_short_but_correct
 
-                incorrect_indices_in_batch = torch.where(replace_mask)[0]
-                print(f"错误样本indices in batch: {incorrect_indices_in_batch.tolist()}")
-                if incorrect_indices_in_batch.numel() > 0:
-                    print(f"Replacing {incorrect_indices_in_batch.numel()} incorrect off-policy samples.")
-                    for idx in incorrect_indices_in_batch:
-                        standard_sample_pos = idx // self.config.actor_rollout_ref.rollout.n 
-                        #standard_sample = gen_batch_off_output_standard.get_item(standard_sample_pos)
-                        for key in gen_batch_off_output_standard.batch.keys():
-                            if key in batch.batch.keys():
-                                batch.batch[key][idx] = gen_batch_off_output_standard.batch[key][standard_sample_pos]
-                        batch.batch['se_mask'][idx] = torch.zeros_like(batch.batch['se_mask'][idx])
-                else:
-                    print("No incorrect off-policy samples to replace.")
+            #     incorrect_indices_in_batch = torch.where(replace_mask)[0]
+            #     print(f"错误样本indices in batch: {incorrect_indices_in_batch.tolist()}")
+            #     if incorrect_indices_in_batch.numel() > 0:
+            #         print(f"Replacing {incorrect_indices_in_batch.numel()} incorrect off-policy samples.")
+            #         for idx in incorrect_indices_in_batch:
+            #             standard_sample_pos = idx // self.config.actor_rollout_ref.rollout.n 
+            #             #standard_sample = gen_batch_off_output_standard.get_item(standard_sample_pos)
+            #             for key in gen_batch_off_output_standard.batch.keys():
+            #                 if key in batch.batch.keys():
+            #                     batch.batch[key][idx] = gen_batch_off_output_standard.batch[key][standard_sample_pos]
+            #             batch.batch['se_mask'][idx] = torch.zeros_like(batch.batch['se_mask'][idx])
+            #     else:
+            #         print("No incorrect off-policy samples to replace.")
             
             se_mask = batch.batch['se_mask'].any(-1)
             standard_off_policy_mask = off_policy_mask & (~se_mask)

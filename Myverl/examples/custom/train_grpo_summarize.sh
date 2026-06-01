@@ -112,7 +112,7 @@ python -m verl.trainer.main_ppo_new \
     +actor_rollout_ref.actor.off_policy_max_clip=1.28 \
     +actor_rollout_ref.actor.off_policy_min_clip=-1 \
     +actor_rollout_ref.actor.all_max_clip=10 \
-    +actor_rollout_ref.actor.use_off_policy_probs=False \
+    +actor_rollout_ref.actor.use_off_policy_probs=True \
     +actor_rollout_ref.actor.loss_remove_token_mean=True \
     +actor_rollout_ref.actor.loss_remove_clip=True \
     actor_rollout_ref.rollout.tensor_model_parallel_size=$TENSOR_PARALLEL \
