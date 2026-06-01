@@ -191,7 +191,15 @@ def process_single_item(
         msgs = _build_summarize_prompt(system_msg, question, prefix_text, template)
         prompts_list.append(msgs)
 
-    item["summarize_prompts"] = np.array(prompts_list, dtype=object)
+    # IMPORTANT: 不能用 np.array(prompts_list, dtype=object)。
+    # 每个 msgs 都是 [system, user] 长度 2 的 list，numpy 会自动推断成 2D
+    # shape=(K, 2)，pyarrow 写 parquet 时只接受 1D object 列、会报
+    # "Only 1D arrays accepted"。显式构造 1D object array 才能让每个 cell
+    # 保持成 list of dict，让 pyarrow 序列化为 list[list[struct]]。
+    arr = np.empty(len(prompts_list), dtype=object)
+    for i, p in enumerate(prompts_list):
+        arr[i] = p
+    item["summarize_prompts"] = arr
     return item
 
 
