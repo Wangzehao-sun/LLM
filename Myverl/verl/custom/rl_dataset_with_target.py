@@ -84,9 +84,14 @@ class RLHFDatasetWithTarget(RLHFDataset):
                  se_target_probs_key='se_logits',
                  se_prompt_key='se_prompt',  # 新增: 保存 SE prompt 的列名
                  use_se=False,
+                 # ---- summarize-then-continue (explain-style) 新增 ----
+                 use_summarize=False,
+                 summarize_prompts_key='summarize_prompts',
+                 max_summarize_prompts=8,           # K, 与训练时 n_prefix 对齐
+                 max_summarize_length=8192,         # rollout-time 长 prompt 容量
         ):
         super().__init__(parquet_files, tokenizer, config=config)
-        
+
         self.max_target_length = max_target_length
         self.filter_targets = filter_targets
         self.target_key = target_key
@@ -98,6 +103,11 @@ class RLHFDatasetWithTarget(RLHFDataset):
         self.se_target_probs_key = se_target_probs_key
         self.max_num_targets = max_num_targets
         self.use_se = use_se
+        # ---- summarize-then-continue (explain-style) ----
+        self.use_summarize = use_summarize
+        self.summarize_prompts_key = summarize_prompts_key
+        self.max_summarize_prompts = max_summarize_prompts
+        self.max_summarize_length = max_summarize_length
         if self.filter_targets:
             self._filter_targets()
     def _filter_targets(self):
@@ -301,6 +311,70 @@ class RLHFDatasetWithTarget(RLHFDataset):
                 row_dict['target_probs'] = target_probs_pt.squeeze(0)
             else:
                 row_dict['target_probs'] = torch.zeros_like(row_dict['tgt_input_ids'], dtype=torch.float32).fill_(-1)
+
+        # ---- summarize-then-continue (explain-style) 新增 ----
+        # 把离线脚本预先渲染的 K 条 summarize_prompts 转成 [K, max_summarize_length] 张量。
+        # 与父类填好的 row_dict['input_ids']（原始短 prompt，max_prompt_length）并存：
+        #   - input_ids: rollout 不会用，loss-time actor forward 用
+        #   - summarize_input_ids[step_i]: rollout-time vllm 用
+        # 注意：当 use_summarize=True 时，无论本行是否有 summarize_prompts 列，
+        # 都会写入这三个张量（缺数据则用 pad 占位），保证 collate_fn 不会因 key
+        # 不一致而崩。trainer 端的 assert 会对全 pad 行做诊断。
+        if self.use_summarize:
+            K = self.max_summarize_prompts
+            sp_list = original_row.get(self.summarize_prompts_key)
+            if isinstance(sp_list, np.ndarray):
+                sp_list = sp_list.tolist()
+
+            if not sp_list:
+                # 数据缺失保护：返回全 pad
+                summarize_input_ids = torch.full(
+                    (K, self.max_summarize_length), self.tokenizer.pad_token_id, dtype=torch.long,
+                )
+            else:
+                # 长度对齐到 K：超长截断、不足按 idx 映射插值复制
+                if len(sp_list) >= K:
+                    sp_list = sp_list[:K]
+                elif len(sp_list) == 1:
+                    sp_list = sp_list * K
+                else:
+                    sp_list = [sp_list[int(i / (K - 1) * (len(sp_list) - 1))] for i in range(K)]
+
+                sum_ids_list: List[torch.Tensor] = []
+                for messages in sp_list:
+                    if isinstance(messages, np.ndarray):
+                        messages = messages.tolist()
+                    full = self.tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True
+                    )
+                    ids = self.tokenizer(
+                        full, add_special_tokens=False, return_tensors='pt'
+                    )['input_ids']
+                    if ids.shape[-1] < self.max_summarize_length:
+                        ids = pad_sequence_to_length(
+                            ids,
+                            max_seq_len=self.max_summarize_length,
+                            pad_token_id=self.tokenizer.pad_token_id,
+                            left_pad=True,  # prompt 左 pad，与父类约定一致
+                        )
+                    else:
+                        # 左截断保留尾部 generation_prompt
+                        ids = ids[:, -self.max_summarize_length:]
+                    sum_ids_list.append(ids.squeeze(0))
+                summarize_input_ids = torch.stack(sum_ids_list, dim=0)  # [K, L_long]
+
+            summarize_attention_mask = (
+                summarize_input_ids != self.tokenizer.pad_token_id
+            ).to(torch.long)
+            summarize_position_ids = torch.stack(
+                [compute_position_id_with_mask(summarize_attention_mask[i])
+                 for i in range(summarize_input_ids.size(0))],
+                dim=0,
+            )
+
+            row_dict['summarize_input_ids'] = summarize_input_ids
+            row_dict['summarize_attention_mask'] = summarize_attention_mask
+            row_dict['summarize_position_ids'] = summarize_position_ids
 
         # 父类已经处理了 'raw_prompt', 'index' 等字段，我们无需重复
         # 直接返回被我们追加了 target 相关字段的 `row_dict`

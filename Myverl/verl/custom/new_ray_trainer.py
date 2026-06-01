@@ -627,6 +627,8 @@ class NewRayPPOTrainer(RayPPOTrainer):
         off_responses: torch.Tensor,
         prefix_list: list,
         train_batch_size: int,
+        mode: str = "concat",
+        loss_prompts: torch.Tensor = None,
     ) -> DataProto:
         """
         根据离线目标(prefix_list)的前缀和模型生成的响应(off_responses)构建混合的off-policy输出。
@@ -636,6 +638,12 @@ class NewRayPPOTrainer(RayPPOTrainer):
             off_responses (torch.Tensor): 模型为off-policy prompts生成的响应张量。
             prefix_list (list): 序列列表,每个元素为token_id的列表。
             train_batch_size (int): 原始训练批次大小。
+            mode (str): 'concat'（默认，现有 prefix 续写行为）| 'summarize'
+                        （rollout 与 loss prompt 解耦：rollout 用长 summarize prompt、
+                        loss-time 用 loss_prompts 这个原始短 prompt）。
+            loss_prompts (torch.Tensor): 当 mode='summarize' 时必填，shape [B, max_prompt_length]，
+                        原始 question prompt（不含 prefix、不含 reason_prompt）。
+                        用作最终 input_ids 的 prompt 段，actor 据此重新 forward 算 log_prob。
 
         Returns:
             DataProto: 构建完成并经过repeat的off-policy输出。
@@ -648,13 +656,26 @@ class NewRayPPOTrainer(RayPPOTrainer):
         print("设备:", device)
         dtype = gen_batch.batch['input_ids'].dtype
         print("数据类型:", dtype)
-        if off_responses == None:   
+        if off_responses == None:
             off_responses = torch.full((train_batch_size*n_repeat,1),pad_token_id, dtype=dtype, device=device)
         off_len = n_repeat*train_batch_size
         assert off_responses.size(0) == off_len, f"off_responses batch size mismatch: expected {off_len}, got {off_responses.size(0)}"
-        # 1. 从未经repeat的gen_batch中获取原始prompts
-        original_prompts = gen_batch.batch['input_ids'][::n_on]
-        original_prompts = original_prompts.repeat_interleave(n_repeat, dim=0)
+        # 1. 决定 prompts 来源：
+        #    - 'concat'：用 gen_batch.input_ids（其中已经拼了 prefix，等同现状）
+        #    - 'summarize'：用 loss_prompts（纯原始 question prompt，不含 prefix/reason_prompt）
+        if mode == "summarize":
+            assert loss_prompts is not None, \
+                "_build_hybrid_off_policy_output(mode='summarize') requires loss_prompts"
+            assert loss_prompts.size(0) == train_batch_size, (
+                f"loss_prompts batch size {loss_prompts.size(0)} != train_batch_size {train_batch_size}"
+            )
+            # loss_prompts 已是 [B, L_short]，直接 repeat_interleave 到 [B*n_repeat, L_short]
+            original_prompts = loss_prompts.to(device=device, dtype=dtype)
+            original_prompts = original_prompts.repeat_interleave(n_repeat, dim=0)
+        else:
+            # concat（现有逻辑）
+            original_prompts = gen_batch.batch['input_ids'][::n_on]
+            original_prompts = original_prompts.repeat_interleave(n_repeat, dim=0)
         # 2. 直接使用传入的prefix_list
         tgt_prefixes = prefix_list
         #打印tgt_prefixes中每个元素的长度
@@ -672,19 +693,25 @@ class NewRayPPOTrainer(RayPPOTrainer):
         final_responses = []
         max_response_len = max(self.config.data.max_response_length,off_responses.size(1))
         prefix_mask = torch.zeros([off_len, max_response_len], dtype=torch.bool, device=device)
-        
+
         print("off_prefix_mask size:", prefix_mask.size())
-        
+
         #max_response_len = max(self.config.data.max_response_length,off_responses.size(1))
         for i in range(off_len):
-            # If it is the last element in the group, only use the prefix
-            if (i + 1) % n_repeat == 0:
-                 final_responses.append(torch.tensor(tgt_prefixes[i], dtype=dtype))
+            if mode == "summarize":
+                # response = 仅 model 自己生成的部分（不 concat teacher prefix）
+                # prefix_mask[i] 保持全 0 → loss 公式自动走 on-policy 分支
+                final_responses.append(torch.tensor(off_responses_list[i], dtype=dtype))
             else:
-                 final_responses.append(torch.tensor(tgt_prefixes[i]+ off_responses_list[i], dtype=dtype))
-            
-            prefix_len = min(len(tgt_prefixes[i]), max_response_len)
-            prefix_mask[i, :prefix_len] = 1
+                # 'concat' —— 现有 prefix 续写逻辑
+                # If it is the last element in the group, only use the prefix
+                if (i + 1) % n_repeat == 0:
+                     final_responses.append(torch.tensor(tgt_prefixes[i], dtype=dtype))
+                else:
+                     final_responses.append(torch.tensor(tgt_prefixes[i]+ off_responses_list[i], dtype=dtype))
+
+                prefix_len = min(len(tgt_prefixes[i]), max_response_len)
+                prefix_mask[i, :prefix_len] = 1
         # 4. 对混合responses进行左填充
         padded_responses = torch.full(
             (len(final_responses), max_response_len), pad_token_id, dtype=dtype,device=device
@@ -1142,6 +1169,9 @@ class NewRayPPOTrainer(RayPPOTrainer):
         
         manual_repeat = False # Flag to skip default repeat logic
         prefix_lists = None
+        # summarize 模式（explain-style loss）专用：保存替换前的原始短 prompt，
+        # 在 _build_hybrid_off_policy_output 时作为 loss_prompts 传入。None 表示不走 summarize。
+        loss_prompts_for_summarize = None
         if is_failure_recycle_step:
             if 'se_input_ids' in batch.batch and self.config.actor_rollout_ref.rollout.n_se>0:
                  print(f"Recycle Step: Using se_input_ids for generation.")
@@ -1166,7 +1196,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
                  # Controlled by config parameter 'prefix_mode' (default: 'auto')
                  
                  prefix_mode = self.config.actor_rollout_ref.rollout.get('prefix_mode', 'sparse')
-                 
+
 
                  if prefix_mode == 'sparse':
                      token_split_points = None
@@ -1176,19 +1206,48 @@ class NewRayPPOTrainer(RayPPOTrainer):
                  elif prefix_mode == 'token_split':
                      token_split_points = batch.non_tensor_batch.get('token_split_points', None)
                      ratios = np.linspace(0, 1, n_repeat)
+                 elif prefix_mode == 'summarize':
+                     # explain-style off-policy: rollout 用 dataset 预渲染的 K 条 long
+                     # summarize prompt; loss-time 换回原始短 prompt（loss_prompts）。
+                     # ratios/token_split_points 对此模式无意义，留占位避开下游 bug。
+                     assert 'summarize_input_ids' in batch.batch, (
+                         "prefix_mode=summarize requires data.use_summarize=True and a "
+                         "'summarize_prompts' column produced by Data/prepare_summarize_prompts.py"
+                     )
+                     token_split_points = None
+                     ratios = np.zeros(n_repeat)
                  else: # linear
                      token_split_points = None
                      ratios = np.linspace(0, 1, n_repeat)
-                 
+
                  # Extract original tensors to use as a base for each ratio
                  original_input_ids = gen_batch.batch['input_ids']
                  original_attention_mask = gen_batch.batch['attention_mask']
                  original_position_ids = gen_batch.batch['position_ids']
-                 
+
+                 # summarize 模式：暂存原始短 prompt，稍后传给 _build_hybrid_off_policy_output
+                 # 作为 loss-time prompts（actor forward 用），与 rollout-time 的长 summarize prompt 解耦。
+                 if prefix_mode == 'summarize':
+                     loss_prompts_for_summarize = original_input_ids.clone()
+                     sum_ids = batch.batch['summarize_input_ids']      # [B, K, L_long]
+                     if sum_ids.size(1) < n_repeat:
+                         raise ValueError(
+                             f"summarize_input_ids has K={sum_ids.size(1)} but n_prefix={n_repeat}; "
+                             "set data.max_summarize_prompts >= n_prefix"
+                         )
+
                  input_ids_list = []
-                 
+
                  total_prefix_list = []
                  for step_i, ratio in enumerate(ratios):
+                     if prefix_mode == 'summarize':
+                         # 直接索引 dataset 预渲染的第 step_i 条 long prompt；
+                         # response 内不含 teacher prefix，prefix_list 对应位置给空列表，
+                         # _build_hybrid_off_policy_output(mode='summarize') 会忽略它。
+                         input_ids_list.append(sum_ids[:, step_i, :])
+                         total_prefix_list.append([[] for _ in range(train_batch_size)])
+                         continue
+
                      # Create a temporary DataProto for the existing helper function
                      # We must clone because DataProto wraps the tensors
                      temp_batch = DataProto.from_single_dict({
@@ -1196,7 +1255,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
                          "attention_mask": original_attention_mask.clone(),
                          "position_ids": original_position_ids.clone()
                      })
-                     
+
                      # Determine prefix_lens for this step if token_split_points is available
                      # step_i == 0 always uses ratio=0 (pure on-policy, no prefix)
                      current_prefix_lens = None
@@ -1212,7 +1271,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
                                      idx = int(step_i / (n_repeat - 1) * (len(points) - 1))
                                  else:
                                      idx = len(points) - 1
-                                     
+
                                  # Boundary check
                                  idx = min(max(0, idx), len(points) - 1)
                                  current_prefix_lens.append(points[idx])
@@ -1284,19 +1343,33 @@ class NewRayPPOTrainer(RayPPOTrainer):
                      # Temporary overwrite n_off to make _build_hybrid_off_policy_output work
                      #saved_n_off = self.config.actor_rollout_ref.rollout.n_off
                      #self.config.actor_rollout_ref.rollout.n_off = self.config.actor_rollout_ref.rollout.n_prefix
-                     
+
                      # Use existing helper to construct hybrid output
                      # We pass prefix_lists as prefix_list so it uses the full prefix from our list
                      # gen_batch has interleaved structure (S0_R0, S0_R1...), so n_divide=n_prefix allows extracting S0_R0 (clean prompt)
-                     gen_batch_output = self._build_hybrid_off_policy_output(
-                         n_divide=self.config.actor_rollout_ref.rollout.n_prefix,
-                         n_repeat=self.config.actor_rollout_ref.rollout.n_prefix,
-                         gen_batch=gen_batch, 
-                         off_responses=gen_batch_output.batch['responses'],
-                         prefix_list=prefix_lists,
-                         train_batch_size=train_batch_size,
-                     )
-                     
+                     # explain-style: summarize 模式下传 mode='summarize' + 原始短 prompt 作为 loss_prompts，
+                     # 让 actor forward 在原始 prompt 下重新算 log_prob（rollout 用的是长 summarize prompt）。
+                     if loss_prompts_for_summarize is not None:
+                         gen_batch_output = self._build_hybrid_off_policy_output(
+                             n_divide=self.config.actor_rollout_ref.rollout.n_prefix,
+                             n_repeat=self.config.actor_rollout_ref.rollout.n_prefix,
+                             gen_batch=gen_batch,
+                             off_responses=gen_batch_output.batch['responses'],
+                             prefix_list=prefix_lists,
+                             train_batch_size=train_batch_size,
+                             mode="summarize",
+                             loss_prompts=loss_prompts_for_summarize,
+                         )
+                     else:
+                         gen_batch_output = self._build_hybrid_off_policy_output(
+                             n_divide=self.config.actor_rollout_ref.rollout.n_prefix,
+                             n_repeat=self.config.actor_rollout_ref.rollout.n_prefix,
+                             gen_batch=gen_batch,
+                             off_responses=gen_batch_output.batch['responses'],
+                             prefix_list=prefix_lists,
+                             train_batch_size=train_batch_size,
+                         )
+
                      #self.config.actor_rollout_ref.rollout.n_off = saved_n_off
                 else:
                     #为gen_batch-output添加prefix_mask字段，表示哪些response token是离线的
