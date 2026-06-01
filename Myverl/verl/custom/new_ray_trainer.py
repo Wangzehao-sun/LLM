@@ -340,7 +340,12 @@ class NewRayPPOTrainer(RayPPOTrainer):
                                          filter_targets=self.config.data.get('filter_targets', False),
                                          sample_target_ratio=self.config.data.get('sample_target_ratio', 1.0),
                                          target_key=self.config.data.get('target_key', 'target'),
-                                         use_se=self.config.data.get('use_se', True),)
+                                         use_se=self.config.data.get('use_se', True),
+                                         # ---- summarize-then-continue (explain-style) 新增 ----
+                                         use_summarize=self.config.data.get('use_summarize', False),
+                                         summarize_prompts_key=self.config.data.get('summarize_prompts_key', 'summarize_prompts'),
+                                         max_summarize_prompts=self.config.data.get('max_summarize_prompts', 8),
+                                         max_summarize_length=self.config.data.get('max_summarize_length', 8192),)
 
         # use sampler for better ckpt resume
         if train_sampler is None:
