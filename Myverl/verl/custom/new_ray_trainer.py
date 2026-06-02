@@ -1038,7 +1038,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
                         for recycle_step in range(n_recycle_failure):
                             is_last_recycle = (recycle_step == n_recycle_failure - 1)
                             collect_on_recycle = retain_hard_in_buffer and is_last_recycle
-                            is_last, val_mets, recycle_failed_items = self._train_step_internal(failed_batch_dict, epoch, logger_extra, progress_bar, collect_failures=collect_on_recycle,is_failure_recycle_step=True)
+                            is_last, val_mets, recycle_failed_items = self._train_step_internal(failed_batch_dict, epoch, logger_extra, progress_bar, collect_failures=collect_on_recycle,is_failure_recycle_step=True, recycle_sub_step=recycle_step)
 
                             extra_training_steps += 1
                             print(f"Extra training steps performed: {extra_training_steps} (Round {buffer_round}, recycle step {recycle_step + 1}/{n_recycle_failure})")
@@ -1075,7 +1075,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
                      return
 
 
-    def _train_step_internal(self, batch_dict, epoch, logger, progress_bar, collect_failures=False, is_failure_recycle_step=False):
+    def _train_step_internal(self, batch_dict, epoch, logger, progress_bar, collect_failures=False, is_failure_recycle_step=False, recycle_sub_step=0):
         do_profile = self.global_steps in self.config.trainer.profile_steps if self.config.trainer.profile_steps is not None else False
         if do_profile:
             self.actor_rollout_wg.start_profile()
@@ -1089,6 +1089,9 @@ class NewRayPPOTrainer(RayPPOTrainer):
         metrics = {}
         timing_raw = {}
         failed_items = []
+        # For recycle steps, offset the log step to avoid tensorboard/wandb overwrite
+        # at the same global_steps. Normal steps use global_steps directly.
+        _log_step = self.global_steps * 100 + recycle_sub_step + 1 if is_failure_recycle_step else self.global_steps
         batch: DataProto = DataProto.from_single_dict(batch_dict)
         # Add original index to track samples for failure collection
         batch.non_tensor_batch['original_index'] = np.arange(len(batch.batch['input_ids']))
@@ -2003,7 +2006,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
                 critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                 metrics.update(critic_output_metrics)
 
-            logger.log(data=metrics, step=self.global_steps)
+            logger.log(data=metrics, step=_log_step)
             # implement critic warmup
             if self.config.trainer.critic_warmup <= self.global_steps:
                 # update actor
@@ -2030,7 +2033,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
             rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
             if rollout_data_dir:
                 if is_failure_recycle_step:
-                    rollout_data_dir = os.path.join(rollout_data_dir, "recycle")
+                    rollout_data_dir = os.path.join(rollout_data_dir, "recycle", f"r{recycle_sub_step}")
                 else:
                     rollout_data_dir = os.path.join(rollout_data_dir, "normal")
                 os.makedirs(rollout_data_dir, exist_ok=True)
@@ -2066,6 +2069,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
             {
                 "training/global_step": self.global_steps,
                 "training/epoch": epoch,
+                "training/recycle_sub_step": recycle_sub_step if is_failure_recycle_step else -1,
             }
         )
         # collect metrics
@@ -2076,7 +2080,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
         metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
 
         # TODO: make a canonical logger that supports various backend
-        logger.log(data=metrics, step=self.global_steps)
+        logger.log(data=metrics, step=_log_step)
         metrics_data_dir = self.config.trainer.get("metrics_data_dir", None)
         if metrics_data_dir is not None and metrics_data_dir != "":
             metrics_filepath = os.path.join(metrics_data_dir, "training_metrics.jsonl")
