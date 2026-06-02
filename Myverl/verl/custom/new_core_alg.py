@@ -438,9 +438,12 @@ def compute_token_on_off_sft_loss(
     if off_policy_strategy == "rl-sft":
         on_policy_loss_type = "rl"
         off_policy_loss_type = "sft"
+    elif off_policy_strategy == "rl-rl":
+        on_policy_loss_type = "rl"
+        off_policy_loss_type = "rl"
     elif off_policy_strategy == "sft-sft":
         on_policy_loss_type = "sft"
-        off_policy_loss_type = "sft" 
+        off_policy_loss_type = "sft"
     elif off_policy_strategy == "none-sft":
         on_policy_loss_type = "none"
         off_policy_loss_type = "sft"
@@ -483,6 +486,9 @@ def compute_token_on_off_sft_loss(
     # ---------------------------
     off_sft_losses = torch.zeros_like(log_prob)
     off_rl_losses = torch.zeros_like(log_prob)
+    # off-policy RL 分支的 ratio 裁剪比例统计(仅 rl 分支会更新)
+    off_ratio_max_clip_frac = torch.tensor(0.0)
+    off_ratio_min_clip_frac = torch.tensor(0.0)
     if off_policy_loss_type == "sft":
         if off_policy_reshape == 'vanilla':
             off_sft_losses = -log_prob
@@ -514,9 +520,24 @@ def compute_token_on_off_sft_loss(
         else:
             off_sft_losses = -log_prob
     elif off_policy_loss_type == "rl":
+        # off-policy RL:由于上层已把 off-policy 样本的 old_log_prob 替换为
+        # "长 prompt 下的 logprob",这里的 ratio = exp(log_prob - old_log_prob)
+        # = exp(actor_under_short - actor_under_long),即 explain-style 的
+        # prompt-shift 重要性采样比率(IS ratio)。
         negative_approx_kl = torch.clamp(log_prob - old_log_prob, min=-20.0, max=20.0)
-        ratio = torch.exp(negative_approx_kl)
-        off_rl_losses = -advantages * ratio
+        off_ratio = torch.exp(negative_approx_kl)
+
+        # 路径 A 风格的 off_ratio 上/下界裁剪 + clip-frac 统计
+        off_clip_region = prefix_mask * response_mask * reward_mask
+        if off_max_clip is not None:
+            off_ratio = torch.clamp(off_ratio, max=off_max_clip)
+            off_ratio_max_clip_frac = verl_F.masked_mean((off_ratio == off_max_clip).float(), off_clip_region)
+        if off_min_clip is not None:
+            off_ratio = torch.clamp(off_ratio, min=off_min_clip)
+            off_ratio_min_clip_frac = verl_F.masked_mean((off_ratio == off_min_clip).float(), off_clip_region)
+
+        # 完整 advantage(正负优势都用),与路径 A 的普通(else)分支一致
+        off_rl_losses = -advantages * off_ratio
     elif off_policy_loss_type == "none":
         pass
     else:
@@ -599,8 +620,8 @@ def compute_token_on_off_sft_loss(
 
     off_pg_clipfrac = torch.tensor(0.0)
     on_pg_clipfrac = torch.tensor(0.0)
-    off_ratio_max_clip_frac = torch.tensor(0.0)
-    off_ratio_min_clip_frac = torch.tensor(0.0)
+    # off_ratio_max_clip_frac / off_ratio_min_clip_frac 已在 off rl 分支中计算
+    # (非 rl 分支保持初始化的 0.0)
 
     return {
         "pg_loss": pg_loss,

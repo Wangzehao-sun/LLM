@@ -349,7 +349,7 @@ class NewDataParallelPPOActor(DataParallelPPOActor):
                         if 'off_ratio_min_clip_frac' in ret_dict:
                             metrics_data['actor/off_ratio_min_clip_frac'] = ret_dict['off_ratio_min_clip_frac'].detach().item()
                         append_to_dict(metrics, metrics_data)
-                    elif current_loss_mode in ["relift",'hype-sft','sft','rl-sft','sft-sft','none-sft']:
+                    elif current_loss_mode in ["relift",'hype-sft','sft','rl-sft','rl-rl','sft-sft','none-sft']:
                         from .new_core_alg import compute_token_on_off_sft_loss
                         loss_fn = compute_token_on_off_sft_loss
                         prefix_mask = data['prefix_mask'] if 'prefix_mask' in data else None
@@ -363,6 +363,9 @@ class NewDataParallelPPOActor(DataParallelPPOActor):
                             cliprange=clip_ratio,
                             prefix_mask=prefix_mask,
                             reward_mask=reward_mask,
+                            off_max_clip=self.config.off_policy_max_clip if self.config.off_policy_max_clip != -1 else None,
+                            off_min_clip=self.config.off_policy_min_clip if self.config.off_policy_min_clip != -1 else None,
+                            all_max_clip=self.config.all_max_clip if self.config.all_max_clip != -1 else None,
                             off_policy_strategy=current_loss_mode,
                             off_policy_reshape=off_policy_reshape,
                             se_mask=se_mask
