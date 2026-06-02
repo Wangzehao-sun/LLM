@@ -281,8 +281,8 @@ class NewDataParallelPPOActor(DataParallelPPOActor):
                             "actor/pg_clipfrac": pg_clipfrac.detach().item(),
                             "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
                             # ===== 按 advantage 正负拆分的 loss 贡献/比例 =====
-                            "actor/on_pos_adv_loss_contrib": extra_metrics["pos_adv_loss_contrib"].detach().item(),
-                            "actor/on_neg_adv_loss_contrib": extra_metrics["neg_adv_loss_contrib"].detach().item(),
+                            # "actor/on_pos_adv_loss_contrib": extra_metrics["pos_adv_loss_contrib"].detach().item(),
+                            # "actor/on_neg_adv_loss_contrib": extra_metrics["neg_adv_loss_contrib"].detach().item(),
                             # 正/负 advantage token 的 loss 绝对值比例 ∈ [0,1], sum=1
                             "actor/on_pos_adv_loss_ratio": extra_metrics["pos_adv_loss_ratio"].detach().item(),
                             "actor/on_neg_adv_loss_ratio": extra_metrics["neg_adv_loss_ratio"].detach().item(),
