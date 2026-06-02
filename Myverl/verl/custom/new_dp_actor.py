@@ -422,6 +422,16 @@ class NewDataParallelPPOActor(DataParallelPPOActor):
                         # off-policy 区域中 old_prob < sft_gate_threshold 的 token 占比
                         if 'off_low_conf_token_frac' in ret_dict:
                             metrics_data['actor/off_low_conf_token_frac'] = ret_dict['off_low_conf_token_frac'].detach().item()
+                        # ===== on-policy 区域按 advantage 正负拆分的 loss 贡献/比例 =====
+                        if 'on_pos_adv_loss_contrib' in ret_dict:
+                            metrics_data['actor/on_pos_adv_loss_contrib'] = ret_dict['on_pos_adv_loss_contrib'].detach().item()
+                        if 'on_neg_adv_loss_contrib' in ret_dict:
+                            metrics_data['actor/on_neg_adv_loss_contrib'] = ret_dict['on_neg_adv_loss_contrib'].detach().item()
+                        # 正/负 advantage token 的 loss 绝对值比例 ∈ [0,1], sum=1
+                        if 'on_pos_adv_loss_ratio' in ret_dict:
+                            metrics_data['actor/on_pos_adv_loss_ratio'] = ret_dict['on_pos_adv_loss_ratio'].detach().item()
+                        if 'on_neg_adv_loss_ratio' in ret_dict:
+                            metrics_data['actor/on_neg_adv_loss_ratio'] = ret_dict['on_neg_adv_loss_ratio'].detach().item()
                         append_to_dict(metrics, metrics_data)
                     else:
                         policy_loss_fn = get_policy_loss_fn(current_loss_mode)

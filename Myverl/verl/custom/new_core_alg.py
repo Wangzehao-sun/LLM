@@ -615,6 +615,22 @@ def compute_token_on_off_sft_loss(
         low_conf_mask = (old_prob_for_stat < sft_gate_threshold).float() * off_region_mask
         off_low_conf_token_frac = low_conf_mask.sum() / off_token_count
 
+        # ---- on-policy 区域中按 advantage 正负拆分 loss 贡献 ----
+        # 仅统计 on-policy 部分(on_region_losses 已含 (1-prefix_mask)*reward_mask 掩码),
+        # 与 on_loss_contrib 同分母,保证 pos + neg + zero == on_loss_contrib(数值上)
+        pos_adv_mask = (advantages > 0).float()
+        neg_adv_mask = (advantages < 0).float()
+
+        on_pos_adv_loss_contrib = (on_region_losses * pos_adv_mask).sum() / denom
+        on_neg_adv_loss_contrib = (on_region_losses * neg_adv_mask).sum() / denom
+
+        # 正/负 advantage token 的 loss 绝对值比例,∈ [0,1] 且 sum=1
+        abs_on_pos_adv = on_pos_adv_loss_contrib.abs()
+        abs_on_neg_adv = on_neg_adv_loss_contrib.abs()
+        abs_sum_on_pos_neg = (abs_on_pos_adv + abs_on_neg_adv).clamp(min=1e-8)
+        on_pos_adv_loss_ratio = abs_on_pos_adv / abs_sum_on_pos_neg
+        on_neg_adv_loss_ratio = abs_on_neg_adv / abs_sum_on_pos_neg
+
     negative_approx_kl = torch.clamp(log_prob - old_log_prob, min=-20.0, max=20.0)
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
 
@@ -647,6 +663,12 @@ def compute_token_on_off_sft_loss(
         "off_has_loss": off_has_loss,
         # off-policy 区域中 old_prob < sft_gate_threshold 的 token 占比
         "off_low_conf_token_frac": off_low_conf_token_frac,
+        # ===== on-policy 区域按 advantage 正负拆分的 loss 贡献/比例 =====
+        "on_pos_adv_loss_contrib": on_pos_adv_loss_contrib,
+        "on_neg_adv_loss_contrib": on_neg_adv_loss_contrib,
+        # 正/负 advantage token 的 loss 绝对值比例 ∈ [0,1], sum=1
+        "on_pos_adv_loss_ratio": on_pos_adv_loss_ratio,
+        "on_neg_adv_loss_ratio": on_neg_adv_loss_ratio,
     }
 
 
