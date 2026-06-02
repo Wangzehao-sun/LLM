@@ -265,7 +265,7 @@ class NewDataParallelPPOActor(DataParallelPPOActor):
                         #pg_clipfrac表示有多少比例的词元（token）的损失被裁剪了
                         #ppo_kl表示PPO中的KL散度
                         #pg_clipfrac_lower表示有多少比例的词元（token）的损失被裁剪了，且优势函数为负。
-                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, extra_metrics = compute_policy_loss(
                             old_log_prob=old_log_prob,
                             log_prob=log_prob,
                             advantages=advantages,
@@ -275,10 +275,17 @@ class NewDataParallelPPOActor(DataParallelPPOActor):
                             cliprange_high=clip_ratio_high,
                             clip_ratio_c=clip_ratio_c,
                             loss_agg_mode=loss_agg_mode,
+                            return_extra_metrics=True,
                         )
                         metrics_data = {
                             "actor/pg_clipfrac": pg_clipfrac.detach().item(),
                             "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+                            # ===== 按 advantage 正负拆分的 loss 贡献/比例 =====
+                            # "actor/on_pos_adv_loss_contrib": extra_metrics["pos_adv_loss_contrib"].detach().item(),
+                            # "actor/on_neg_adv_loss_contrib": extra_metrics["neg_adv_loss_contrib"].detach().item(),
+                            # 正/负 advantage token 的 loss 绝对值比例 ∈ [0,1], sum=1
+                            "actor/on_pos_adv_loss_ratio": extra_metrics["pos_adv_loss_ratio"].detach().item(),
+                            "actor/on_neg_adv_loss_ratio": extra_metrics["neg_adv_loss_ratio"].detach().item(),
                         }
                         append_to_dict(metrics, metrics_data)
                     elif current_loss_mode in ["luffy","rlpluss","se",'se_luffy','se_filter']:

@@ -567,6 +567,7 @@ def compute_policy_loss(
     cliprange_high=None,
     clip_ratio_c=3.0,
     loss_agg_mode: str = "token-mean",
+    return_extra_metrics: bool = False,
 ):
     """
     Compute the clipped policy objective and related metrics for PPO.
@@ -595,6 +596,11 @@ def compute_policy_loss(
             Defaults to 3.0.
         loss_agg_mode (str, optional):
             Aggregation mode for `agg_loss`. Defaults to "token-mean".
+        return_extra_metrics (bool, optional):
+            If True, additionally return a dict of logging-only metrics as a
+            5th element (e.g. positive/negative advantage loss contributions and
+            ratios). Defaults to False to keep the original 4-tuple return for
+            existing callers.
     """
     assert clip_ratio_c > 1.0, "The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0," + f" but get the value: {clip_ratio_c}."
 
@@ -621,6 +627,29 @@ def compute_policy_loss(
 
     pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+
+    if return_extra_metrics:
+        # ===== 按 advantage 正负拆分 loss 贡献/比例 (仅用于日志,不参与反向) =====
+        # 使用与 pg_loss 相同的 token 掩码 (response_mask),保证可加性:
+        # pos_contrib + neg_contrib + 零优势贡献 == token-mean 下的 pg_loss(数值上)。
+        with torch.no_grad():
+            pos_adv_mask = (advantages > 0).float()
+            neg_adv_mask = (advantages < 0).float()
+            denom = response_mask.sum().clamp(min=1.0)
+            pos_adv_loss_contrib = (pg_losses * pos_adv_mask * response_mask).sum() / denom
+            neg_adv_loss_contrib = (pg_losses * neg_adv_mask * response_mask).sum() / denom
+
+            # 正/负 advantage token 的 loss 绝对值比例,∈ [0,1] 且 sum=1
+            abs_pos = pos_adv_loss_contrib.abs()
+            abs_neg = neg_adv_loss_contrib.abs()
+            abs_sum = (abs_pos + abs_neg).clamp(min=1e-8)
+            extra_metrics = {
+                "pos_adv_loss_contrib": pos_adv_loss_contrib,
+                "neg_adv_loss_contrib": neg_adv_loss_contrib,
+                "pos_adv_loss_ratio": abs_pos / abs_sum,
+                "neg_adv_loss_ratio": abs_neg / abs_sum,
+            }
+        return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, extra_metrics
 
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
