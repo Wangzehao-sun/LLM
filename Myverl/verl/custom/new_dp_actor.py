@@ -356,7 +356,7 @@ class NewDataParallelPPOActor(DataParallelPPOActor):
                         if 'off_ratio_min_clip_frac' in ret_dict:
                             metrics_data['actor/off_ratio_min_clip_frac'] = ret_dict['off_ratio_min_clip_frac'].detach().item()
                         append_to_dict(metrics, metrics_data)
-                    elif current_loss_mode in ["relift",'hype-sft','sft','rl-sft','rl-rl','sft-sft','none-sft']:
+                    elif current_loss_mode in ["relift",'hype-sft','sft','rl-sft','rl-rl','sft-sft','none-sft','none-rl']:
                         from .new_core_alg import compute_token_on_off_sft_loss
                         loss_fn = compute_token_on_off_sft_loss
                         prefix_mask = data['prefix_mask'] if 'prefix_mask' in data else None
