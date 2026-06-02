@@ -368,6 +368,8 @@ class NewDataParallelPPOActor(DataParallelPPOActor):
                             advantages=advantages,
                             response_mask=response_mask,
                             cliprange=clip_ratio,
+                            cliprange_low=clip_ratio_low,
+                            cliprange_high=clip_ratio_high,
                             prefix_mask=prefix_mask,
                             reward_mask=reward_mask,
                             off_max_clip=self.config.off_policy_max_clip if self.config.off_policy_max_clip != -1 else None,
@@ -375,6 +377,7 @@ class NewDataParallelPPOActor(DataParallelPPOActor):
                             all_max_clip=self.config.all_max_clip if self.config.all_max_clip != -1 else None,
                             off_policy_strategy=current_loss_mode,
                             off_policy_reshape=off_policy_reshape,
+                            loss_remove_clip=self.config.loss_remove_clip,
                             se_mask=se_mask
                         )
                         pg_loss = ret_dict['pg_loss']

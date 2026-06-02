@@ -527,7 +527,7 @@ def compute_token_on_off_sft_loss(
         negative_approx_kl = torch.clamp(log_prob - old_log_prob, min=-20.0, max=20.0)
         off_ratio = torch.exp(negative_approx_kl)
 
-        # 路径 A 风格的 off_ratio 上/下界裁剪 + clip-frac 统计
+        # (1) 路径 A 风格的 off_ratio 上/下界硬裁剪 + clip-frac 统计
         off_clip_region = prefix_mask * response_mask * reward_mask
         if off_max_clip is not None:
             off_ratio = torch.clamp(off_ratio, max=off_max_clip)
@@ -536,8 +536,23 @@ def compute_token_on_off_sft_loss(
             off_ratio = torch.clamp(off_ratio, min=off_min_clip)
             off_ratio_min_clip_frac = verl_F.masked_mean((off_ratio == off_min_clip).float(), off_clip_region)
 
-        # 完整 advantage(正负优势都用),与路径 A 的普通(else)分支一致
-        off_rl_losses = -advantages * off_ratio
+        # (2) 在硬裁剪之上叠加与 on-policy 对称的 PPO dual-clip
+        #     完全镜像上面的 on-policy RL 分支(对称裁剪 + max 悲观 + 负优势 clip_ratio_c 兜底)
+        if cliprange_low is None:
+            cliprange_low = cliprange
+        if cliprange_high is None:
+            cliprange_high = cliprange
+        upper_bound = max(1.0 + cliprange_high, 1.0 + cliprange)
+
+        off_pg_losses = -advantages * off_ratio
+        if loss_remove_clip is False:
+            off_pg_losses2 = -advantages * torch.clamp(off_ratio, 1.0 - cliprange_low, upper_bound)
+            off_pg_losses_clip = torch.max(off_pg_losses, off_pg_losses2)
+            off_pg_losses3 = -advantages * 3.0
+            off_pg_losses_clip2 = torch.min(off_pg_losses3, off_pg_losses_clip)
+            off_rl_losses = torch.where(advantages < 0, off_pg_losses_clip2, off_pg_losses_clip)
+        else:
+            off_rl_losses = off_pg_losses
     elif off_policy_loss_type == "none":
         pass
     else:
