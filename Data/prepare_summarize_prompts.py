@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import multiprocessing as mp
+import re
 from copy import deepcopy
 from typing import Any, Dict, List, Tuple
 
@@ -121,6 +122,90 @@ def _extract_think_process(item: Dict[str, Any]) -> str:
     return think_process
 
 
+def _find_boxed_spans(text: str) -> List[Tuple[int, str]]:
+    """Locate every ``\\boxed{...}`` with balance-aware brace matching.
+
+    Returns a list of ``(start, content)`` tuples in document order, where
+    ``start`` is the index of the leading backslash and ``content`` is the
+    text inside the (possibly nested) braces, e.g. ``\\frac{m}{n}`` for
+    ``\\boxed{\\frac{m}{n}}``. Unbalanced trailing braces fall back to "rest
+    of string" so we never crash on malformed input.
+    """
+    spans: List[Tuple[int, str]] = []
+    for m in re.finditer(r"\\boxed\s*\{", text):
+        brace_open = m.end() - 1  # index of the opening '{'
+        depth = 0
+        i = brace_open
+        while i < len(text):
+            c = text[i]
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    spans.append((m.start(), text[brace_open + 1:i]))
+                    break
+            i += 1
+        else:
+            spans.append((m.start(), text[brace_open + 1:]))
+    return spans
+
+
+def _truncate_before_final_answer(think_process: str) -> str:
+    """Cut off the answer-revealing tail of ``think_process``.
+
+    The split points produced by ``add_token_split_points.py`` span the whole
+    thought process, whose final sentences almost always reveal the result
+    (typically via a ``\\boxed{...}``). Any prefix that reaches that far would
+    let the model simply copy the answer instead of re-deriving it.
+
+    Strategy: take the content of the LAST ``\\boxed{...}`` as the final
+    answer, then cut at the FIRST ``\\boxed{...}`` whose content is identical
+    to it. This drops the earliest point where the correct answer is revealed
+    (covering "we get X ... let me verify ... yes, X" patterns) while keeping
+    earlier exploratory boxes whose content differs (e.g. a wrong guess that
+    is later discarded).
+
+    Brace matching is balance-aware so nested braces such as
+    ``\\boxed{\\frac{m}{n}}`` are handled correctly. If no ``\\boxed`` is
+    present the text is returned unchanged (the downstream clamp still bounds
+    prefixes to the available tokens). If the answer is revealed already in the
+    first sentence, an empty string is returned so the caller skips the row
+    (no answer-free prefix exists).
+    """
+    if not think_process:
+        return think_process
+
+    spans = _find_boxed_spans(think_process)
+    if not spans:
+        return think_process
+
+    final_content = spans[-1][1].strip()
+    # Earliest \boxed whose content matches the final answer.
+    box_pos = spans[-1][0]
+    for start, content in spans:
+        if content.strip() == final_content:
+            box_pos = start
+            break
+
+    # Back up to the start of the sentence/line that contains that \boxed.
+    # We cut at the latest sentence-ish boundary before box_pos: sentence-final
+    # punctuation followed by whitespace, or a newline. This keeps the cut at a
+    # natural boundary instead of mid-sentence.
+    boundary = 0
+    for m in re.finditer(r"(?:[.!?]+[\)\]\"']?\s+|\n+)", think_process[:box_pos]):
+        boundary = m.end()
+    cut = boundary
+
+    # NOTE: cut == 0 means the answer is revealed already in the very first
+    # sentence -- there is no answer-free prefix to keep, so we return an empty
+    # string. The caller treats falsy think_process as "skip this row" (its
+    # summarize_prompts becomes an empty array), which is the desired behaviour:
+    # such rows cannot produce a safe prefix. We must NOT fall back to the
+    # original text here, otherwise the answer would leak.
+    return think_process[:cut].rstrip()
+
+
 def _extract_question(item: Dict[str, Any]) -> str:
     """Pull the user's original question out of ``prompt`` (chat-style list)."""
     prompt = item.get("prompt")
@@ -186,6 +271,12 @@ def process_single_item(
     question = _extract_question(item)
     system_msg = _system_message(item)
     think_process = _extract_think_process(item)
+    # Drop the answer-revealing tail so no prefix can leak the final answer.
+    # split_points were computed on the FULL think process; after truncation
+    # n_tgt shrinks and the existing clamp(sp, n_tgt) below squashes any
+    # split point past the cut down to the truncated end (i.e. just before
+    # the final-answer sentence).
+    think_process = _truncate_before_final_answer(think_process)
     split_points = item.get("token_split_points")
 
     # Defensive fallbacks: if anything is missing, emit an empty np.array so
