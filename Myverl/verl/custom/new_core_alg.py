@@ -543,8 +543,8 @@ def compute_token_on_off_sft_loss(
         response_mask = response_mask * p_on_mask
         pg_losses = pg_losses * p_on_mask
 
-    pg_loss = verl_F.masked_mean(pg_losses, response_mask * reward_mask)
-
+    #pg_loss = verl_F.masked_mean(pg_losses, response_mask * reward_mask)
+    pg_loss = 0.4 * off_pg_loss + 0.6 * on_pg_loss
     # ============= 统计 on/off 占比 + off 内 SFT/RL 占比 =============
     # 仅用于日志,不参与反向。使用与 pg_loss 相同的分母,
     # 保证 on_loss_contrib + off_loss_contrib == pg_loss(数值上)
