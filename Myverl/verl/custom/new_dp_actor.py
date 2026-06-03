@@ -363,6 +363,7 @@ class NewDataParallelPPOActor(DataParallelPPOActor):
                         reward_mask = data['reward_mask'] if 'reward_mask' in data else None
                         se_mask = data['se_mask'] if 'se_mask' in data else None
                         off_policy_reshape = self.config.policy_loss.get("off_policy_reshape", "p_div_p_0.1")
+                        on_rl_mask_neg_adv = self.config.policy_loss.get("on_rl_mask_neg_adv", False)
                         ret_dict = loss_fn(old_log_prob=old_log_prob,
                             log_prob=log_prob,
                             advantages=advantages,
@@ -372,7 +373,8 @@ class NewDataParallelPPOActor(DataParallelPPOActor):
                             reward_mask=reward_mask,
                             off_policy_strategy=current_loss_mode,
                             off_policy_reshape=off_policy_reshape,
-                            se_mask=se_mask
+                            se_mask=se_mask,
+                            on_rl_mask_neg_adv=on_rl_mask_neg_adv,
                         )
                         pg_loss = ret_dict['pg_loss']
                         off_pg_loss = ret_dict['off_pg_loss']

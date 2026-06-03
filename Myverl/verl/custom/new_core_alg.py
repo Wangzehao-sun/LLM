@@ -430,6 +430,7 @@ def compute_token_on_off_sft_loss(
     off_policy_loss_type="sft", # "sft", "none"
     sft_gate_threshold=0.2,
     sft_gate_tau=0.01,
+    on_rl_mask_neg_adv=False,  # whether to mask out tokens with negative advantage in on-policy RL
 ):
     """
     """
@@ -471,6 +472,9 @@ def compute_token_on_off_sft_loss(
             on_losses = torch.where(advantages < 0, on_pg_losses_clip2, on_pg_losses_clip)
         else:
             on_losses = on_pg_losses
+        # optionally zero out negative-advantage tokens in on-policy RL
+        if on_rl_mask_neg_adv:
+            on_losses = on_losses * (advantages >= 0).float()
     elif on_policy_loss_type == "none":
         on_losses = torch.zeros_like(log_prob)
     else:
