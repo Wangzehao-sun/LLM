@@ -535,7 +535,11 @@ def compute_token_on_off_sft_loss(
     if off_pg_loss.isnan().item() is True:
         off_pg_loss = torch.tensor(0.0)
 
-    on_pg_loss = verl_F.masked_mean(on_pg_losses, (1.0 - prefix_mask) * response_mask * reward_mask)
+    # on-policy mask: when on_rl_mask_neg_adv is enabled, exclude negative-advantage tokens from denominator
+    on_effective_mask = (1.0 - prefix_mask) * response_mask * reward_mask
+    if on_rl_mask_neg_adv:
+        on_effective_mask = on_effective_mask * (advantages >= 0).float()
+    on_pg_loss = verl_F.masked_mean(on_pg_losses, on_effective_mask)
     if on_pg_loss.isnan().item() is True:
         on_pg_loss = torch.tensor(0.0)
 
