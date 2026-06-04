@@ -1063,7 +1063,8 @@ class NewRayPPOTrainer(RayPPOTrainer):
                     print(f"Buffer training complete. {buffer_round} rounds processed. Remaining buffer: {len(failed_questions_buffer)}")
 
                 # Normal training step
-                is_last_step, last_val_metrics, new_failed_items = self._train_step_internal(batch_dict, epoch, logger, progress_bar, collect_failures=self.config.data.get('collect_failures', False),is_failure_recycle_step=False)
+                _collect_failures = self.config.data.get('collect_failures', False) and self.global_steps >= self.config.data.get('extra_step_start_after', 0)
+                is_last_step, last_val_metrics, new_failed_items = self._train_step_internal(batch_dict, epoch, logger, progress_bar, collect_failures=_collect_failures, is_failure_recycle_step=False)
                 
                 # Add new failures to buffer
                 if new_failed_items:
