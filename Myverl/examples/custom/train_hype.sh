@@ -74,6 +74,8 @@ python -m verl.trainer.main_ppo_new \
     +data.retain_accuracy_low=0.25 \
     +data.retain_accuracy_high=0.75 \
     +data.max_recycle_count=3 \
+    +data.max_rounds_per_trigger=2 \
+    +data.extra_step_interval=3 \
     reward_model.reward_manager='math' \
     +se_model.enable=False \
     +actor_rollout_se.model.path=$MODEL_PATH \

@@ -998,20 +998,24 @@ class NewRayPPOTrainer(RayPPOTrainer):
         failure_buffer_max_size = self.config.data.get('failure_buffer_max_size', 128)  # e.g., 64
         retain_hard_in_buffer = self.config.data.get('retain_hard_in_buffer', False)
         max_recycle_count = self.config.data.get('max_recycle_count', 5)  # 超过此次数不再回收
+        max_rounds_per_trigger = self.config.data.get('max_rounds_per_trigger', 999)  # max batches to process per trigger
+        extra_step_interval = self.config.data.get('extra_step_interval', 1)  # at least K normal steps between extra_step triggers
+        steps_since_last_extra = 0  # counter for cooldown
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
-                
+
                 # Check if buffer is full enough to trigger training on failed samples
-                if len(failed_questions_buffer) >= failure_buffer_max_size:
+                # Also requires at least extra_step_interval normal steps since last extra_step
+                if len(failed_questions_buffer) >= failure_buffer_max_size and steps_since_last_extra >= extra_step_interval:
                     print(f"Failed questions buffer reached {len(failed_questions_buffer)} items. Training on failed samples...")
 
                     n_recycle_failure = self.config.data.get('n_recycle_failure', 2)
                     train_batch_size = len(batch_dict['input_ids'])  # use normal batch size as chunk size
                     buffer_round = 0
 
-                    # Loop through the buffer, consuming one batch at a time
-                    while len(failed_questions_buffer) >= train_batch_size:
+                    # Loop through the buffer, consuming one batch at a time (limited by max_rounds_per_trigger)
+                    while len(failed_questions_buffer) >= train_batch_size and buffer_round < max_rounds_per_trigger:
                         buffer_round += 1
                         current_batch_size = train_batch_size
 
@@ -1061,10 +1065,12 @@ class NewRayPPOTrainer(RayPPOTrainer):
                             print(f"Round {buffer_round}: retained {retained_count} hard questions (dropped {dropped_count} exceeding max_recycle_count={max_recycle_count}). Buffer size: {len(failed_questions_buffer)}")
 
                     print(f"Buffer training complete. {buffer_round} rounds processed. Remaining buffer: {len(failed_questions_buffer)}")
+                    steps_since_last_extra = 0  # reset cooldown after extra_step
 
                 # Normal training step
                 _collect_failures = self.config.data.get('collect_failures', False) and self.global_steps >= self.config.data.get('extra_step_start_after', 0)
                 is_last_step, last_val_metrics, new_failed_items = self._train_step_internal(batch_dict, epoch, logger, progress_bar, collect_failures=_collect_failures, is_failure_recycle_step=False)
+                steps_since_last_extra += 1  # increment cooldown counter after each normal step
                 
                 # Add new failures to buffer
                 if new_failed_items:
