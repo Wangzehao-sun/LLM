@@ -156,7 +156,7 @@ def process_think_process(
         return [0] * num_stages
 
     total_len = len(think_process)
-    linear_steps = np.linspace(0, 1, num_stages + 1)[1:]
+    linear_steps = np.linspace(0, 1, num_stages)
     ratios = np.power(linear_steps, curve_power)
 
     split_counts: List[int] = []

@@ -334,36 +334,36 @@ class NewRayPPOTrainer(RayPPOTrainer):
         from torchdata.stateful_dataloader import StatefulDataLoader
         from verl.trainer.main_ppo_new import create_rl_dataset, create_rl_sampler
         self.train_dataset = RLHFDatasetWithTarget(parquet_files=self.config.data.train_files,
-                                         tokenizer=self.tokenizer,
-                                         config=self.config.data,
-                                         max_target_length=self.config.actor_rollout_ref.rollout.max_prefix_len,
-                                         filter_targets=self.config.data.get('filter_targets', False),
-                                         sample_target_ratio=self.config.data.get('sample_target_ratio', 1.0),
-                                         target_key=self.config.data.get('target_key', 'target'),
-                                         use_se=self.config.data.get('use_se', True),)
+                                        tokenizer=self.tokenizer,
+                                        config=self.config.data,
+                                        max_target_length=self.config.actor_rollout_ref.rollout.max_prefix_len,
+                                        filter_targets=self.config.data.get('filter_targets', False),
+                                        sample_target_ratio=self.config.data.get('sample_target_ratio', 1.0),
+                                        target_key=self.config.data.get('target_key', 'target'),
+                                        use_se=self.config.data.get('use_se', True),)
 
         # use sampler for better ckpt resume
         if train_sampler is None:
             train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
 
         self.train_dataloader = StatefulDataLoader(dataset=self.train_dataset,
-                                           batch_size=self.config.data.train_batch_size,
-                                           num_workers=self.config.data.get("dataloader_num_workers", 8),
-                                           drop_last=True,
-                                           collate_fn=defaultcollate_fn if collate_fn is None else collate_fn,
-                                           sampler=train_sampler)
+                                        batch_size=self.config.data.train_batch_size,
+                                        num_workers=self.config.data.get("dataloader_num_workers", 8),
+                                        drop_last=True,
+                                        collate_fn=defaultcollate_fn if collate_fn is None else collate_fn,
+                                        sampler=train_sampler)
         val_batch_size = self.config.data.val_batch_size  # Prefer config value if set
         if val_batch_size is None:
             val_batch_size = len(self.val_dataset)
         self.val_dataset = RLHFDataset(data_files=self.config.data.val_files,
-                                       tokenizer=self.tokenizer,
-                                       config=self.config.data)
+                                    tokenizer=self.tokenizer,
+                                    config=self.config.data)
         self.val_dataloader = StatefulDataLoader(dataset=self.val_dataset,
-                                         batch_size=val_batch_size,
-                                         num_workers=self.config.data.get("dataloader_num_workers", 8),
-                                         shuffle=False,
-                                         drop_last=True,
-                                         collate_fn=defaultcollate_fn if collate_fn is None else collate_fn,)
+                                        batch_size=val_batch_size,
+                                        num_workers=self.config.data.get("dataloader_num_workers", 8),
+                                        shuffle=False,
+                                        drop_last=True,
+                                        collate_fn=defaultcollate_fn if collate_fn is None else collate_fn,)
 
         assert len(self.train_dataloader) >= 1, "Train dataloader is empty!"
         assert len(self.val_dataloader) >= 1, "Validation dataloader is empty!"
@@ -556,7 +556,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
             train_batch_size (int): 训练批次大小。
             prefix_ratio (float): 要使用的 tgt 序列的长度比例 (0.0 到 1.0)。
             prefix_lens (list, optional): List of integer lengths for each sample to determine prefix size. 
-                                          If provided, overrides prefix_ratio.
+                                        If provided, overrides prefix_ratio.
 
         Returns:
             DataProto: 更新了 'input_ids', 'attention_mask', 'position_ids' 的 gen_batch_off。
@@ -579,12 +579,12 @@ class NewRayPPOTrainer(RayPPOTrainer):
         #print("tgt_list lengths:", [len(t) for t in tgt_list])
         # 2. 根据 prefix_ratio 或 prefix_lens 截断 tgt 序列
         if prefix_lens is not None:
-             prefix_list = []
-             for i in range(len(tgt_list)):
-                 length = int(prefix_lens[i])
-                 # Clip length to be safe
-                 length = min(length, len(tgt_list[i]))
-                 prefix_list.append(tgt_list[i][:length])
+            prefix_list = []
+            for i in range(len(tgt_list)):
+                length = int(prefix_lens[i])
+                # Clip length to be safe
+                length = min(length, len(tgt_list[i]))
+                prefix_list.append(tgt_list[i][:length])
         else:
              prefix_list = [tgt_list[i][:int(len(tgt_list[i]) * prefix_ratio)] for i in range(len(tgt_list))]
         
@@ -627,6 +627,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
         off_responses: torch.Tensor,
         prefix_list: list,
         train_batch_size: int,
+        tgt_lengths: list = None,
     ) -> DataProto:
         """
         根据离线目标(prefix_list)的前缀和模型生成的响应(off_responses)构建混合的off-policy输出。
@@ -636,6 +637,9 @@ class NewRayPPOTrainer(RayPPOTrainer):
             off_responses (torch.Tensor): 模型为off-policy prompts生成的响应张量。
             prefix_list (list): 序列列表,每个元素为token_id的列表。
             train_batch_size (int): 原始训练批次大小。
+            tgt_lengths (list, optional): 每个sample的完整tgt长度(含eos)。
+                当prefix覆盖完整tgt时只使用prefix,不拼接生成内容。
+                If None, fallback to old behavior: last element in group uses only prefix.
 
         Returns:
             DataProto: 构建完成并经过repeat的off-policy输出。
@@ -677,11 +681,17 @@ class NewRayPPOTrainer(RayPPOTrainer):
         
         #max_response_len = max(self.config.data.max_response_length,off_responses.size(1))
         for i in range(off_len):
-            # If it is the last element in the group, only use the prefix
-            if (i + 1) % n_repeat == 0:
-                 final_responses.append(torch.tensor(tgt_prefixes[i], dtype=dtype))
+            # Determine if this prefix covers the full tgt (no need to append generation)
+            if tgt_lengths is not None:
+                use_only_prefix = len(tgt_prefixes[i]) >= tgt_lengths[i]
             else:
-                 final_responses.append(torch.tensor(tgt_prefixes[i]+ off_responses_list[i], dtype=dtype))
+                # Fallback: old behavior, last element in group uses only prefix
+                use_only_prefix = (i + 1) % n_repeat == 0
+
+            if use_only_prefix:
+                final_responses.append(torch.tensor(tgt_prefixes[i], dtype=dtype))
+            else:
+                final_responses.append(torch.tensor(tgt_prefixes[i]+ off_responses_list[i], dtype=dtype))
             
             prefix_len = min(len(tgt_prefixes[i]), max_response_len)
             prefix_mask[i, :prefix_len] = 1
@@ -1035,9 +1045,9 @@ class NewRayPPOTrainer(RayPPOTrainer):
                     # print(f"Added {len(new_failed_items)} failed items to buffer. Current size: {len(failed_questions_buffer)}")
 
                 if is_last_step:
-                     pprint(f"Final validation metrics: {last_val_metrics}")
-                     progress_bar.close()
-                     return
+                    pprint(f"Final validation metrics: {last_val_metrics}")
+                    progress_bar.close()
+                    return
 
 
     def _train_step_internal(self, batch_dict, epoch, logger, progress_bar, collect_failures=False, is_failure_recycle_step=False, recycle_sub_step=0):
@@ -1093,7 +1103,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
         #没有
         if "interaction_kwargs" in batch.non_tensor_batch:
             non_tensor_batch_keys_to_pop.append("interaction_kwargs")
-         #提取用于生成的batch
+        #提取用于生成的batch
         gen_batch = batch.pop(
             batch_keys=batch_keys_to_pop,
             #non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
@@ -1154,121 +1164,124 @@ class NewRayPPOTrainer(RayPPOTrainer):
         prefix_lists = None
         if is_failure_recycle_step:
             if 'se_input_ids' in batch.batch and self.config.actor_rollout_ref.rollout.n_se>0:
-                 print(f"Recycle Step: Using se_input_ids for generation.")
-                 gen_batch.batch['input_ids'] = batch.batch['se_input_ids']
-                 if 'se_attention_mask' in batch.batch:
-                     gen_batch.batch['attention_mask'] = batch.batch['se_attention_mask']
-                 if 'se_position_ids' in batch.batch:
-                     gen_batch.batch['position_ids'] = batch.batch['se_position_ids']
+                print(f"Recycle Step: Using se_input_ids for generation.")
+                gen_batch.batch['input_ids'] = batch.batch['se_input_ids']
+                if 'se_attention_mask' in batch.batch:
+                    gen_batch.batch['attention_mask'] = batch.batch['se_attention_mask']
+                if 'se_position_ids' in batch.batch:
+                    gen_batch.batch['position_ids'] = batch.batch['se_position_ids']
             elif 'tgt_input_ids' in batch.batch and self.config.actor_rollout_ref.rollout.n_prefix>0:
-                 print(f"Recycle Step: Using tgt_input_ids with progressive prefix for generation.")
-                 # Determine n_repeat based on loss mode logic
-                 n_repeat = self.config.actor_rollout_ref.rollout.n_prefix
-                 n_total = n_repeat
-                 
-                 tgt_input_ids = batch.batch['tgt_input_ids']
+                print(f"Recycle Step: Using tgt_input_ids with progressive prefix for generation.")
+                # Determine n_repeat based on loss mode logic
+                n_repeat = self.config.actor_rollout_ref.rollout.n_prefix
+                n_total = n_repeat
+                
+                tgt_input_ids = batch.batch['tgt_input_ids']
 
-                 # 1. Use declared ratio (linear)
-                 # 2. Use token_split_points
-                 # 3. Use seven ratios as 0, one ratio as 1
-                 
-                 # Logic: prioritise token_split_points if available, else linear. 
-                 # Controlled by config parameter 'prefix_mode' (default: 'auto')
-                 
-                 prefix_mode = self.config.actor_rollout_ref.rollout.get('prefix_mode', 'sparse')
-                 
+                # 1. Use declared ratio (linear)
+                # 2. Use token_split_points
+                # 3. Use seven ratios as 0, one ratio as 1
+                
+                # Logic: prioritise token_split_points if available, else linear. 
+                # Controlled by config parameter 'prefix_mode' (default: 'auto')
+                
+                prefix_mode = self.config.actor_rollout_ref.rollout.get('prefix_mode', 'sparse')
+                
 
-                 if prefix_mode == 'sparse':
-                     token_split_points = None
-                     ratios = np.zeros(n_repeat)
-                     if n_repeat > 0:
-                         ratios[-1] = 1.0
-                 elif prefix_mode == 'token_split':
-                     token_split_points = batch.non_tensor_batch.get('token_split_points', None)
-                     ratios = np.linspace(0, 1, n_repeat)
-                 else: # linear
-                     token_split_points = None
-                     ratios = np.linspace(0, 1, n_repeat)
-                 
-                 # Extract original tensors to use as a base for each ratio
-                 original_input_ids = gen_batch.batch['input_ids']
-                 original_attention_mask = gen_batch.batch['attention_mask']
-                 original_position_ids = gen_batch.batch['position_ids']
-                 
-                 input_ids_list = []
-                 
-                 total_prefix_list = []
-                 for step_i, ratio in enumerate(ratios):
-                     # Create a temporary DataProto for the existing helper function
-                     # We must clone because DataProto wraps the tensors
-                     temp_batch = DataProto.from_single_dict({
-                         "input_ids": original_input_ids.clone(),
-                         "attention_mask": original_attention_mask.clone(),
-                         "position_ids": original_position_ids.clone()
-                     })
-                     
-                     # Determine prefix_lens for this step if token_split_points is available
-                     # step_i == 0 always uses ratio=0 (pure on-policy, no prefix)
-                     current_prefix_lens = None
-                     if token_split_points is not None and step_i > 0 and step_i < n_repeat - 1:
-                         current_prefix_lens = []
-                         for b_i in range(train_batch_size):
-                             points = token_split_points[b_i]
-                             # Safe handling for mapping step_i to index in points
-                             if isinstance(points, (np.ndarray, list)) and len(points) > 0:
-                                 # Map step_i (0..n_repeat-1) to index in points (0..len(points)-1)
-                                 # If n_repeat matches len(points), idx maps 1-to-1.
-                                 if n_repeat > 1:
-                                     idx = int(step_i / (n_repeat - 1) * (len(points) - 1))
-                                 else:
-                                     idx = len(points) - 1
-                                     
-                                 # Boundary check
-                                 idx = min(max(0, idx), len(points) - 1)
-                                 current_prefix_lens.append(points[idx])
-                             else:
-                                 # Fallback if specific sample has no points: use 0 or handle logic to fallback to ratio
-                                 # Here we use 0 to avoid errors, but effectively this sample gets no prefix.
-                                 current_prefix_lens.append(0)
+                if prefix_mode == 'sparse':
+                    token_split_points = None
+                    ratios = np.zeros(n_repeat)
+                    if n_repeat > 0:
+                        ratios[-1] = 1.0
+                elif prefix_mode in ['token_split_full', 'token_split_mix']:
+                    token_split_points = batch.non_tensor_batch.get('token_split_points', None)
+                    ratios = np.linspace(0, 1, n_repeat)  # fallback when points unavailable
+                else: # linear
+                    token_split_points = None
+                    ratios = np.linspace(0, 1, n_repeat)
+                
+                # Extract original tensors to use as a base for each ratio
+                original_input_ids = gen_batch.batch['input_ids']
+                original_attention_mask = gen_batch.batch['attention_mask']
+                original_position_ids = gen_batch.batch['position_ids']
+                
+                input_ids_list = []
+                
+                total_prefix_list = []
+                for step_i, ratio in enumerate(ratios):
+                    # Create a temporary DataProto for the existing helper function
+                    # We must clone because DataProto wraps the tensors
+                    temp_batch = DataProto.from_single_dict({
+                        "input_ids": original_input_ids.clone(),
+                        "attention_mask": original_attention_mask.clone(),
+                        "position_ids": original_position_ids.clone()
+                    })
 
-                     # Apply existing logic using the helper
-                     processed_batch, _,prefix_list = self._prepare_off_policy_from_tgt(
-                         tgt_input_ids, temp_batch, train_batch_size, ratio, prefix_lens=current_prefix_lens
-                     )
-                     input_ids_list.append(processed_batch.batch['input_ids'])
-                     total_prefix_list.append(prefix_list)
-                 
-                 # Combine results: Left Pad (Right Align) -> Stack Interleaved -> Flatten
-                 max_len = max(t.size(1) for t in input_ids_list)
-                 pad_token_id = self.tokenizer.pad_token_id
-                 padded_tensors = []
-                 
-                 for t in input_ids_list:
-                     if t.size(1) < max_len:
-                         # Pad specifically with pad_token_id
-                         padding = torch.full((t.size(0), max_len - t.size(1)), pad_token_id, dtype=t.dtype, device=t.device)
-                         padded_tensors.append(torch.cat([padding, t], dim=1))
-                     else:
-                         padded_tensors.append(t)
-                 
-                 # Stack dim=1 for interleaved layout: (B, N, L) -> (B*N, L)
-                 input_ids_new = torch.stack(padded_tensors, dim=1).view(-1, max_len)
-                 
-                 # Re-generate masks consistent with new input_ids
-                 attention_mask_new, position_ids_new = generate_masks_from_input_ids(
-                     input_ids_new, pad_token_id, gen_batch.batch['attention_mask'].dtype
-                 )
+                    # Determine prefix_lens for this step
+                    # In token_split modes: direct 1-to-1 mapping step_i -> points[step_i]
+                    # (points[0]=0 means pure on-policy, no gate needed)
+                    # token_split_mix: last step forced to ratio=1.0 (full tgt)
+                    current_prefix_lens = None
+                    if token_split_points is not None:
+                        # token_split_mix: last step skips points, falls back to ratio=1.0
+                        if prefix_mode == 'token_split_mix' and step_i == n_repeat - 1:
+                            current_prefix_lens = None  # use ratio=1.0 fallback
+                        else:
+                            current_prefix_lens = []
+                            for b_i in range(train_batch_size):
+                                points = token_split_points[b_i]
+                                if isinstance(points, (np.ndarray, list)) and len(points) > step_i:
+                                    current_prefix_lens.append(int(points[step_i]))
+                                else:
+                                    # Fallback: use ratio-based length
+                                    current_prefix_lens.append(None)
+                            # If any sample has None fallback, use ratio for those
+                            if any(v is None for v in current_prefix_lens):
+                                current_prefix_lens = None
 
-                 # Repeat gen_batch first to handle metadata interleaving
-                 gen_batch = gen_batch.repeat(repeat_times=n_repeat, interleave=True)
-                 
-                 gen_batch.batch['input_ids'] = input_ids_new
-                 gen_batch.batch['attention_mask'] = attention_mask_new
-                 gen_batch.batch['position_ids'] = position_ids_new
-                 
-                 # Align prefix_lists with gen_batch order (Interleaved: S0_R0, S0_R1, ..., S1_R0, S1_R1...)
-                 prefix_lists = [p for sample_prefixes in zip(*total_prefix_list) for p in sample_prefixes]
-                 manual_repeat = True
+                    # Apply existing logic using the helper
+                    processed_batch, tgt_list_full, prefix_list = self._prepare_off_policy_from_tgt(
+                        tgt_input_ids, temp_batch, train_batch_size, ratio, prefix_lens=current_prefix_lens
+                    )
+                    input_ids_list.append(processed_batch.batch['input_ids'])
+                    total_prefix_list.append(prefix_list)
+                    # Save tgt lengths from first iteration (same for all steps)
+                    if step_i == 0:
+                        tgt_lengths_per_sample = [len(t) for t in tgt_list_full]
+                
+                # Combine results: Left Pad (Right Align) -> Stack Interleaved -> Flatten
+                max_len = max(t.size(1) for t in input_ids_list)
+                pad_token_id = self.tokenizer.pad_token_id
+                padded_tensors = []
+                
+                for t in input_ids_list:
+                    if t.size(1) < max_len:
+                        # Pad specifically with pad_token_id
+                        padding = torch.full((t.size(0), max_len - t.size(1)), pad_token_id, dtype=t.dtype, device=t.device)
+                        padded_tensors.append(torch.cat([padding, t], dim=1))
+                    else:
+                        padded_tensors.append(t)
+                
+                # Stack dim=1 for interleaved layout: (B, N, L) -> (B*N, L)
+                input_ids_new = torch.stack(padded_tensors, dim=1).view(-1, max_len)
+                
+                # Re-generate masks consistent with new input_ids
+                attention_mask_new, position_ids_new = generate_masks_from_input_ids(
+                    input_ids_new, pad_token_id, gen_batch.batch['attention_mask'].dtype
+                )
+
+                # Repeat gen_batch first to handle metadata interleaving
+                gen_batch = gen_batch.repeat(repeat_times=n_repeat, interleave=True)
+                
+                gen_batch.batch['input_ids'] = input_ids_new
+                gen_batch.batch['attention_mask'] = attention_mask_new
+                gen_batch.batch['position_ids'] = position_ids_new
+                
+                # Align prefix_lists with gen_batch order (Interleaved: S0_R0, S0_R1, ..., S1_R0, S1_R1...)
+                prefix_lists = [p for sample_prefixes in zip(*total_prefix_list) for p in sample_prefixes]
+                # Expand tgt_lengths to match interleaved order (each sample repeated n_repeat times)
+                tgt_lengths_interleaved = [l for l in tgt_lengths_per_sample for _ in range(n_repeat)]
+                manual_repeat = True
 
         if not manual_repeat:
             if self.config.actor_rollout_ref.actor.policy_loss.loss_mode=='se_filter':
@@ -1291,27 +1304,28 @@ class NewRayPPOTrainer(RayPPOTrainer):
                 gen_batch_output.meta_info.pop("timing", None)
 
                 if prefix_lists is not None:
-                     # Temporary overwrite n_off to make _build_hybrid_off_policy_output work
-                     #saved_n_off = self.config.actor_rollout_ref.rollout.n_off
-                     #self.config.actor_rollout_ref.rollout.n_off = self.config.actor_rollout_ref.rollout.n_prefix
-                     
-                     # Use existing helper to construct hybrid output
-                     # We pass prefix_lists as prefix_list so it uses the full prefix from our list
-                     # gen_batch has interleaved structure (S0_R0, S0_R1...), so n_divide=n_prefix allows extracting S0_R0 (clean prompt)
-                     gen_batch_output = self._build_hybrid_off_policy_output(
-                         n_divide=self.config.actor_rollout_ref.rollout.n_prefix,
-                         n_repeat=self.config.actor_rollout_ref.rollout.n_prefix,
-                         gen_batch=gen_batch, 
-                         off_responses=gen_batch_output.batch['responses'],
-                         prefix_list=prefix_lists,
-                         train_batch_size=train_batch_size,
-                     )
-                     
-                     #self.config.actor_rollout_ref.rollout.n_off = saved_n_off
+                    # Temporary overwrite n_off to make _build_hybrid_off_policy_output work
+                    #saved_n_off = self.config.actor_rollout_ref.rollout.n_off
+                    #self.config.actor_rollout_ref.rollout.n_off = self.config.actor_rollout_ref.rollout.n_prefix
+                    
+                    # Use existing helper to construct hybrid output
+                    # We pass prefix_lists as prefix_list so it uses the full prefix from our list
+                    # gen_batch has interleaved structure (S0_R0, S0_R1...), so n_divide=n_prefix allows extracting S0_R0 (clean prompt)
+                    gen_batch_output = self._build_hybrid_off_policy_output(
+                        n_divide=self.config.actor_rollout_ref.rollout.n_prefix,
+                        n_repeat=self.config.actor_rollout_ref.rollout.n_prefix,
+                        gen_batch=gen_batch,
+                        off_responses=gen_batch_output.batch['responses'],
+                        prefix_list=prefix_lists,
+                        train_batch_size=train_batch_size,
+                        tgt_lengths=tgt_lengths_interleaved,
+                    )
+                    
+                    #self.config.actor_rollout_ref.rollout.n_off = saved_n_off
                 else:
                     #为gen_batch-output添加prefix_mask字段，表示哪些response token是离线的
                     gen_batch_output.batch['prefix_mask'] = torch.zeros((gen_batch_output.batch['responses'].size(0), gen_batch_output.batch['responses'].size(1)),
-                                       dtype=torch.bool) # empty dummy tensor
+                                    dtype=torch.bool) # empty dummy tensor
             #import time
             #time.sleep(5) # wait for a while to make the logs more readable
             with marked_timer("gen_off", timing_raw, color="blue"):
@@ -1357,7 +1371,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
                     elif self.config.actor_rollout_ref.rollout.n_se>0:
 
                         gen_batch_output.batch['off_old_log_probs'] = torch.zeros((gen_batch_output.batch['responses'].size(0), gen_batch_output.batch['responses'].size(1)),
-                                   dtype=torch.float32)
+                                dtype=torch.float32)
                         
 
                         gen_batch_off.meta_info['is_se'] = True
@@ -1497,12 +1511,12 @@ class NewRayPPOTrainer(RayPPOTrainer):
             if n_off>0:
                 if self.config.actor_rollout_ref.rollout.n_prefix>0:
                     batch.batch['se_mask'] = torch.zeros((batch.batch['responses'].size(0), batch.batch['responses'].size(1)),
-                                   dtype=torch.bool)
+                                dtype=torch.bool)
                 elif self.config.actor_rollout_ref.rollout.n_se>0:
                     batch.batch['se_mask'] = deepcopy(batch.batch['prefix_mask'])
             else:
                 batch.batch['se_mask'] = torch.zeros((batch.batch['responses'].size(0), batch.batch['responses'].size(1)),
-                                   dtype=torch.bool)
+                                dtype=torch.bool)
             metrics['batch/avg_prefix_ratio'] = prefix_ratio
             
             # Balance the number of valid tokens across DP ranks.
@@ -1578,35 +1592,35 @@ class NewRayPPOTrainer(RayPPOTrainer):
                     
                     if off_policy_mask_np[uid_mask].any() and self.config.actor_rollout_ref.actor.policy_loss.off_policy_masking==True:
                         if is_failure_recycle_step:
-                             # Filter for mixed samples within this UID group
-                             group_indices = np.where(uid_mask)[0]
-                             
-                             # Access masks. Note: indexing with numpy array on GPU tensor works
-                             grp_prefix_mask = batch.batch['prefix_mask'][group_indices]
-                             grp_response_mask = batch.batch['response_mask'][group_indices]
-                             
-                             # Compute mixed condition. 
-                             # Keep computation on the device of the masks (likely GPU) for speed
-                             has_off = grp_prefix_mask.any(dim=1)
-                             has_on = (grp_response_mask & ~grp_prefix_mask).any(dim=1)
-                             is_mixed = has_off & has_on # boolean tensor (G,)
-                             
-                             is_incorrect = (uid_rewards == fail_value)
-                             if is_incorrect.device != is_mixed.device:
-                                 is_incorrect = is_incorrect.to(is_mixed.device)
-                             
-                             # Bring boolean condition to CPU to select indices
-                             is_target_np = (is_mixed).cpu().numpy()
-                             
-                             # Indices in batch where is_mixed is True
-                             mixed_batch_indices = group_indices[is_target_np]
-                             
-                             if len(mixed_batch_indices) > 0:
-                                 target_prefix_mask = batch.batch['prefix_mask'][mixed_batch_indices]
-                                 if reward_mask.device != target_prefix_mask.device:
-                                     target_prefix_mask = target_prefix_mask.to(reward_mask.device)
-                                 
-                                 reward_mask[mixed_batch_indices] = reward_mask[mixed_batch_indices] & (~target_prefix_mask)
+                            # Filter for mixed samples within this UID group
+                            group_indices = np.where(uid_mask)[0]
+                            
+                            # Access masks. Note: indexing with numpy array on GPU tensor works
+                            grp_prefix_mask = batch.batch['prefix_mask'][group_indices]
+                            grp_response_mask = batch.batch['response_mask'][group_indices]
+                            
+                            # Compute mixed condition. 
+                            # Keep computation on the device of the masks (likely GPU) for speed
+                            has_off = grp_prefix_mask.any(dim=1)
+                            has_on = (grp_response_mask & ~grp_prefix_mask).any(dim=1)
+                            is_mixed = has_off & has_on # boolean tensor (G,)
+                            
+                            is_incorrect = (uid_rewards == fail_value)
+                            if is_incorrect.device != is_mixed.device:
+                                is_incorrect = is_incorrect.to(is_mixed.device)
+                            
+                            # Bring boolean condition to CPU to select indices
+                            is_target_np = (is_mixed).cpu().numpy()
+                            
+                            # Indices in batch where is_mixed is True
+                            mixed_batch_indices = group_indices[is_target_np]
+                            
+                            if len(mixed_batch_indices) > 0:
+                                target_prefix_mask = batch.batch['prefix_mask'][mixed_batch_indices]
+                                if reward_mask.device != target_prefix_mask.device:
+                                    target_prefix_mask = target_prefix_mask.to(reward_mask.device)
+                                
+                                reward_mask[mixed_batch_indices] = reward_mask[mixed_batch_indices] & (~target_prefix_mask)
 
                         else:
                             if self.config.actor_rollout_ref.actor.policy_loss.loss_mode in ['luffy','se']:
@@ -1674,22 +1688,22 @@ class NewRayPPOTrainer(RayPPOTrainer):
                 # Iterate unique indices
                 failed_original_indices = []
                 for idx_val in unique_indices:
-                     # Get all rollouts for this question
-                     mask = (orig_idx_np == idx_val)
-                     rewards_for_q = reward_np[mask]
+                    # Get all rollouts for this question
+                    mask = (orig_idx_np == idx_val)
+                    rewards_for_q = reward_np[mask]
 
-                     if is_failure_recycle_step and self.config.data.get('retain_hard_in_buffer', False):
-                         # Recycle mode: retain questions with accuracy in (low_threshold, high_threshold)
-                         # Skip accuracy == 0 (completely unsolvable) and accuracy >= high (already learned)
-                         accuracy = (rewards_for_q == success_value).sum() / max(len(rewards_for_q), 1)
-                         retain_low_threshold = self.config.data.get('retain_accuracy_low', 0.25)
-                         retain_high_threshold = self.config.data.get('retain_accuracy_high', 0.75)
-                         if retain_low_threshold < accuracy < retain_high_threshold:
-                             failed_original_indices.append(idx_val)
-                     else:
-                         # Normal mode: only collect when ALL rollouts failed
-                         if (rewards_for_q == fail_value).all():
-                             failed_original_indices.append(idx_val)
+                    if is_failure_recycle_step and self.config.data.get('retain_hard_in_buffer', False):
+                        # Recycle mode: retain questions with accuracy in (low_threshold, high_threshold)
+                        # Skip accuracy == 0 (completely unsolvable) and accuracy >= high (already learned)
+                        accuracy = (rewards_for_q == success_value).sum() / max(len(rewards_for_q), 1)
+                        retain_low_threshold = self.config.data.get('retain_accuracy_low', 0.25)
+                        retain_high_threshold = self.config.data.get('retain_accuracy_high', 0.75)
+                        if retain_low_threshold < accuracy < retain_high_threshold:
+                            failed_original_indices.append(idx_val)
+                    else:
+                        # Normal mode: only collect when ALL rollouts failed
+                        if (rewards_for_q == fail_value).all():
+                            failed_original_indices.append(idx_val)
                 
                 # Now extract items from batch_dict
                 # batch_dict has keys like 'input_ids', etc.
@@ -1918,10 +1932,10 @@ class NewRayPPOTrainer(RayPPOTrainer):
                     batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                     
                     if is_failure_recycle_step:
-                         recycle_loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("recycle_loss_mode", None)
-                         if recycle_loss_mode:
-                             print(f"Recycle Step: Overriding loss_mode to {recycle_loss_mode}")
-                             batch.meta_info["loss_mode"] = recycle_loss_mode
+                        recycle_loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("recycle_loss_mode", None)
+                        if recycle_loss_mode:
+                            print(f"Recycle Step: Overriding loss_mode to {recycle_loss_mode}")
+                            batch.meta_info["loss_mode"] = recycle_loss_mode
                     
                     actor_output = self.actor_rollout_wg.update_actor(batch)
                 actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
@@ -2050,7 +2064,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
         last_val_metrics = None
 
         #这一块儿的代码好像没啥用
-       
+
         total_entropy_list = []
         total_probs_list = []
         for epoch in range(self.config.trainer.total_epochs):
