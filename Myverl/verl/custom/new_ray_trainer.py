@@ -965,6 +965,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
         )
 
         self.global_steps = 0
+        self.extra_steps = 0  # independent counter for recycle/extra training steps (starts from 1)
 
         # load checkpoint before doing anything
         self._load_checkpoint()
@@ -1062,7 +1063,8 @@ class NewRayPPOTrainer(RayPPOTrainer):
                     print(f"Buffer training complete. {buffer_round} rounds processed. Remaining buffer: {len(failed_questions_buffer)}")
 
                 # Normal training step
-                is_last_step, last_val_metrics, new_failed_items = self._train_step_internal(batch_dict, epoch, logger, progress_bar, collect_failures=self.config.data.get('collect_failures', False),is_failure_recycle_step=False)
+                _collect_failures = self.config.data.get('collect_failures', False) and self.global_steps >= self.config.data.get('extra_step_start_after', 0)
+                is_last_step, last_val_metrics, new_failed_items = self._train_step_internal(batch_dict, epoch, logger, progress_bar, collect_failures=_collect_failures, is_failure_recycle_step=False)
                 
                 # Add new failures to buffer
                 if new_failed_items:
@@ -1089,9 +1091,14 @@ class NewRayPPOTrainer(RayPPOTrainer):
         metrics = {}
         timing_raw = {}
         failed_items = []
-        # For recycle steps, offset the log step to avoid tensorboard/wandb overwrite
-        # at the same global_steps. Normal steps use global_steps directly.
-        _log_step = self.global_steps * 100 + recycle_sub_step + 1 if is_failure_recycle_step else self.global_steps
+        # For recycle steps, use an independent sequential counter (1, 2, 3, ...)
+        # to avoid large step numbers like 2401 on tensorboard x-axis.
+        # Normal steps use global_steps directly.
+        if is_failure_recycle_step:
+            self.extra_steps += 1
+            _log_step = self.extra_steps
+        else:
+            _log_step = self.global_steps
         batch: DataProto = DataProto.from_single_dict(batch_dict)
         # Add original index to track samples for failure collection
         batch.non_tensor_batch['original_index'] = np.arange(len(batch.batch['input_ids']))
@@ -2131,6 +2138,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
         )
 
         self.global_steps = 0
+        self.extra_steps = 0  # independent counter for recycle/extra training steps (starts from 1)
 
         # load checkpoint before doing anything
         self._load_checkpoint()
