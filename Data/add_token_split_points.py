@@ -17,6 +17,83 @@ def init_worker(tokenizer_path: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Final answer extraction & truncation (prevent answer leakage)
+# ---------------------------------------------------------------------------
+
+def _find_boxed_spans(text: str) -> List[Tuple[int, int, str]]:
+    r"""Find all \boxed{...} spans with balanced brace matching.
+
+    Returns list of (start, end, content) tuples where:
+    - start: index of '\' in '\boxed{'
+    - end: index after the closing '}'
+    - content: the text inside the braces
+    """
+    spans = []
+    pattern = re.compile(r"\\boxed\{")
+    for m in pattern.finditer(text):
+        start = m.start()
+        depth = 1
+        i = m.end()
+        while i < len(text) and depth > 0:
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+            i += 1
+        if depth == 0:
+            content = text[m.end():i - 1]
+            spans.append((start, i, content))
+    return spans
+
+
+def _truncate_answer_from_think(think_process: str, full_text: str) -> str:
+    r"""Remove answer leakage from think_process.
+
+    1. Extract the last \boxed{} content from full_text as the final answer.
+    2. In think_process, find the FIRST \boxed{} with matching content.
+    3. Truncate at the sentence boundary before that match.
+
+    Returns truncated text, or original if no leakage found.
+    """
+    # Step 1: get final answer from the last \boxed{} in full text
+    all_spans = _find_boxed_spans(full_text)
+    if not all_spans:
+        return think_process
+    final_answer = all_spans[-1][2].strip()
+    if not final_answer:
+        return think_process
+
+    # Step 2: find first matching \boxed{} in think_process
+    think_spans = _find_boxed_spans(think_process)
+    match_start = None
+    for start, end, content in think_spans:
+        if content.strip() == final_answer:
+            match_start = start
+            break
+
+    if match_start is None:
+        return think_process
+
+    # Step 3: truncate at sentence boundary before the match
+    search_region = think_process[:match_start]
+    # Find the last clean boundary (newline or ". ")
+    last_newline = search_region.rfind("\n")
+    last_period = max(search_region.rfind(". "), search_region.rfind(".\n"))
+    boundary = max(last_newline, last_period)
+
+    if boundary > 0:
+        if search_region[boundary] == "\n":
+            cut_pos = boundary
+        else:
+            cut_pos = boundary + 2  # include ". "
+    else:
+        cut_pos = match_start
+
+    truncated = think_process[:cut_pos].rstrip()
+    return truncated if truncated else think_process
+
+
+# ---------------------------------------------------------------------------
 # Segmentation: paragraph or sentence
 # ---------------------------------------------------------------------------
 
@@ -207,8 +284,12 @@ def process_think_process(
     return split_counts
 
 
-def extract_think_process(item: Dict[str, Any]) -> str:
-    """Extract think process from a row with different possible target formats."""
+def extract_think_process(item: Dict[str, Any]) -> Tuple[str, str]:
+    """Extract think process from a row with different possible target formats.
+
+    Returns (think_process, full_text) tuple. full_text is needed for
+    final answer extraction.
+    """
     target_val = item.get("target", "")
     text = ""
 
@@ -225,10 +306,11 @@ def extract_think_process(item: Dict[str, Any]) -> str:
     else:
         text = item.get("thought_process", "") or item.get("thinking", "") or ""
 
+    full_text = text
     think_process = text.split("</think>")[0].strip()
     if "<think>" in think_process:
         think_process = think_process.replace("<think>", "").strip()
-    return think_process
+    return think_process, full_text
 
 
 def process_single_item(
@@ -238,14 +320,17 @@ def process_single_item(
     split_unit: str,
 ) -> Dict[str, Any]:
     global worker_tokenizer
-    think_process = extract_think_process(item)
+    think_process, full_text = extract_think_process(item)
 
     if worker_tokenizer is None:
         item["token_split_points"] = [0] * num_stages
         return item
 
+    # Truncate think_process before any sentence that leaks the final answer
+    think_process_safe = _truncate_answer_from_think(think_process, full_text)
+
     item["token_split_points"] = process_think_process(
-        think_process,
+        think_process_safe,
         worker_tokenizer,
         num_stages=num_stages,
         curve_power=curve_power,
