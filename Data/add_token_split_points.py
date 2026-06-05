@@ -346,10 +346,139 @@ def _worker_process(
     return process_single_item(item, num_stages, curve_power, split_unit)
 
 
+# ---------------------------------------------------------------------------
+# Post-hoc verification: decode prefix up to last split point, check no leak
+# ---------------------------------------------------------------------------
+
+def _collect_final_answers(full_text: str) -> List[str]:
+    r"""Collect all final-answer contents.
+
+    Final answers are the \boxed{} contents that appear AFTER </think>
+    (the summary section). If there is no </think>, fall back to the last
+    \boxed{} in the whole text.
+    """
+    parts = full_text.split("</think>")
+    if len(parts) >= 2:
+        after = parts[-1]
+        answers = [c.strip() for _, _, c in _find_boxed_spans(after) if c.strip()]
+        if answers:
+            return answers
+    # Fallback: no </think> section -> use the last boxed in full text
+    spans = _find_boxed_spans(full_text)
+    if spans and spans[-1][2].strip():
+        return [spans[-1][2].strip()]
+    return []
+
+
+def verify_no_answer_leak(
+    item: Dict[str, Any],
+    tokenizer,
+) -> Dict[str, Any]:
+    r"""Decode the prefix up to the LAST split point and check for leakage.
+
+    The last split point is the longest prefix; if it is answer-free, all
+    shorter prefixes are too. We re-tokenize the (answer-truncated) think
+    text exactly as the generator did, slice at token_split_points[-1],
+    decode, and look for any final-answer \boxed{} content in it.
+
+    Returns a diagnostic dict with at least:
+        has_answer, leaked, final_answers, last_point, decoded_tail
+    """
+    think_process, full_text = extract_think_process(item)
+    final_answers = _collect_final_answers(full_text)
+
+    points = item.get("token_split_points", None)
+    if isinstance(points, np.ndarray):
+        points = points.tolist()
+
+    result = {
+        "has_answer": bool(final_answers),
+        "final_answers": final_answers,
+        "leaked": False,
+        "leaked_answer": None,
+        "last_point": None,
+        "decoded_tail": "",
+    }
+
+    if not final_answers or not points:
+        return result
+
+    # The text the split points were computed on (answer-truncated)
+    think_safe = _truncate_answer_from_think(think_process, full_text)
+    token_ids = tokenizer(think_safe, add_special_tokens=False).input_ids
+
+    last_point = int(points[-1])
+    last_point = max(0, min(last_point, len(token_ids)))
+    result["last_point"] = last_point
+
+    prefix_text = tokenizer.decode(token_ids[:last_point], skip_special_tokens=True)
+    result["decoded_tail"] = prefix_text[-200:]
+
+    # Check 1: any \boxed{} in the prefix whose content matches a final answer
+    prefix_boxed = [c.strip() for _, _, c in _find_boxed_spans(prefix_text)]
+    for ans in final_answers:
+        if ans in prefix_boxed:
+            result["leaked"] = True
+            result["leaked_answer"] = ans
+            return result
+    # Check 2: literal \boxed{answer} substring fallback
+    for ans in final_answers:
+        if f"\\boxed{{{ans}}}" in prefix_text:
+            result["leaked"] = True
+            result["leaked_answer"] = ans
+            return result
+
+    return result
+
+
+def run_verification(
+    input_path: str,
+    tokenizer_path: str,
+    max_rows: int = 0,
+    show_examples: int = 5,
+) -> None:
+    """Load a parquet with token_split_points and report leakage stats."""
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    df = pd.read_parquet(input_path)
+    records = df.to_dict(orient="records")
+    if max_rows > 0:
+        records = records[:max_rows]
+
+    n = len(records)
+    n_has_answer = 0
+    n_leak = 0
+    examples = []
+
+    for item in tqdm(records, total=n, desc="Verifying"):
+        r = verify_no_answer_leak(item, tokenizer)
+        if r["has_answer"]:
+            n_has_answer += 1
+        if r["leaked"]:
+            n_leak += 1
+            if len(examples) < show_examples:
+                examples.append(r)
+
+    print("=" * 70)
+    print(f"Rows checked              : {n}")
+    print(f"Rows with a final answer  : {n_has_answer}")
+    print(f"Rows LEAKING at last point: {n_leak}")
+    print("=" * 70)
+    if n_leak == 0:
+        print("PASS: last split point never contains a final answer.")
+    else:
+        print(f"FAIL: {n_leak} rows leak the answer at the last split point.")
+        for i, ex in enumerate(examples):
+            print(f"\n--- Leak example {i + 1} ---")
+            print(f"final_answers = {ex['final_answers']}")
+            print(f"leaked_answer = {ex['leaked_answer']!r}")
+            print(f"last_point    = {ex['last_point']}")
+            print(f"decoded tail  = ...{ex['decoded_tail']!r}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Add token_split_points to parquet rows.")
     parser.add_argument("--input", required=True, help="Input parquet path")
-    parser.add_argument("--output", required=True, help="Output parquet path")
+    parser.add_argument("--output", help="Output parquet path (not needed for --verify-only)")
     parser.add_argument(
         "--tokenizer-path",
         default="/home/shared/Qwen2.5-Math-7B-16k-think",
@@ -373,7 +502,34 @@ def main() -> None:
             "LaTeX math regions; 'paragraph' uses the legacy \\n\\n behaviour."
         ),
     )
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="After writing output, decode prefix up to the last split point "
+             "and verify it does not contain the final answer.",
+    )
+    parser.add_argument(
+        "--verify-only",
+        action="store_true",
+        help="Skip computation; only run leakage verification on --input "
+             "(which must already contain token_split_points).",
+    )
+    parser.add_argument(
+        "--verify-max-rows",
+        type=int,
+        default=0,
+        help="Limit number of rows checked during verification (0 = all).",
+    )
     args = parser.parse_args()
+
+    # Verify-only mode: input parquet already has token_split_points
+    if args.verify_only:
+        run_verification(
+            args.input,
+            args.tokenizer_path,
+            max_rows=args.verify_max_rows,
+        )
+        return
 
     df = pd.read_parquet(args.input)
     records = df.to_dict(orient="records")
@@ -406,9 +562,21 @@ def main() -> None:
     out_df = pd.DataFrame(processed)
     # 打印一条数据
     print(out_df.iloc[0])
-    out_df.to_parquet(args.output, index=False)
+    if args.output:
+        out_df.to_parquet(args.output, index=False)
+        print(f"Done. Wrote {len(out_df)} rows to: {args.output}")
+    else:
+        print("No --output given; skipping write.")
 
-    print(f"Done. Wrote {len(out_df)} rows to: {args.output}")
+    # Optional post-hoc verification
+    if args.verify:
+        verify_target = args.output if args.output else args.input
+        print("\nRunning answer-leak verification...")
+        run_verification(
+            verify_target,
+            args.tokenizer_path,
+            max_rows=args.verify_max_rows,
+        )
 
 
 if __name__ == "__main__":
