@@ -522,12 +522,13 @@ def compute_token_on_off_sft_loss(
             #   L   = - w_t * log pi_theta(y_t)
             # p_t uses the current policy probability (detached), so the weight
             # is a constant per token and only -log_prob carries the gradient.
-            ws_eta = 0.1
+            #ws_eta = 0.1
             ws_tau = 0.5
             ws_gamma = 1.0
             prob = torch.exp(log_prob.detach())
             x = prob / max(ws_tau, 1e-6)
-            w_t = ws_eta + (1.0 - ws_eta) * torch.clamp(torch.pow(x, ws_gamma), max=1.0)
+            #w_t = ws_eta + (1.0 - ws_eta) * torch.clamp(torch.pow(x, ws_gamma), max=1.0)
+            w_t = torch.clamp(torch.pow(x, ws_gamma), max=1.0)
             off_sft_losses = -w_t * log_prob
         else:
             off_sft_losses = -log_prob
