@@ -1565,6 +1565,12 @@ class NewRayPPOTrainer(RayPPOTrainer):
                 solve_none_format = 0
                 solve_one = 0
                 solve_none_on_policy = 0
+                # In extra_step, mask out hard questions whose on-policy rollouts
+                # (those containing model-generated tokens) are ALL wrong. The
+                # expert pure-prefix rollout is trivially correct, so it must be
+                # excluded from this judgement. Off by default.
+                mask_all_prefix_fail = self.config.data.get('mask_all_prefix_fail', False)
+                mask_all_fail_count = 0
                 #if self.config.actor_rollout_ref.actor.policy_loss.loss_mode=="se_filter":
                 reward_mask = torch.ones((batch.batch['responses'].size(0), batch.batch['responses'].size(1)), dtype=torch.bool)
                 
@@ -1605,27 +1611,27 @@ class NewRayPPOTrainer(RayPPOTrainer):
                             grp_prefix_mask = batch.batch['prefix_mask'][group_indices]
                             grp_response_mask = batch.batch['response_mask'][group_indices]
                             
-                            # Compute mixed condition. 
+                            # Compute mixed condition.
                             # Keep computation on the device of the masks (likely GPU) for speed
                             has_off = grp_prefix_mask.any(dim=1)
                             has_on = (grp_response_mask & ~grp_prefix_mask).any(dim=1)
                             is_mixed = has_off & has_on # boolean tensor (G,)
-                            
+
                             is_incorrect = (uid_rewards == fail_value)
                             if is_incorrect.device != is_mixed.device:
                                 is_incorrect = is_incorrect.to(is_mixed.device)
-                            
+
                             # Bring boolean condition to CPU to select indices
                             is_target_np = (is_mixed).cpu().numpy()
-                            
+
                             # Indices in batch where is_mixed is True
                             mixed_batch_indices = group_indices[is_target_np]
-                            
+
                             if len(mixed_batch_indices) > 0:
                                 target_prefix_mask = batch.batch['prefix_mask'][mixed_batch_indices]
                                 if reward_mask.device != target_prefix_mask.device:
                                     target_prefix_mask = target_prefix_mask.to(reward_mask.device)
-                                
+
                                 reward_mask[mixed_batch_indices] = reward_mask[mixed_batch_indices] & (~target_prefix_mask)
 
                         else:
@@ -1637,6 +1643,24 @@ class NewRayPPOTrainer(RayPPOTrainer):
                                 on_policy_in_group = uid_mask & (~off_policy_mask_np)
 
                                 reward_mask[on_policy_in_group, :] = False
+
+                    # Extra_step: mask the whole group if EVERY on-policy rollout
+                    # (those containing model-generated tokens) is wrong. The expert
+                    # pure-prefix rollout has no generated tokens (has_on == False),
+                    # so it is excluded and cannot make a question look solved.
+                    # Independent of off_policy_masking; off by default.
+                    if is_failure_recycle_step and mask_all_prefix_fail:
+                        grp_idx = np.where(uid_mask)[0]
+                        grp_prefix = batch.batch['prefix_mask'][grp_idx]
+                        grp_response = batch.batch['response_mask'][grp_idx]
+                        # rollouts with model-generated (on-policy) tokens
+                        has_on = (grp_response & ~grp_prefix).any(dim=1).cpu().numpy()
+                        uid_rewards_np = uid_rewards.cpu().numpy() if isinstance(uid_rewards, torch.Tensor) else uid_rewards
+                        if has_on.any():
+                            on_policy_rewards = uid_rewards_np[has_on]
+                            if (on_policy_rewards != success_value).all():
+                                reward_mask[uid_mask, :] = False
+                                mask_all_fail_count += 1
                 if not self.config.algorithm.get("filter_reward",True):
                     # if self.config.trainer.skip_valid_mask:
                     valid_mask[:] = True
