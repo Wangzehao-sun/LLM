@@ -1352,6 +1352,9 @@ class NewRayPPOTrainer(RayPPOTrainer):
                 gen_batch = gen_batch.repeat(repeat_times=n_on, interleave=True)
         gen_batch.meta_info['global_steps'] = self.global_steps
         gen_batch.meta_info['is_se'] = False
+        # Flag extra_step generations so rollout can sample with extra_temperature
+        # and log-prob recompute can match it (keeps PPO ratio consistent).
+        gen_batch.meta_info['is_extra'] = is_failure_recycle_step
         is_last_step = self.global_steps >= self.total_training_steps
         with marked_timer("step", timing_raw):
             # generate a batch
@@ -1624,6 +1627,9 @@ class NewRayPPOTrainer(RayPPOTrainer):
 
             # compute global_valid tokens
             batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+            # propagate extra_step flag so old/ref log-prob recompute uses the
+            # matching extra_temperature (consistent PPO ratio).
+            batch.meta_info["is_extra"] = is_failure_recycle_step
 
             with marked_timer("reward", timing_raw, color="yellow"):
                 # compute reward model score
