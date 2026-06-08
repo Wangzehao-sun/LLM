@@ -707,7 +707,12 @@ class NewActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
         data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
-        data.meta_info["temperature"] = self.config.rollout.temperature
+        # extra_step may sample with a different temperature; match it here so the
+        # recomputed old_log_probs align with the sampling distribution.
+        temperature = self.config.rollout.temperature
+        if data.meta_info.get("is_extra", False) and self.config.rollout.get("extra_temperature", -1) > 0:
+            temperature = self.config.rollout.extra_temperature
+        data.meta_info["temperature"] = temperature
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
@@ -715,7 +720,7 @@ class NewActorRolloutRefWorker(Worker, DistProfilerExtension):
                 output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
             output = DataProto.from_dict(
                 tensors={"old_log_probs": output, "entropys": entropys},
-                meta_info={"temperature": self.config.rollout.temperature},
+                meta_info={"temperature": temperature},
             )
             output = self.ulysses_sharding_manager.postprocess_data(output)
 
@@ -750,7 +755,11 @@ class NewActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         micro_batch_size = self.config.ref.log_prob_micro_batch_size_per_gpu
         data.meta_info["micro_batch_size"] = micro_batch_size
-        data.meta_info["temperature"] = self.config.rollout.temperature
+        # match extra_step sampling temperature when applicable (see compute_log_prob)
+        ref_temperature = self.config.rollout.temperature
+        if data.meta_info.get("is_extra", False) and self.config.rollout.get("extra_temperature", -1) > 0:
+            ref_temperature = self.config.rollout.extra_temperature
+        data.meta_info["temperature"] = ref_temperature
         data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
         with self.ulysses_sharding_manager:

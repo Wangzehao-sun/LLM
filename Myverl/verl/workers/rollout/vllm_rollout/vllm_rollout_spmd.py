@@ -282,6 +282,16 @@ class vLLMRollout(BaseRollout):
                 "n": 1,  # if validate, already repeat in ray_trainer
             }
 
+        # extra_step temperature override (mirrors se_temperature). When the
+        # trainer marks a recycle/extra_step generation via meta_info["is_extra"]
+        # and rollout.extra_temperature > 0, sample with that temperature instead
+        # of config.temperature. Only for the normal sampling path.
+        is_extra = prompts.meta_info.get("is_extra", False)
+        if do_sample and not is_validate and not is_se and is_extra:
+            extra_temperature = self.config.get("extra_temperature", -1)
+            if extra_temperature is not None and extra_temperature > 0:
+                kwargs["temperature"] = float(extra_temperature)
+
         lora_requests = None
         if self.lora_kwargs:
             lora_int_ids = list(self.inference_engine.llm_engine.list_loras())
