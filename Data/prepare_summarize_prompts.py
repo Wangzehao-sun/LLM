@@ -1,8 +1,17 @@
 """Add a ``summarize_prompts`` column to a parquet that already carries
 ``token_split_points``.
 
-For each row, given the K split points produced by ``add_token_split_points.py``
-this script renders K user-turn messages of the form::
+Two modes (``--mode``):
+
+* ``multi`` (default): for each row, given the K split points produced by
+  ``add_token_split_points.py``, render K user-turn messages -- one per prefix
+  length -- so a single question yields a length-K ``summarize_prompts`` array.
+* ``full``: ignore the split points and render a SINGLE user-turn message whose
+  [Reasoning Draft] is the complete (answer-truncated) reasoning, i.e. one
+  prompt per question (length-1 ``summarize_prompts`` array). The downstream
+  dataset replicates this single prompt up to its configured K.
+
+In both modes each rendered user turn has the form::
 
     You are an expert mathematician. You are given a [Problem] and a
     [Reasoning Draft] ... re-author a single "Gold Standard" solution,
@@ -23,15 +32,17 @@ loss). Doing the rendering offline avoids any decode/re-tokenize work in the
 training loop.
 
 Schema add:
-    summarize_prompts : np.ndarray[object] of length K, each element being a
-                        list[{role, content}] (system + user).
+    summarize_prompts : np.ndarray[object] of length K (``multi``) or length 1
+                        (``full``), each element being a list[{role, content}]
+                        (system + user).
 
 Usage:
 
     python prepare_summarize_prompts.py \
         --input  $HOME/LLM/Data/deepmath_dgt6_n10000_split.parquet \
         --output $HOME/LLM/Data/deepmath_dgt6_n10000_summarize.parquet \
-        --tokenizer-path /home/shared/Qwen2.5-Math-7B-16k-think
+        --tokenizer-path /home/shared/Qwen2.5-Math-7B-16k-think \
+        --mode full   # single full-reasoning prefix per question
 """
 
 from __future__ import annotations
@@ -261,6 +272,7 @@ def _build_summarize_prompt(
 def process_single_item(
     item: Dict[str, Any],
     template: str,
+    mode: str = "multi",
 ) -> Dict[str, Any]:
     global worker_tokenizer
 
@@ -277,11 +289,15 @@ def process_single_item(
 
     # Defensive fallbacks: if anything is missing, emit an empty np.array so
     # downstream code can detect and skip these rows.
+    #
+    # NOTE: ``full`` mode does not consume split_points (it always uses the
+    # whole truncated think_process as the single prefix), so a missing
+    # token_split_points column is NOT a blocker there.
     if (
         worker_tokenizer is None
         or not question
         or not think_process
-        or split_points is None
+        or (mode != "full" and split_points is None)
     ):
         item["summarize_prompts"] = np.array([], dtype=object)
         return item
@@ -296,8 +312,16 @@ def process_single_item(
     )["input_ids"]
     n_tgt = len(tgt_tokens)
 
+    # ``full`` mode: a single prefix = the entire (answer-truncated) reasoning,
+    # i.e. one synthetic split point at n_tgt. This yields a length-1
+    # summarize_prompts array; the downstream dataset replicates it up to K.
+    if mode == "full":
+        effective_points: List[int] = [n_tgt]
+    else:
+        effective_points = [int(sp) for sp in split_points]
+
     prompts_list: List[List[Dict[str, str]]] = []
-    for sp in split_points:
+    for sp in effective_points:
         sp = int(sp)
         sp = max(0, min(sp, n_tgt))  # clamp
         if sp == 0:
@@ -321,9 +345,9 @@ def process_single_item(
     return item
 
 
-def _worker_process(args: Tuple[Dict[str, Any], str]) -> Dict[str, Any]:
-    item, template = args
-    return process_single_item(item, template)
+def _worker_process(args: Tuple[Dict[str, Any], str, str]) -> Dict[str, Any]:
+    item, template, mode = args
+    return process_single_item(item, template, mode)
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +369,14 @@ def main() -> None:
     )
     parser.add_argument("--workers", type=int, default=16, help="Worker process count (1 = sync).")
     parser.add_argument(
+        "--mode",
+        choices=["multi", "full"],
+        default="multi",
+        help="multi (default): one prompt per split point -> length-K array. "
+             "full: a single prompt whose draft is the complete (answer-truncated) "
+             "reasoning -> length-1 array (split points ignored).",
+    )
+    parser.add_argument(
         "--template",
         default=DEFAULT_TEMPLATE,
         help="User-turn template, must include {question} and {prefix} placeholders.",
@@ -358,25 +390,33 @@ def main() -> None:
     print(f"Reading {args.input}")
     df = pd.read_parquet(args.input)
     if "token_split_points" not in df.columns:
-        raise SystemExit(
-            "Input parquet has no 'token_split_points' column. "
-            "Run Data/add_token_split_points.py first."
-        )
+        # ``full`` mode never reads split points, so a missing column is fine
+        # there; ``multi`` mode requires them.
+        if args.mode == "full":
+            print(
+                "  (no 'token_split_points' column; OK in --mode full, "
+                "split points are not used)"
+            )
+        else:
+            raise SystemExit(
+                "Input parquet has no 'token_split_points' column. "
+                "Run Data/add_token_split_points.py first."
+            )
 
     if args.limit is not None:
         df = df.head(args.limit)
     records = df.to_dict(orient="records")
-    print(f"  -> {len(records):,} rows. Tokenizer: {args.tokenizer_path}")
+    print(f"  -> {len(records):,} rows. Tokenizer: {args.tokenizer_path}. Mode: {args.mode}")
 
     workers = max(1, min(args.workers, mp.cpu_count()))
     if workers == 1:
         init_worker(args.tokenizer_path)
         processed = [
-            process_single_item(item, args.template)
+            process_single_item(item, args.template, args.mode)
             for item in tqdm(records, total=len(records), desc="rendering")
         ]
     else:
-        task_iter = ((item, args.template) for item in records)
+        task_iter = ((item, args.template, args.mode) for item in records)
         with mp.Pool(
             processes=workers,
             initializer=init_worker,
@@ -398,19 +438,26 @@ def main() -> None:
     )
     print(f"  -> {n_emitted:,}/{len(out_df):,} rows have non-empty summarize_prompts.")
 
-    # Print a sample for human-eyeball verification.
+    # Print a sample for human-eyeball verification. ``full`` mode emits
+    # length-1 arrays, so require >= 1 (not >= 2) and only index entries that
+    # exist. token_split_points may be absent in ``full`` mode, so guard it.
     sample = next(
         (
             row for _, row in out_df.iterrows()
             if isinstance(row["summarize_prompts"], np.ndarray)
-            and len(row["summarize_prompts"]) >= 2
+            and len(row["summarize_prompts"]) >= 1
         ),
         None,
     )
     if sample is not None:
         sps = sample["summarize_prompts"]
-        for idx in [0, len(sps) // 2, len(sps) - 1]:
-            print(f"\n--- sample summarize_prompts[{idx}] (split_point={sample['token_split_points'][idx]}) ---")
+        sample_points = sample.get("token_split_points")
+        idxs = sorted({0, len(sps) // 2, len(sps) - 1})
+        for idx in idxs:
+            sp_str = ""
+            if isinstance(sample_points, (list, np.ndarray)) and idx < len(sample_points):
+                sp_str = f" (split_point={sample_points[idx]})"
+            print(f"\n--- sample summarize_prompts[{idx}]{sp_str} ---")
             for msg in sps[idx]:
                 content = msg.get("content", "")
                 head = content[:300].replace("\n", " ")
