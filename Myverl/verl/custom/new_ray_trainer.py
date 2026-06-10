@@ -1802,8 +1802,15 @@ class NewRayPPOTrainer(RayPPOTrainer):
                          if retain_low_threshold < accuracy < retain_high_threshold:
                              failed_original_indices.append(idx_val)
                      else:
-                         # Normal mode: only collect when ALL rollouts failed
-                         if (rewards_for_q == fail_value).all():
+                         # Normal mode: collect when accuracy is at/below a threshold.
+                         # Default threshold 0.0 reproduces the old behaviour
+                         # (only collect when ALL rollouts failed). Raise it to
+                         # also recycle "hard but occasionally solved" questions,
+                         # e.g. collect_accuracy_threshold=0.25 keeps questions
+                         # solved in <= 25% of rollouts.
+                         collect_acc_threshold = self.config.data.get('collect_accuracy_threshold', 0.0)
+                         accuracy = (rewards_for_q == success_value).sum() / max(len(rewards_for_q), 1)
+                         if accuracy <= collect_acc_threshold:
                              failed_original_indices.append(idx_val)
                 
                 # Now extract items from batch_dict
