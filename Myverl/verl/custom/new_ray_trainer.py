@@ -71,6 +71,52 @@ from verl.trainer.ppo.ray_trainer import (
     reduce_metrics
 )
 from verl.custom.new_vllm_rollout import _pre_process_inputs_right_pad, _pre_process_inputs
+import re
+
+
+# ---------------------------------------------------------------------------
+# Trajectory filter for rewritten (off-policy / summarize) rollouts.
+# Implements the paper's "Rule of Trajectory Filter" (minus the >6K length rule):
+#   - reject responses that still reference the draft / experience (keywords)
+#   - reject responses that restate the summarize-template instructions
+#   - reject noisy responses with long runs of repeated chars / substrings
+# Defaults derive from DEFAULT_TEMPLATE in Data/prepare_summarize_prompts.py.
+# ---------------------------------------------------------------------------
+_DEFAULT_TRAJ_KEYWORDS = [
+    "refer to experience", "the draft", "as given", "as shown above",
+    "from the previous steps", "reasoning draft", "the experience",
+]
+_DEFAULT_TRAJ_INSTR_PHRASES = [
+    "gold standard", "strict requirements", "total de-reference",
+    "invisible integration", "consistency check", "[reasoning draft]",
+    "[problem]", "[your solution]", "re-author",
+]
+
+
+def _trajectory_filter_reject(text: str, cfg: dict):
+    """Return (reject: bool, reason: str) for a rewritten-trajectory response.
+
+    cfg keys (all optional, sensible defaults baked in):
+      keywords            : list[str]  -> reject if any appears (case-insensitive)
+      instruction_phrases : list[str]  -> reject if any appears (restates the
+                                          summarize template)
+      max_repeated_char_run : int      -> reject if a single char repeats >= N times
+      max_repeated_substr   : int      -> reject if a 2-20 char block repeats >= K times
+    """
+    low = text.lower()
+    for kw in cfg.get("keywords", _DEFAULT_TRAJ_KEYWORDS):
+        if kw.lower() in low:
+            return True, "keyword"
+    for ph in cfg.get("instruction_phrases", _DEFAULT_TRAJ_INSTR_PHRASES):
+        if ph.lower() in low:
+            return True, "instruction"
+    n_char = cfg.get("max_repeated_char_run", 50)
+    if n_char and re.search(r"(.)\1{%d,}" % (int(n_char) - 1), text):
+        return True, "noise_char"
+    n_sub = cfg.get("max_repeated_substr", 10)
+    if n_sub and re.search(r"(.{2,20}?)\1{%d,}" % (int(n_sub) - 1), text):
+        return True, "noise_substr"
+    return False, ""
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl", multi_turn=False):
     """Apply KL penalty to the token-level rewards.
 
@@ -1697,6 +1743,42 @@ class NewRayPPOTrainer(RayPPOTrainer):
                 
                 off_policy_mask_np = batch.batch['prefix_mask'].any(-1).cpu().numpy()
 
+                # ---- Trajectory format filter on rewritten (off-policy/summarize) rollouts ----
+                # Treat this as part of the reward function: a rewritten trajectory that still
+                # references the draft/experience, restates the summarize-template instructions,
+                # or contains noisy repeated strings is a FORMAT ERROR -> its reward is overwritten
+                # with format_value (-1). This must run BEFORE the uid grouping below so the new
+                # rewards flow into solve_none_format / reward_sum / advantage consistently.
+                # Only touches off-policy rows; on-policy self-sampled rollouts are untouched.
+                # Disabled unless explicitly enabled.
+                tf_cfg = self.config.algorithm.get('trajectory_filter', {})
+                if tf_cfg.get('enable', False):
+                    resp_texts = self.tokenizer.batch_decode(
+                        batch.batch["responses"], skip_special_tokens=True
+                    )
+                    resp_mask_for_tf = batch.batch['response_mask']
+                    n_rej = 0
+                    reason_counts = {}
+                    for i in range(len(resp_texts)):
+                        if not off_policy_mask_np[i]:
+                            continue  # only filter rewritten trajectories
+                        reject, reason = _trajectory_filter_reject(resp_texts[i], tf_cfg)
+                        if reject:
+                            # Overwrite this row's reward with the format-error value.
+                            # The score lives on the last valid response token, matching
+                            # MathRewardManager (reward_tensor[i, valid_len-1]).
+                            valid_len = int(resp_mask_for_tf[i].sum().item())
+                            reward_tensor[i, :] = 0
+                            if valid_len > 0:
+                                reward_tensor[i, valid_len - 1] = format_value
+                            n_rej += 1
+                            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+                    # token_level_scores was set from reward_tensor above; keep it in sync.
+                    batch.batch["token_level_scores"] = reward_tensor
+                    metrics['batch/traj_filter_rejected'] = n_rej
+                    for r, c in reason_counts.items():
+                        metrics[f'batch/traj_filter_{r}'] = c
+
                 for uid in unique_uids:
                     uid_mask = uids == uid
                     uid_rewards = reward_tensor[uid_mask].sum(-1)  # Sum rewards for each sequence
@@ -1768,6 +1850,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
                     # if self.config.trainer.skip_valid_mask:
                     valid_mask[:] = True
                     # Log to metrics
+
                 reward_sum_per_sample = reward_tensor.sum(-1)
 
                 # 2. 将该张量转换为 Python 列表并存入 non_tensor_batch
