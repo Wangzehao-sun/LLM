@@ -1810,7 +1810,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
                          # solved in <= 25% of rollouts.
                          collect_acc_threshold = self.config.data.get('collect_accuracy_threshold', 0.0)
                          accuracy = (rewards_for_q == success_value).sum() / max(len(rewards_for_q), 1)
-                         if accuracy <= collect_acc_threshold:
+                         if accuracy < collect_acc_threshold:
                              failed_original_indices.append(idx_val)
                 
                 # Now extract items from batch_dict
