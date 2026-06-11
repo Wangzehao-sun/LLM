@@ -88,8 +88,7 @@ _DEFAULT_TRAJ_KEYWORDS = [
 ]
 _DEFAULT_TRAJ_INSTR_PHRASES = [
     "gold standard", "strict requirements", "total de-reference",
-    "invisible integration", "consistency check", "[reasoning draft]",
-    "[problem]", "[your solution]", "re-author",
+    "invisible integration", "[reasoning draft]","re-author",
 ]
 
 
