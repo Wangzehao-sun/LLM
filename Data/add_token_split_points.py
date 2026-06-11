@@ -217,24 +217,37 @@ def process_think_process(
     num_stages: int = 8,
     curve_power: float = 1.5,
     split_unit: str = "sentence",
+    prefix_ratio: float = None,
 ) -> List[int]:
-    """Compute ``num_stages`` token split points from a thought process.
+    """Compute token split points from a thought process.
 
     The thought process is segmented into sentences (default) or paragraphs.
-    For each ratio ``r`` in ``linspace(0, 1, num_stages+1)[1:] ** curve_power``
-    we find the first segment boundary whose char offset is at least
-    ``r * len(text)`` and report the corresponding token count.
+
+    Two modes:
+
+    * Multi-stage (default, ``prefix_ratio is None``): for each ratio ``r`` in
+      ``linspace(0, 1, num_stages) ** curve_power`` we find the first segment
+      boundary whose char offset is at least ``r * len(text)`` and report the
+      corresponding token count -- yielding ``num_stages`` split points.
+    * Single fixed-ratio prefix (``prefix_ratio`` set): every row produces a
+      single split point at the SAME ratio of its own text length, snapped to
+      a sentence/paragraph boundary. ``num_stages``/``curve_power`` are ignored.
     """
+    n_out = 1 if prefix_ratio is not None else num_stages
+
     if not think_process:
-        return [0] * num_stages
+        return [0] * n_out
 
     boundaries = _segment_text(think_process, split_unit)
     if not boundaries:
-        return [0] * num_stages
+        return [0] * n_out
 
     total_len = len(think_process)
-    linear_steps = np.linspace(0, 1, num_stages)
-    ratios = np.power(linear_steps, curve_power)
+    if prefix_ratio is not None:
+        ratios = np.array([float(prefix_ratio)])
+    else:
+        linear_steps = np.linspace(0, 1, num_stages)
+        ratios = np.power(linear_steps, curve_power)
 
     split_counts: List[int] = []
 
@@ -318,12 +331,15 @@ def process_single_item(
     num_stages: int,
     curve_power: float,
     split_unit: str,
+    prefix_ratio: float = None,
 ) -> Dict[str, Any]:
     global worker_tokenizer
     think_process, full_text = extract_think_process(item)
 
+    n_out = 1 if prefix_ratio is not None else num_stages
+
     if worker_tokenizer is None:
-        item["token_split_points"] = [0] * num_stages
+        item["token_split_points"] = [0] * n_out
         return item
 
     # Truncate think_process before any sentence that leaks the final answer
@@ -335,15 +351,16 @@ def process_single_item(
         num_stages=num_stages,
         curve_power=curve_power,
         split_unit=split_unit,
+        prefix_ratio=prefix_ratio,
     )
     return item
 
 
 def _worker_process(
-    args: Tuple[Dict[str, Any], int, float, str],
+    args: Tuple[Dict[str, Any], int, float, str, float],
 ) -> Dict[str, Any]:
-    item, num_stages, curve_power, split_unit = args
-    return process_single_item(item, num_stages, curve_power, split_unit)
+    item, num_stages, curve_power, split_unit, prefix_ratio = args
+    return process_single_item(item, num_stages, curve_power, split_unit, prefix_ratio)
 
 
 # ---------------------------------------------------------------------------
@@ -486,6 +503,16 @@ def main() -> None:
     )
     parser.add_argument("--num-stages", type=int, default=8, help="Number of split stages")
     parser.add_argument(
+        "--prefix-ratio",
+        type=float,
+        default=None,
+        help=(
+            "If set (e.g. 0.5), every row gets a SINGLE split point at this "
+            "fixed ratio of its own think-text length, snapped to a "
+            "sentence/paragraph boundary. Overrides --num-stages/--curve-power."
+        ),
+    )
+    parser.add_argument(
         "--curve-power",
         type=float,
         default=1.0,
@@ -536,13 +563,16 @@ def main() -> None:
 
     workers = max(1, min(args.workers, mp.cpu_count()))
     task_iter = (
-        (item, args.num_stages, args.curve_power, args.split_unit) for item in records
+        (item, args.num_stages, args.curve_power, args.split_unit, args.prefix_ratio)
+        for item in records
     )
 
     if workers == 1:
         init_worker(args.tokenizer_path)
         processed = [
-            process_single_item(item, args.num_stages, args.curve_power, args.split_unit)
+            process_single_item(
+                item, args.num_stages, args.curve_power, args.split_unit, args.prefix_ratio
+            )
             for item in tqdm(records, total=len(records))
         ]
     else:
