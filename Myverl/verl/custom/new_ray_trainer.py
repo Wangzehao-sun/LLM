@@ -624,6 +624,35 @@ class NewRayPPOTrainer(RayPPOTrainer):
         #print("Last token ids of concatenated sequences:", [seq[-1] if len(seq) > 0 else None for seq in gen_batch_off.batch['input_ids'].tolist()])
         
         return gen_batch_off,tgt_list,prefix_list
+
+    def _dump_real_rollout_input(self, gen_batch_output: DataProto, is_failure_recycle_step: bool, recycle_sub_step: int = 0) -> None:
+        """Dump the REAL rollout input right after generation.
+
+        At this point gen_batch_output.batch['prompts'] still holds the exact
+        tokens the model was conditioned on during generation. Downstream
+        _build_hybrid_off_policy_output rebuilds 'prompts' (summarize -> short
+        question prompt; concat -> teacher prefix moved into 'responses'), so the
+        main rollout dump never shows what the model actually read. No-op unless
+        trainer.rollout_data_dir is set.
+
+        File name uses self.extra_steps for recycle steps (global_steps does not
+        advance during recycle, so it would otherwise overwrite).
+        """
+        rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+        if not rollout_data_dir or "prompts" not in gen_batch_output.batch.keys():
+            return
+        sub = os.path.join("recycle_realinput", f"r{recycle_sub_step}") if is_failure_recycle_step else "normal_realinput"
+        out_dir = os.path.join(rollout_data_dir, sub)
+        os.makedirs(out_dir, exist_ok=True)
+        stem = self.extra_steps if is_failure_recycle_step else self.global_steps
+        inputs = self.tokenizer.batch_decode(gen_batch_output.batch["prompts"], skip_special_tokens=True)
+        outputs = self.tokenizer.batch_decode(gen_batch_output.batch["responses"], skip_special_tokens=True)
+        path = os.path.join(out_dir, f"{stem}.jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            for inp, out in zip(inputs, outputs):
+                f.write(json.dumps({"input": inp, "output": out}, ensure_ascii=False) + "\n")
+        print(f"Dumped REAL rollout inputs to {path}")
+
     def _build_hybrid_off_policy_output(
         self,
         n_divide: int,
@@ -1367,6 +1396,9 @@ class NewRayPPOTrainer(RayPPOTrainer):
                     self.async_rollout_manager.sleep()
                 timing_raw.update(gen_batch_output.meta_info["timing"])
                 gen_batch_output.meta_info.pop("timing", None)
+
+                # Dump the real rollout input before downstream code rebuilds 'prompts'.
+                self._dump_real_rollout_input(gen_batch_output, is_failure_recycle_step, recycle_sub_step)
 
                 if prefix_lists is not None:
                      # Temporary overwrite n_off to make _build_hybrid_off_policy_output work
