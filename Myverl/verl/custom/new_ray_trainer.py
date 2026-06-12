@@ -1236,7 +1236,11 @@ class NewRayPPOTrainer(RayPPOTrainer):
                             current_prefix_lens = []
                             for b_i in range(train_batch_size):
                                 points = token_split_points[b_i]
-                                if isinstance(points, (np.ndarray, list)) and len(points) > step_i:
+                                if isinstance(points, (np.ndarray, list)) and len(points) == 1:
+                                    # Single split point: broadcast it to every step
+                                    # so all n_prefix prefixes share the same length.
+                                    current_prefix_lens.append(int(points[0]))
+                                elif isinstance(points, (np.ndarray, list)) and len(points) > step_i:
                                     current_prefix_lens.append(int(points[step_i]))
                                 else:
                                     # Fallback: use ratio-based length
