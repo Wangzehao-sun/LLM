@@ -436,6 +436,15 @@ class NewDataParallelPPOActor(DataParallelPPOActor):
                         if 'on_neg_adv_loss_ratio' in ret_dict:
                             metrics_data['actor/on_neg_adv_loss_ratio'] = ret_dict['on_neg_adv_loss_ratio'].detach().item()
                         append_to_dict(metrics, metrics_data)
+                    elif current_loss_mode == "pure_sft":
+                        # Standalone SFT update (e.g. extra_step SFT on expert tgt_input_ids).
+                        # Pure cross-entropy on the response tokens: -mean(log_prob).
+                        # No importance ratio / advantage involved, so old_log_prob and
+                        # advantages may be dummy zeros.
+                        from .new_core_alg import compute_sft_pure_loss
+                        pg_loss = compute_sft_pure_loss(log_prob, response_mask)
+                        ppo_kl = torch.tensor(0.0, device=log_prob.device)
+                        append_to_dict(metrics, {"actor/sft_loss": pg_loss.detach().item()})
                     else:
                         policy_loss_fn = get_policy_loss_fn(current_loss_mode)
 

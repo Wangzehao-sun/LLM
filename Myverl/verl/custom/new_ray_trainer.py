@@ -1056,6 +1056,75 @@ class NewRayPPOTrainer(RayPPOTrainer):
                     return
 
 
+    def _run_sft_extra_step(self, batch, gen_batch, train_batch_size, logger, _log_step, timing_raw, epoch):
+        """Extra (failure-recycle) step that trains via pure SFT on expert data.
+
+        Unlike the RL recycle path, this performs NO rollout/generation. It takes
+        the stored expert trajectory ``tgt_input_ids`` of each buffered hard
+        question, builds (prompt + full expert response) sequences, and runs a
+        single SFT update (loss = mean(-log_prob) over the expert response
+        tokens) via ``update_actor`` with ``loss_mode='pure_sft'``.
+
+        Returns the same ``(is_last_step, last_val_metrics, failed_items)`` tuple
+        as ``_train_step_internal`` so the caller in ``fit`` is unaffected.
+        """
+        metrics = {}
+        assert 'tgt_input_ids' in batch.batch, \
+            "extra_step_mode='sft' requires 'tgt_input_ids' in the batch."
+
+        with marked_timer("sft_extra", timing_raw, color="red"):
+            # 1. Recover the full expert trajectories (right-padding stripped, eos appended).
+            tgt_inputs_ids = deepcopy(batch.batch['tgt_input_ids'])
+            _, tgt_list, _ = self._prepare_off_policy_from_tgt(
+                tgt_inputs_ids, deepcopy(gen_batch), train_batch_size, 1.0
+            )
+            tgt_lengths = [len(t) for t in tgt_list]
+
+            # 2. Build (prompt + full expert response) batch. off_responses=None and
+            #    tgt_lengths covering the full tgt => responses == expert trajectory,
+            #    prefix_mask == 1 over the whole expert response.
+            sft_batch = self._build_hybrid_off_policy_output(
+                n_divide=1,
+                n_repeat=1,
+                gen_batch=deepcopy(gen_batch),
+                off_responses=None,
+                prefix_list=tgt_list,
+                train_batch_size=train_batch_size,
+                tgt_lengths=tgt_lengths,
+            )
+
+            # 3. Add tensors required by update_policy's select_keys (dummy where the
+            #    SFT loss does not use them).
+            resp = sft_batch.batch['responses']
+            bsz, resp_len = resp.size(0), resp.size(1)
+            device = resp.device
+            sft_batch.batch['response_mask'] = compute_response_mask(sft_batch)
+            sft_batch.batch['old_log_probs'] = torch.zeros((bsz, resp_len), dtype=torch.float32, device=device)
+            sft_batch.batch['advantages'] = torch.zeros((bsz, resp_len), dtype=torch.float32, device=device)
+            sft_batch.batch['reward_mask'] = torch.ones((bsz, resp_len), dtype=torch.bool, device=device)
+            sft_batch.batch['se_mask'] = torch.zeros((bsz, resp_len), dtype=torch.bool, device=device)
+
+            # 4. Balance across DP ranks then set meta_info needed by the worker/actor.
+            if self.config.trainer.balance_batch:
+                self._balance_batch(sft_batch, metrics=metrics)
+            sft_batch.meta_info["global_token_num"] = torch.sum(sft_batch.batch["attention_mask"], dim=-1).tolist()
+            sft_batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+            sft_batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+            sft_batch.meta_info["loss_mode"] = "pure_sft"
+            sft_batch.meta_info["is_extra"] = True
+
+            # 5. Single SFT optimizer update (no rollout).
+            with marked_timer("update_actor", timing_raw, color="red"):
+                actor_output = self.actor_rollout_wg.update_actor(sft_batch)
+            metrics.update(reduce_metrics(actor_output.meta_info["metrics"]))
+
+        metrics["training/sft_extra_step"] = self.extra_steps
+        logger.log(data=metrics, step=_log_step)
+        sys.stdout.flush()
+
+        is_last_step = self.global_steps >= self.total_training_steps
+        return (True, None, []) if is_last_step else (False, None, [])
+
     def _train_step_internal(self, batch_dict, epoch, logger, progress_bar, collect_failures=False, is_failure_recycle_step=False, recycle_sub_step=0):
         do_profile = self.global_steps in self.config.trainer.profile_steps if self.config.trainer.profile_steps is not None else False
         if do_profile:
@@ -1114,6 +1183,14 @@ class NewRayPPOTrainer(RayPPOTrainer):
             batch_keys=batch_keys_to_pop,
             #non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
         )
+        # extra_step (failure-recycle) can run as a pure SFT update on the expert
+        # tgt_input_ids WITHOUT any rollout. Controlled by data.extra_step_mode:
+        #   'rl'  (default) -> existing prefix-rollout RL recycle logic below
+        #   'sft'           -> direct SFT update on tgt_input_ids, no generation
+        if is_failure_recycle_step and self.config.data.get('extra_step_mode', 'rl') == 'sft':
+            return self._run_sft_extra_step(
+                batch, gen_batch, train_batch_size, logger, _log_step, timing_raw, epoch
+            )
         n_on = self.config.actor_rollout_ref.rollout.n - self.config.actor_rollout_ref.rollout.n_off
         n_off = self.config.actor_rollout_ref.rollout.n_off
         n_total = self.config.actor_rollout_ref.rollout.n
