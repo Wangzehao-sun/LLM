@@ -1012,6 +1012,13 @@ class NewRayPPOTrainer(RayPPOTrainer):
 
                         # Train on this chunk for n_recycle_failure times
                         print(f"Buffer round {buffer_round}: training on batch of size {current_batch_size} for {n_recycle_failure} times (remaining buffer: {len(failed_questions_buffer)})")
+                        # Optional: run ONE pure-SFT pass on this chunk's expert
+                        # tgt_input_ids BEFORE the RL recycle step(s). Enabled by
+                        # data.extra_sft_step; when false this is fully skipped and
+                        # the behaviour is identical to the existing RL-only logic.
+                        if self.config.data.get('extra_sft_step', False):
+                            print(f"Buffer round {buffer_round}: running SFT pass before RL recycle.")
+                            self._run_sft_extra_step(failed_batch_dict, logger_extra)
                         recycle_failed_items = []
                         for recycle_step in range(n_recycle_failure):
                             is_last_recycle = (recycle_step == n_recycle_failure - 1)
@@ -1056,21 +1063,20 @@ class NewRayPPOTrainer(RayPPOTrainer):
                     return
 
 
-    def _run_sft_extra_step(self, batch, gen_batch, train_batch_size, logger, _log_step, timing_raw, epoch):
-        """Extra (failure-recycle) step that trains via pure SFT on expert data.
+    def _sft_update_on_expert(self, batch, gen_batch, train_batch_size, timing_raw):
+        """Run ONE pure-SFT optimizer update on the expert trajectories.
 
-        Unlike the RL recycle path, this performs NO rollout/generation. It takes
-        the stored expert trajectory ``tgt_input_ids`` of each buffered hard
-        question, builds (prompt + full expert response) sequences, and runs a
-        single SFT update (loss = mean(-log_prob) over the expert response
-        tokens) via ``update_actor`` with ``loss_mode='pure_sft'``.
+        Builds (prompt + full expert ``tgt_input_ids``) sequences and updates the
+        actor with ``loss_mode='pure_sft'`` (loss = mean(-log_prob) over the
+        expert response tokens). Performs NO rollout/generation.
 
-        Returns the same ``(is_last_step, last_val_metrics, failed_items)`` tuple
-        as ``_train_step_internal`` so the caller in ``fit`` is unaffected.
+        Returns a metrics dict (already reduced) for logging. Used both by the
+        SFT-only extra_step (``extra_step_mode='sft'``) and by the SFT-before-RL
+        switch (``extra_step_sft_before_rl=True``).
         """
         metrics = {}
         assert 'tgt_input_ids' in batch.batch, \
-            "extra_step_mode='sft' requires 'tgt_input_ids' in the batch."
+            "SFT update requires 'tgt_input_ids' in the batch."
 
         with marked_timer("sft_extra", timing_raw, color="red"):
             # 1. Recover the full expert trajectories (right-padding stripped, eos appended).
@@ -1118,12 +1124,34 @@ class NewRayPPOTrainer(RayPPOTrainer):
                 actor_output = self.actor_rollout_wg.update_actor(sft_batch)
             metrics.update(reduce_metrics(actor_output.meta_info["metrics"]))
 
+        return metrics
+
+    def _run_sft_extra_step(self, batch_dict, logger):
+        """Run ONE pure-SFT extra step on a buffered failure batch (no rollout).
+
+        Called from ``fit`` when ``data.extra_sft_step`` is true: right after the
+        failure buffer fills, do one SFT pass over the expert ``tgt_input_ids``
+        BEFORE the normal RL recycle step(s) run on the same data. SFT runs before
+        any generation, so the rollout engine resyncs the post-SFT weights and
+        PPO's old_log_prob stays self-consistent in the subsequent RL step.
+
+        Mirrors how ``_train_step_internal`` reconstructs the batch/gen_batch from
+        a ``batch_dict`` and uses the independent ``extra_steps`` log counter.
+        """
+        timing_raw = {}
+        self.extra_steps += 1
+        _log_step = self.extra_steps
+
+        batch: DataProto = DataProto.from_single_dict(batch_dict)
+        train_batch_size = batch.batch['input_ids'].size(0)
+        # pop the generation keys exactly like _train_step_internal so the
+        # remaining `batch` carries tgt_input_ids and `gen_batch` carries prompts.
+        gen_batch = batch.pop(batch_keys=["input_ids", "attention_mask", "position_ids"])
+
+        metrics = self._sft_update_on_expert(batch, gen_batch, train_batch_size, timing_raw)
         metrics["training/sft_extra_step"] = self.extra_steps
         logger.log(data=metrics, step=_log_step)
         sys.stdout.flush()
-
-        is_last_step = self.global_steps >= self.total_training_steps
-        return (True, None, []) if is_last_step else (False, None, [])
 
     def _train_step_internal(self, batch_dict, epoch, logger, progress_bar, collect_failures=False, is_failure_recycle_step=False, recycle_sub_step=0):
         do_profile = self.global_steps in self.config.trainer.profile_steps if self.config.trainer.profile_steps is not None else False
@@ -1183,14 +1211,6 @@ class NewRayPPOTrainer(RayPPOTrainer):
             batch_keys=batch_keys_to_pop,
             #non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
         )
-        # extra_step (failure-recycle) can run as a pure SFT update on the expert
-        # tgt_input_ids WITHOUT any rollout. Controlled by data.extra_step_mode:
-        #   'rl'  (default) -> existing prefix-rollout RL recycle logic below
-        #   'sft'           -> direct SFT update on tgt_input_ids, no generation
-        if is_failure_recycle_step and self.config.data.get('extra_step_mode', 'rl') == 'sft':
-            return self._run_sft_extra_step(
-                batch, gen_batch, train_batch_size, logger, _log_step, timing_raw, epoch
-            )
         n_on = self.config.actor_rollout_ref.rollout.n - self.config.actor_rollout_ref.rollout.n_off
         n_off = self.config.actor_rollout_ref.rollout.n_off
         n_total = self.config.actor_rollout_ref.rollout.n
