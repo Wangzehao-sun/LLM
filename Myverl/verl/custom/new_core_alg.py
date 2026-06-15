@@ -445,6 +445,12 @@ def compute_token_on_off_sft_loss(
     elif off_policy_strategy == "none-sft":
         on_policy_loss_type = "none"
         off_policy_loss_type = "sft"
+    elif off_policy_strategy == "rl-rl":
+        on_policy_loss_type = "rl"
+        off_policy_loss_type = "rl"
+    elif off_policy_strategy == "none-rl":
+        on_policy_loss_type = "none"
+        off_policy_loss_type = "rl"
     # ---------------------------
     # 计算 on-policy token 的 loss
     # ---------------------------
