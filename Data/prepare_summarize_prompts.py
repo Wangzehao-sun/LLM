@@ -7,9 +7,13 @@ Two modes (``--mode``):
   ``add_token_split_points.py``, render K user-turn messages -- one per prefix
   length -- so a single question yields a length-K ``summarize_prompts`` array.
 * ``full``: ignore the split points and render a SINGLE user-turn message whose
-  [Reasoning Draft] is the complete (answer-truncated) reasoning, i.e. one
-  prompt per question (length-1 ``summarize_prompts`` array). The downstream
-  dataset replicates this single prompt up to its configured K.
+  [Reasoning Draft] is a leading fraction of the (answer-truncated) reasoning,
+  i.e. one prompt per question (length-1 ``summarize_prompts`` array). The
+  fraction is controlled by ``--full-ratio`` (default ``1.0`` = the complete
+  reasoning). With ``ratio < 1.0`` the prefix is cut at ``ratio * n_tgt``
+  tokens and then backed up to the nearest sentence/newline boundary so it
+  never ends mid-sentence. The downstream dataset replicates this single
+  prompt up to its configured K.
 
 In both modes each rendered user turn has the form::
 
@@ -42,7 +46,8 @@ Usage:
         --input  $HOME/LLM/Data/deepmath_dgt6_n10000_split.parquet \
         --output $HOME/LLM/Data/deepmath_dgt6_n10000_summarize.parquet \
         --tokenizer-path /home/shared/Qwen2.5-Math-7B-16k-think \
-        --mode full   # single full-reasoning prefix per question
+        --mode full          # single prefix per question
+        --full-ratio 0.5     # use only the first ~50% of the reasoning as draft
 """
 
 from __future__ import annotations
@@ -62,7 +67,7 @@ from transformers import AutoTokenizer
 # Constants
 # ---------------------------------------------------------------------------
 
-DEFAULT_TEMPLATE = (
+DEFAULT_TEMPLATE1 = (
     "Please reason step by step, and put your final answer within \\boxed{{}}."
     "You are given a [Problem] and a [Reasoning Draft] — an in-progress derivation for it that stops before "
     "the final answer.\n\n"
@@ -87,6 +92,28 @@ DEFAULT_TEMPLATE = (
     "[Problem]\n{question}\n\n"
     "[Reasoning Draft]\n{prefix}\n\n"
     "[Your solution]"
+)
+
+DEFAULT_TEMPLATE = (
+    "You are given a [Problem] and a [Partial Reasoning Draft].\n\n"
+    "Your task is to write one complete, self-contained solution. "
+    "First, faithfully rephrase the reasoning already contained in the draft in your own words. " 
+    "Then continue from that point and finish the remaining derivation. " 
+    "The final output should read as a single coherent solution for the problem, not as a commentary on the draft.\n\n"
+    "## Strict requirements:\n"
+    "1. Do not mention or refer to the Partial Reasoning Draft. " 
+    "The reader should not be able to tell that any draft was provided.\n"
+    "2. Rephrase the valid reasoning in the draft as part of a natural solution. " 
+    "Preserve the main approach, necessary conditions, formulas, intermediate results, " 
+    "and nontrivial logical steps, but express them in your own clear wording. " 
+    "Do not merely summarize the draft, and do not copy long phrases verbatim.\n"
+    "3. After rephrasing the draft, continue the derivation from that point and solve the remaining part of the problem. "
+    "The continuation should follow naturally from the rephrased reasoning, fill in any missing steps, and lead to a complete final answer."
+    "If the draft contains an obvious error, silently correct it and continue with a valid derivation.\n"
+    "4. Please reason step by step, and put your final answer within \\boxed{{}}."
+    "## Problem:\n{question}\n\n"
+    "## Partial Reasoning Draft:\n{prefix}\n\n"
+    "## Your solution:"
 )
 
 worker_tokenizer = None
@@ -213,6 +240,27 @@ def _truncate_before_final_answer(think_process: str) -> str:
     return think_process[:cut].rstrip()
 
 
+def _backup_to_sentence_boundary(prefix: str) -> str:
+    """Back ``prefix`` up to its last sentence/newline boundary so a draft cut
+    at an arbitrary token offset never ends mid-sentence.
+
+    Used by ``full`` mode with ``--full-ratio < 1.0``: the prefix is first
+    sliced to ``round(ratio * n_tgt)`` tokens (token-space, consistent with the
+    split points), decoded back to text, then handed here. We look for the last
+    sentence-final punctuation (optionally followed by a closing quote/bracket)
+    + whitespace, or a newline, anywhere in ``prefix`` -- mirroring the boundary
+    regex in ``_truncate_before_final_answer``. If no such boundary exists (very
+    short / punctuation-free draft) we return the prefix unchanged so it is not
+    collapsed to an empty string.
+    """
+    if not prefix:
+        return prefix
+    boundary = 0
+    for m in re.finditer(r"(?:[.!?]+[\)\]\"']?\s+|\n+)", prefix):
+        boundary = m.end()
+    return prefix[:boundary].rstrip() if boundary > 0 else prefix.rstrip()
+
+
 def _extract_question(item: Dict[str, Any]) -> str:
     """Pull the user's original question out of ``prompt`` (chat-style list)."""
     prompt = item.get("prompt")
@@ -273,6 +321,7 @@ def process_single_item(
     item: Dict[str, Any],
     template: str,
     mode: str = "multi",
+    full_ratio: float = 1.0,
 ) -> Dict[str, Any]:
     global worker_tokenizer
 
@@ -312,13 +361,20 @@ def process_single_item(
     )["input_ids"]
     n_tgt = len(tgt_tokens)
 
-    # ``full`` mode: a single prefix = the entire (answer-truncated) reasoning,
-    # i.e. one synthetic split point at n_tgt. This yields a length-1
-    # summarize_prompts array; the downstream dataset replicates it up to K.
+    # ``full`` mode: a single prefix = a leading fraction of the
+    # (answer-truncated) reasoning, i.e. one synthetic split point at
+    # ``round(full_ratio * n_tgt)``. With ratio == 1.0 this is the whole
+    # truncated reasoning (original behaviour); with ratio < 1.0 the decoded
+    # prefix is backed up to the nearest sentence boundary so it never ends
+    # mid-sentence. Yields a length-1 summarize_prompts array; the downstream
+    # dataset replicates it up to K.
     if mode == "full":
-        effective_points: List[int] = [n_tgt]
+        sp_full = int(round(full_ratio * n_tgt))
+        effective_points: List[int] = [sp_full]
+        apply_boundary_backup = full_ratio < 1.0
     else:
         effective_points = [int(sp) for sp in split_points]
+        apply_boundary_backup = False
 
     prompts_list: List[List[Dict[str, str]]] = []
     for sp in effective_points:
@@ -330,6 +386,8 @@ def process_single_item(
             prefix_text = worker_tokenizer.decode(
                 tgt_tokens[:sp], skip_special_tokens=True
             )
+            if apply_boundary_backup:
+                prefix_text = _backup_to_sentence_boundary(prefix_text)
         msgs = _build_summarize_prompt(system_msg, question, prefix_text, template)
         prompts_list.append(msgs)
 
@@ -345,9 +403,9 @@ def process_single_item(
     return item
 
 
-def _worker_process(args: Tuple[Dict[str, Any], str, str]) -> Dict[str, Any]:
-    item, template, mode = args
-    return process_single_item(item, template, mode)
+def _worker_process(args: Tuple[Dict[str, Any], str, str, float]) -> Dict[str, Any]:
+    item, template, mode, full_ratio = args
+    return process_single_item(item, template, mode, full_ratio)
 
 
 # ---------------------------------------------------------------------------
@@ -373,8 +431,17 @@ def main() -> None:
         choices=["multi", "full"],
         default="multi",
         help="multi (default): one prompt per split point -> length-K array. "
-             "full: a single prompt whose draft is the complete (answer-truncated) "
-             "reasoning -> length-1 array (split points ignored).",
+             "full: a single prompt whose draft is a leading fraction of the "
+             "(answer-truncated) reasoning -> length-1 array (split points ignored).",
+    )
+    parser.add_argument(
+        "--full-ratio",
+        type=float,
+        default=1.0,
+        help="Only used in --mode full. Fraction (0, 1] of the answer-truncated "
+             "reasoning (in token space) to use as the [Reasoning Draft]. "
+             "1.0 (default) = the complete reasoning; e.g. 0.5 = the first ~50%% "
+             "of tokens, backed up to the nearest sentence boundary.",
     )
     parser.add_argument(
         "--template",
@@ -386,6 +453,11 @@ def main() -> None:
 
     if "{question}" not in args.template or "{prefix}" not in args.template:
         raise SystemExit("--template must contain both {question} and {prefix}")
+
+    if not (0.0 < args.full_ratio <= 1.0):
+        raise SystemExit("--full-ratio must be in the (0, 1] range")
+    if args.mode != "full" and args.full_ratio != 1.0:
+        print("  (--full-ratio is ignored unless --mode full)")
 
     print(f"Reading {args.input}")
     df = pd.read_parquet(args.input)
@@ -407,16 +479,18 @@ def main() -> None:
         df = df.head(args.limit)
     records = df.to_dict(orient="records")
     print(f"  -> {len(records):,} rows. Tokenizer: {args.tokenizer_path}. Mode: {args.mode}")
+    if args.mode == "full":
+        print(f"     full-ratio: {args.full_ratio}")
 
     workers = max(1, min(args.workers, mp.cpu_count()))
     if workers == 1:
         init_worker(args.tokenizer_path)
         processed = [
-            process_single_item(item, args.template, args.mode)
+            process_single_item(item, args.template, args.mode, args.full_ratio)
             for item in tqdm(records, total=len(records), desc="rendering")
         ]
     else:
-        task_iter = ((item, args.template, args.mode) for item in records)
+        task_iter = ((item, args.template, args.mode, args.full_ratio) for item in records)
         with mp.Pool(
             processes=workers,
             initializer=init_worker,
