@@ -1491,7 +1491,27 @@ class NewRayPPOTrainer(RayPPOTrainer):
                      # gen_batch has interleaved structure (S0_R0, S0_R1...), so n_divide=n_prefix allows extracting S0_R0 (clean prompt)
                      # explain-style: summarize 模式下传 mode='summarize' + 原始短 prompt 作为 loss_prompts，
                      # 让 actor forward 在原始 prompt 下重新算 log_prob（rollout 用的是长 summarize prompt）。
-                     if loss_prompts_for_summarize is not None:
+                     #
+                     # summarize_loss_on_rollout_prompt=True 时：loss-time 直接在 rollout 用的长
+                     # summarize prompt 上更新。此时 gen_batch_output 本身就是
+                     # [长 summarize prompt, response] 的完整结构，无需重建 input_ids，也无需
+                     # 计算 target_probs（loss 与 rollout 同 prompt，off-policy 的 prompt-shift
+                     # 修正退化为普通 PPO），故直接当作纯 on-policy 样本：只补一个全 False 的
+                     # prefix_mask，让下游 off_policy_mask 判为 on-policy，old_log_prob /
+                     # advantage / loss 全部走标准 on-policy 路径。
+                     loss_on_rollout_prompt = (
+                         loss_prompts_for_summarize is not None
+                         and self.config.actor_rollout_ref.rollout.get(
+                             'summarize_loss_on_rollout_prompt', False
+                         )
+                     )
+                     if loss_on_rollout_prompt:
+                         gen_batch_output.batch['prefix_mask'] = torch.zeros(
+                             (gen_batch_output.batch['responses'].size(0),
+                              gen_batch_output.batch['responses'].size(1)),
+                             dtype=torch.bool,
+                         )
+                     elif loss_prompts_for_summarize is not None:
                          # explain-style: 在 build 替换 prompt 之前，先用此时 gen_batch_output
                          # 的 input_ids（= [长 summarize prompt, response]）算一份 actor log_prob。
                          # exp 后作为 target_probs 注入，让 off-policy 公式
