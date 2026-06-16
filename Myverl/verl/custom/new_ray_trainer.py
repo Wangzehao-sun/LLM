@@ -985,6 +985,11 @@ class NewRayPPOTrainer(RayPPOTrainer):
         """
         在 se_filter 模式下，检查每个问题（包含 n 个采样）准确率是否低于 accuracy_threshold
         如果是，则用离线数据 off_policy_batch 中对应的条目替换该问题在 on_policy_batch 中的一个错误采样。
+
+        当 rollout.screen_off_replace=True 时，对每个候选 off 样本先做"正确性 + 轨迹过滤"
+        双重筛选：只有 reward==success 且通过 _trajectory_filter_reject 的候选才会被替换进去；
+        某问题若无合格候选则不替换（保持其原始全错状态，后续会被 valid_mask 过滤）。
+        默认 False 时保持旧行为（无条件用第一个 off 候选替换最后一个错误回复）。
         """
         # 计算当前生成的reward
         # 将 reward_info 按插入的方式重复 n 次
@@ -993,18 +998,18 @@ class NewRayPPOTrainer(RayPPOTrainer):
 
         #on_policy_batch.non_tensor_batch['reward_model'] = repeated_reward_info
         reward_tensor_on, _ = compute_reward(on_policy_batch, self.reward_fn)
-        
+
         # reward_tensor_on 是 token-level 的，需要求和得到每个样本的得分
         reward_sum = reward_tensor_on.sum(dim=-1)
-        
+
         # reshape reward to (train_batch_size, n)
         rewards_reshaped = reward_sum.view(train_batch_size, n)
-        
+
         success_value = 1
-        
+
         # Calculate accuracy for each problem
         accuracies = (rewards_reshaped == success_value).float().mean(dim=1)
-        
+
         if accuracy_threshold > 0:
             target_mask = accuracies <= accuracy_threshold
         else:
@@ -1013,28 +1018,92 @@ class NewRayPPOTrainer(RayPPOTrainer):
             target_mask = ~has_success
 
         all_wrong_indices = torch.nonzero(target_mask).squeeze(-1)
-        
+
+        # ---- 候选筛选开关 ----
+        # 默认 False 走旧逻辑；True 时只替换"正确且过轨迹过滤"的 off 候选。
+        screen = self.config.actor_rollout_ref.rollout.get('screen_off_replace', False)
+
+        if all_wrong_indices.numel() > 0 and screen:
+            # 1) 给每个 off 候选打分（off_policy_batch 形状 [train_batch_size * n_off]，
+            #    按问题顺序排列，问题 p 的候选在 p*n_off）。
+            off_reward_tensor, _ = compute_reward(off_policy_batch, self.reward_fn)
+            off_reward_sum = off_reward_tensor.sum(dim=-1)  # [train_batch_size * n_off]
+
+            # 2) 轨迹过滤：复用与主流程一致的 cfg；仅在 enable 时生效。
+            tf_cfg = self.config.algorithm.get('trajectory_filter', {})
+            tf_enable = tf_cfg.get('enable', False)
+            off_resp_texts = None
+            if tf_enable:
+                off_resp_texts = self.tokenizer.batch_decode(
+                    off_policy_batch.batch['responses'], skip_special_tokens=True
+                )
+
+            accepted_targets = []   # on-policy batch 内被替换的行索引
+            accepted_sources = []   # off-policy batch 内对应候选索引
+            n_rej_incorrect = 0
+            n_rej_filter = 0
+            for p in all_wrong_indices.tolist():
+                src = p * n_off  # 取该问题第一个 off 候选
+                # 正确性
+                if off_reward_sum[src].item() != success_value:
+                    n_rej_incorrect += 1
+                    continue
+                # 轨迹过滤
+                if tf_enable:
+                    reject, _reason = _trajectory_filter_reject(off_resp_texts[src], tf_cfg)
+                    if reject:
+                        n_rej_filter += 1
+                        continue
+                # 合格：替换该问题最后一个错误回复
+                wrong_local = torch.nonzero(rewards_reshaped[p] != success_value).squeeze(-1)
+                if wrong_local.numel() == 0:
+                    continue  # 理论不会发生（target 都至少有一个错误）
+                last_wrong = int(wrong_local[-1].item())
+                accepted_targets.append(p * n + last_wrong)
+                accepted_sources.append(src)
+
+            print(
+                f"[screen_off_replace] candidates={all_wrong_indices.numel()}, "
+                f"accepted={len(accepted_targets)}, rejected_incorrect={n_rej_incorrect}, "
+                f"rejected_filter={n_rej_filter}"
+            )
+
+            if accepted_targets:
+                if 'off_old_log_probs' not in on_policy_batch.batch:
+                    on_policy_batch.batch['off_old_log_probs'] = torch.zeros_like(
+                        on_policy_batch.batch['responses'], dtype=torch.float32
+                    )
+                for key in off_policy_batch.batch.keys():
+                    if key in on_policy_batch.batch:
+                        dev = on_policy_batch.batch[key].device
+                        ti = torch.as_tensor(accepted_targets, dtype=torch.long, device=dev)
+                        si = torch.as_tensor(accepted_sources, dtype=torch.long, device=dev)
+                        on_policy_batch.batch[key][ti] = off_policy_batch.batch[key][si].to(dev)
+                    else:
+                        print(f"Key {key} not found in on_policy_batch; skipping replacement for this key.")
+            return on_policy_batch
+
         if all_wrong_indices.numel() > 0:
             print(f"Replacing {all_wrong_indices.numel()} problems' response with off-policy data.")
-            
+
             # 找到需要替换的样本索引（每个问题找最后一个回答错误的样本）
             wrong_responses_mask = (rewards_reshaped != success_value)
             relevant_wrong_mask = wrong_responses_mask[all_wrong_indices] # (num_targets, n)
-            
+
             # Find the last wrong index for each target problem
             # Flip to find the first True in reversed, then convert back
             flipped_mask = relevant_wrong_mask.flip(1)
             # We assume there is at least one wrong answer if it was selected (acc < 1 implies wrong exists, or acc=0)
-            _, first_true_in_flipped = flipped_mask.max(dim=1) 
+            _, first_true_in_flipped = flipped_mask.max(dim=1)
             last_wrong_indices_local = (n - 1) - first_true_in_flipped
-            
+
             # 替换每个全错问题的最后一个回复
             target_indices = all_wrong_indices * n + last_wrong_indices_local
-            
+
             # gen_batch_off_output 的结构是 (train_batch_size * n_off)
             # 我们取每个问题的第一个 off-policy 回复
             source_indices = all_wrong_indices * n_off
-            
+
             # 确保 on_policy_batch 中有 off_old_log_probs 字段
             if 'off_old_log_probs' not in on_policy_batch.batch:
                 on_policy_batch.batch['off_old_log_probs'] = torch.zeros_like(on_policy_batch.batch['responses'], dtype=torch.float32)
@@ -1047,8 +1116,217 @@ class NewRayPPOTrainer(RayPPOTrainer):
 
                 # elif key == 'off_old_log_probs':
                 #     on_policy_batch.batch[key][target_indices] = off_policy_batch.batch[key][source_indices]
-        
+
         return on_policy_batch
+
+    def _summarize_replace_normal_step(
+        self,
+        gen_batch: DataProto,
+        gen_batch_output: DataProto,
+        batch: DataProto,
+        train_batch_size: int,
+        timing_raw: dict,
+        metrics: dict,
+    ) -> DataProto:
+        """Normal-step only (与 extra_step / recycle 逻辑完全无关) 的 summarize 替换。
+
+        对当前 normal step 里"全错"(或 accuracy <= accuracy_threshold) 的题目，用其
+        预渲染的 summarize prompt 让当前 actor 生成 **K 条** 候选 (K=summarize_replace_k)：
+        第 k 条用 prompt[min(k, K_data-1)]——数据集渲染多条时取前 K 条不同 prompt，
+        只渲染 1 条时则对该条重复采样 K 次。按 prompt 顺序取 **第一条** 同时满足
+        "reward==success" 且通过 ``_trajectory_filter_reject`` 的候选，用一条 explain-style
+        off-policy 行替换该题的一条错误 rollout：
+
+          * 最终 input_ids = [原始短 question prompt, candidate_response]
+          * prefix_mask = 1（该行走 off-policy explain loss）
+          * off_old_log_probs / target_probs = candidate 在长 summarize prompt 下的 logprob
+            -> loss 端 off_ratio = exp(log_prob_short - log_prob_long) 即 prompt-shift 修正
+            (rl-rl 走 off_old_log_probs 替换 old_log_probs；luffy 走 target_probs 分支)。
+
+        其余 on-policy 行 prefix_mask=0，照常走 GRPO。只对全错题生成候选以省算力；
+        某题 K 条候选全不合格则不替换（保持原状，后续被 valid_mask 过滤）。
+        """
+        if 'summarize_input_ids' not in batch.batch:
+            raise ValueError(
+                "summarize_replace=True 需要 data.use_summarize=True (缺 summarize_input_ids)"
+            )
+        pad_token_id = self.tokenizer.pad_token_id
+        success_value = 1
+        responses = gen_batch_output.batch['responses']
+        device = responses.device
+        bn, resp_width = responses.size(0), responses.size(1)
+        n = bn // train_batch_size  # 每题 on-policy 采样数（interleaved 排列）
+
+        # --- 1. 确保 explain-style 所需的 key 在整批存在（on 行用零占位，masked 掉）---
+        #     use_off_policy_probs=True 时 update_actor 会 select 'target_probs'，
+        #     这里给全批补零，避免 select 失败；on 行 prefix_mask=0 -> off_ratio 被 mask。
+        if 'prefix_mask' not in gen_batch_output.batch.keys():
+            gen_batch_output.batch['prefix_mask'] = torch.zeros(
+                (bn, resp_width), dtype=torch.bool, device=device
+            )
+        gen_batch_output.batch['target_probs'] = torch.zeros(
+            (bn, resp_width), dtype=torch.float32, device=device
+        )
+        gen_batch_output.batch['off_old_log_probs'] = torch.zeros(
+            (bn, resp_width), dtype=torch.float32, device=device
+        )
+
+        # --- 2. 给 on-policy rollouts 打分，找出全错题 ---
+        def _repeat_nt(nt: dict, times: int) -> dict:
+            out = {}
+            for k, v in nt.items():
+                if isinstance(v, np.ndarray):
+                    out[k] = np.repeat(v, times, axis=0)
+                elif isinstance(v, list):
+                    out[k] = [it for it in v for _ in range(times)]
+                else:
+                    out[k] = v
+            return out
+
+        saved_nt = gen_batch_output.non_tensor_batch
+        gen_batch_output.non_tensor_batch = _repeat_nt(batch.non_tensor_batch, n)
+        on_reward, _ = compute_reward(gen_batch_output, self.reward_fn)
+        gen_batch_output.non_tensor_batch = saved_nt  # 还原，避免污染下游 union
+        on_reward_sum = on_reward.sum(-1).to(device).view(train_batch_size, n)
+
+        acc_thr = self.config.actor_rollout_ref.rollout.get('accuracy_threshold', 0.0)
+        if acc_thr and acc_thr > 0:
+            acc = (on_reward_sum == success_value).float().mean(-1)
+            wrong_q = torch.nonzero(acc <= acc_thr).squeeze(-1).tolist()
+        else:
+            has_succ = (on_reward_sum == success_value).any(-1)
+            wrong_q = torch.nonzero(~has_succ).squeeze(-1).tolist()
+        metrics['batch/sr_wrong_questions'] = len(wrong_q)
+        if not wrong_q:
+            return gen_batch_output
+
+        # --- 3. 每道全错题生成 K 条候选 ---
+        #     第 k 条候选用 summarize prompt[min(k, K_data-1)]：
+        #       * 数据集渲染多条 -> 前 K 条用不同 prompt（K_data>=K 时取前 K 条）；
+        #       * 数据集只有 1 条 -> K 条都用这条，靠采样随机性得到 K 个不同候选；
+        #       * 中间情况 -> 多出的候选重复最后一条 prompt。
+        #     候选总数恒为 K（由 config summarize_replace_k 指定，不被 K_data 砍）。
+        sum_ids = batch.batch['summarize_input_ids']          # [B, K_data, L_long]
+        K_data = sum_ids.size(1)
+        L_long = sum_ids.size(2)
+        K = max(1, int(self.config.actor_rollout_ref.rollout.get('summarize_replace_k', 1)))
+        W = len(wrong_q)
+        # 展平成 [W*K, L_long]：行 r = w_idx*K + k -> 第 wrong_q[w_idx] 题的第 k 条候选。
+        long_rows = []
+        for w_idx in wrong_q:
+            for k in range(K):
+                long_rows.append(sum_ids[w_idx, min(k, K_data - 1), :])
+        long_prompt = torch.stack(long_rows, dim=0).to(device)  # [W*K, L_long]
+        long_attn, long_pos = generate_masks_from_input_ids(
+            long_prompt, pad_token_id, gen_batch_output.batch['attention_mask'].dtype
+        )
+        cand_gen = DataProto.from_single_dict({
+            'input_ids': long_prompt,
+            'attention_mask': long_attn,
+            'position_ids': long_pos,
+        })
+        cand_gen.meta_info = deepcopy(gen_batch.meta_info)
+        cand_gen.meta_info['is_se'] = False
+        cand_gen.meta_info['is_extra'] = False
+        with marked_timer("sr_gen", timing_raw, color="cyan"):
+            cand_out = self.actor_rollout_wg.generate_sequences(cand_gen)
+            timing_raw.update(cand_out.meta_info.get("timing", {}))
+            cand_out.meta_info.pop("timing", None)
+        cand_resp = cand_out.batch['responses']               # [W*K, w]
+
+        # --- 4. 候选在长 prompt 下的 logprob（off_old_log_probs / target_probs 来源）---
+        with marked_timer("sr_logprob", timing_raw, color="cyan"):
+            _lp = self.actor_rollout_wg.compute_log_prob(cand_out)
+            long_log_prob = _lp.batch.pop('old_log_probs')    # [W*K, w]
+            if 'entropys' in _lp.batch.keys():
+                _lp.batch.pop('entropys')
+            del _lp
+
+        # --- 5. 候选打分 + 轨迹过滤（按 W*K 展平，每行一条候选）---
+        def _index_nt(nt: dict, idx: list) -> dict:
+            out = {}
+            for k, v in nt.items():
+                if isinstance(v, np.ndarray):
+                    out[k] = v[idx]
+                elif isinstance(v, list):
+                    out[k] = [v[i] for i in idx]
+                else:
+                    out[k] = v
+            return out
+
+        # ground-truth 展平到 W*K：每题 GT 重复 K 次（与候选行一一对应）。
+        flat_gt_idx = [wrong_q[w] for w in range(W) for _ in range(K)]
+        cand_out.non_tensor_batch = _index_nt(batch.non_tensor_batch, flat_gt_idx)
+        cand_reward, _ = compute_reward(cand_out, self.reward_fn)
+        cand_reward_sum = cand_reward.sum(-1)                 # [W*K]
+        tf_cfg = self.config.algorithm.get('trajectory_filter', {})
+        tf_enable = tf_cfg.get('enable', False)
+        cand_texts = (
+            self.tokenizer.batch_decode(cand_resp, skip_special_tokens=True)
+            if tf_enable else None
+        )
+
+        # --- 6. 构建 explain-style off 行（短 prompt + 候选 response），展平到 W*K ---
+        short_prompts = gen_batch.batch['input_ids'][::n]     # [B, L_short]
+        wq_idx = torch.tensor(wrong_q, device=short_prompts.device)
+        # 每题短 prompt 重复 K 次，与 W*K 候选对齐。
+        short_wk = short_prompts[wq_idx].repeat_interleave(K, dim=0).to(device)  # [W*K, L_short]
+        off_batch = self._build_hybrid_off_policy_output(
+            n_divide=1,
+            n_repeat=1,
+            gen_batch=cand_gen,
+            off_responses=cand_resp,
+            prefix_list=[[] for _ in range(W * K)],
+            train_batch_size=W * K,
+            mode="summarize",
+            loss_prompts=short_wk,
+        )
+        # 宽度一致性：generate 把 response 右填充到 max_response_length，
+        # _build_hybrid 也 pad 到 max(max_response_length, w)，与 on 批 resp_width 相同。
+        off_batch.batch['target_probs'] = torch.exp(long_log_prob)
+        off_batch.batch['off_old_log_probs'] = long_log_prob
+
+        # --- 7. 每题按 prompt 顺序取第一条合格候选，替换其一条错误 rollout ---
+        n_acc = n_rej_inc = n_rej_flt = n_no_cand = 0
+        for w_idx, p in enumerate(wrong_q):
+            chosen = -1  # off_batch 内（W*K 展平）被选中的行
+            for k in range(K):
+                r = w_idx * K + k
+                if cand_reward_sum[r].item() != success_value:
+                    n_rej_inc += 1
+                    continue
+                if tf_enable:
+                    rej, _reason = _trajectory_filter_reject(cand_texts[r], tf_cfg)
+                    if rej:
+                        n_rej_flt += 1
+                        continue
+                chosen = r
+                break  # 第一条合格的即用
+            if chosen < 0:
+                n_no_cand += 1
+                continue
+            wrong_local = torch.nonzero(on_reward_sum[p] != success_value).squeeze(-1)
+            if wrong_local.numel() == 0:
+                continue
+            last_wrong = int(wrong_local[-1].item())
+            ti = p * n + last_wrong
+            for key in off_batch.batch.keys():
+                if key in gen_batch_output.batch.keys():
+                    dst = gen_batch_output.batch[key]
+                    dst[ti] = off_batch.batch[key][chosen].to(dst.device)
+            n_acc += 1
+
+        metrics['batch/sr_k'] = K
+        metrics['batch/sr_accepted'] = n_acc
+        metrics['batch/sr_no_candidate'] = n_no_cand
+        metrics['batch/sr_rej_incorrect'] = n_rej_inc
+        metrics['batch/sr_rej_filter'] = n_rej_flt
+        print(
+            f"[summarize_replace] wrong={W}, K={K}, accepted={n_acc}, "
+            f"no_candidate={n_no_cand}, rej_incorrect={n_rej_inc}, rej_filter={n_rej_flt}"
+        )
+        return gen_batch_output
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1566,6 +1844,21 @@ class NewRayPPOTrainer(RayPPOTrainer):
                     #为gen_batch-output添加prefix_mask字段，表示哪些response token是离线的
                     gen_batch_output.batch['prefix_mask'] = torch.zeros((gen_batch_output.batch['responses'].size(0), gen_batch_output.batch['responses'].size(1)),
                                        dtype=torch.bool) # empty dummy tensor
+                    # Normal-step only: 对全错题用 summarize prompt[0] 生成候选，
+                    # 正确且过轨迹过滤则以 explain-style off 行替换一条错误 rollout。
+                    # 仅当开关开启且非 recycle step 时运行（extra_step 逻辑完全不受影响）。
+                    if (
+                        not is_failure_recycle_step
+                        and self.config.actor_rollout_ref.rollout.get('summarize_replace', False)
+                    ):
+                        gen_batch_output = self._summarize_replace_normal_step(
+                            gen_batch=gen_batch,
+                            gen_batch_output=gen_batch_output,
+                            batch=batch,
+                            train_batch_size=train_batch_size,
+                            timing_raw=timing_raw,
+                            metrics=metrics,
+                        )
             #import time
             #time.sleep(5) # wait for a while to make the logs more readable
             with marked_timer("gen_off", timing_raw, color="blue"):
@@ -1700,6 +1993,19 @@ class NewRayPPOTrainer(RayPPOTrainer):
 
                     # 将重复后的 non_tensor_batch 赋值给 gen_batch_output
                     gen_batch_output.non_tensor_batch = repeated_non_tensor_batch
+
+                    # 替换前要对 off-policy 候选做"正确性 + 轨迹过滤"筛选，需要 ground-truth
+                    # 才能给候选打分。off-batch 形状是 [train_batch_size * n_off]，按问题顺序
+                    # 排列，故把原始 non_tensor_batch 按 n_off 重复对齐过去（n_off=1 时即原样）。
+                    off_repeated_non_tensor_batch = {}
+                    for k, v in non_tensor_batch.items():
+                        if isinstance(v, list):
+                            off_repeated_non_tensor_batch[k] = [item for item in v for _ in range(n_off)]
+                        elif isinstance(v, np.ndarray):
+                            off_repeated_non_tensor_batch[k] = np.repeat(v, n_off, axis=0)
+                        else:
+                            off_repeated_non_tensor_batch[k] = v
+                    gen_batch_off_output.non_tensor_batch = off_repeated_non_tensor_batch
 
                     #reward_info = batch.non_tensor_batch.get('reward_model', None)
                     accuracy_threshold = self.config.actor_rollout_ref.rollout.get("accuracy_threshold", 0.0)
