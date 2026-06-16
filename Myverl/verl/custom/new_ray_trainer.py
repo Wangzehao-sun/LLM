@@ -1511,6 +1511,15 @@ class NewRayPPOTrainer(RayPPOTrainer):
                               gen_batch_output.batch['responses'].size(1)),
                              dtype=torch.bool,
                          )
+                         # 这些行 loss 端按 on-policy 处理（prefix_mask 全 False），但内容上
+                         # 仍是"长 summarize prompt 续写"出来的改写样本，需要过轨迹过滤。
+                         # 用一个独立标记与 prefix_mask 解耦：过滤循环据此判断哪些行该过滤，
+                         # 而 off_policy_mask（基于 prefix_mask）仍把它们当 on-policy。
+                         gen_batch_output.batch['summarize_rewritten_mask'] = torch.ones(
+                             (gen_batch_output.batch['responses'].size(0),
+                              gen_batch_output.batch['responses'].size(1)),
+                             dtype=torch.bool,
+                         )
                      elif loss_prompts_for_summarize is not None:
                          # explain-style: 在 build 替换 prompt 之前，先用此时 gen_batch_output
                          # 的 input_ids（= [长 summarize prompt, response]）算一份 actor log_prob。
@@ -1798,13 +1807,23 @@ class NewRayPPOTrainer(RayPPOTrainer):
                 
                 off_policy_mask_np = batch.batch['prefix_mask'].any(-1).cpu().numpy()
 
+                # 轨迹过滤的判据：哪些行属于"改写样本、需过轨迹过滤"。
+                # 默认就是 off-policy 行（prefix_mask 命中）。但 summarize_loss_on_rollout_prompt
+                # 模式下这些改写样本的 prefix_mask 被故意置全 False（loss 端当 on-policy），
+                # 所以单独用 summarize_rewritten_mask 把它们重新纳入过滤范围，二者取并集。
+                # 注意：只影响过滤循环，off_policy_mask_np（uid 分组判 on/off）保持不变。
+                traj_filter_mask_np = off_policy_mask_np
+                if 'summarize_rewritten_mask' in batch.batch.keys():
+                    rewritten_mask_np = batch.batch['summarize_rewritten_mask'].any(-1).cpu().numpy()
+                    traj_filter_mask_np = off_policy_mask_np | rewritten_mask_np
+
                 # ---- Trajectory format filter on rewritten (off-policy/summarize) rollouts ----
                 # Treat this as part of the reward function: a rewritten trajectory that still
                 # references the draft/experience, restates the summarize-template instructions,
                 # or contains noisy repeated strings is a FORMAT ERROR -> its reward is overwritten
                 # with format_value (-1). This must run BEFORE the uid grouping below so the new
                 # rewards flow into solve_none_format / reward_sum / advantage consistently.
-                # Only touches off-policy rows; on-policy self-sampled rollouts are untouched.
+                # Only touches rewritten rows; on-policy self-sampled rollouts are untouched.
                 # Disabled unless explicitly enabled.
                 tf_cfg = self.config.algorithm.get('trajectory_filter', {})
                 if tf_cfg.get('enable', False):
@@ -1815,7 +1834,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
                     n_rej = 0
                     reason_counts = {}
                     for i in range(len(resp_texts)):
-                        if not off_policy_mask_np[i]:
+                        if not traj_filter_mask_np[i]:
                             continue  # only filter rewritten trajectories
                         reject, reason = _trajectory_filter_reject(resp_texts[i], tf_cfg)
                         if reject:
