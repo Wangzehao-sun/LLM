@@ -1390,6 +1390,30 @@ class NewRayPPOTrainer(RayPPOTrainer):
         extra_step_interval = self.config.data.get('extra_step_interval', 1)  # at least K normal steps between extra_step triggers
         steps_since_last_extra = 0  # counter for cooldown
 
+        # ---------------------------------------------------------------
+        # Warmup: 正式训练前先跑几步 extra_step(recycle) warmup，提升模型的
+        # summarize 能力。失败缓冲区此时为空，故直接从 dataloader 取 warmup_steps
+        # 个 batch（每步一个）当作 warmup 数据。warmup_steps=0 时关闭（默认）。
+        # ---------------------------------------------------------------
+        warmup_steps = self.config.data.get('warmup_steps', 0)
+        if warmup_steps > 0:
+            print(f"[warmup] running {warmup_steps} extra_step warmup step(s), one dataloader batch each")
+            w_step = 0
+            for warmup_batch_dict in self.train_dataloader:
+                is_last, w_val, _ = self._train_step_internal(
+                    warmup_batch_dict, 0, logger_extra, progress_bar,
+                    collect_failures=False, is_failure_recycle_step=True,
+                )
+                w_step += 1
+                print(f"[warmup] completed warmup step {w_step}/{warmup_steps}")
+                if is_last:
+                    pprint(f"[warmup] reached final step during warmup: {w_val}")
+                    progress_bar.close()
+                    return
+                if w_step >= warmup_steps:
+                    break
+            print("[warmup] warmup finished; starting normal training")
+
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
 
