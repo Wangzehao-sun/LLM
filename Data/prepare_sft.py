@@ -17,14 +17,36 @@ import argparse
 import pandas as pd
 
 
-def _to_message_list(x):
-    # parquet stores message arrays as numpy object arrays; normalise to list[dict]
-    return [dict(m) for m in list(x)]
+def _normalize_msg(m):
+    # one message -> plain dict, tolerant of numpy structured records.
+    if isinstance(m, dict):
+        return dict(m)
+    if hasattr(m, "dtype") and getattr(m.dtype, "names", None):
+        return {k: m[k] for k in m.dtype.names}
+    return dict(m)
+
+
+def _to_message_list(x, str_role=None):
+    # 列里可能是：单个 message dict（{'role','content'}）、一组 message
+    # （ndarray/list of dict），或一段纯文本字符串（如 output 列的答案）。
+    # 统一成 list[dict]。注意：单个 dict 不能直接 list(x)，那样得到的是它的 keys。
+    if isinstance(x, str):
+        if str_role is None:
+            raise ValueError(
+                "got a plain string but no str_role to wrap it; "
+                "pass str_role (e.g. 'assistant') for text-only columns"
+            )
+        return [{"role": str_role, "content": x}]
+    if isinstance(x, dict):
+        return [_normalize_msg(x)]
+    return [_normalize_msg(m) for m in list(x)]
 
 
 def build_messages(row, prompt_key, target_key):
-    prompt_msgs = _to_message_list(row[prompt_key])
-    target_msgs = _to_message_list(row[target_key])
+    # prompt 通常是 [system, user] 消息数组；target 既可能是消息(数组/单 dict)，
+    # 也可能是纯文本答案(如 output 列)——后者按 assistant 角色包装。
+    prompt_msgs = _to_message_list(row[prompt_key], str_role="user")
+    target_msgs = _to_message_list(row[target_key], str_role="assistant")
     return prompt_msgs + target_msgs
 
 
