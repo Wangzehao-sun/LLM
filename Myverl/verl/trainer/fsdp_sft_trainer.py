@@ -545,6 +545,12 @@ class FSDPSFTTrainer:
                         print(f"Final validation metrics: {last_valid_metric}")
                     return
 
+            # End of epoch: optionally save a checkpoint. Reaching here means the
+            # epoch was fully consumed without hitting is_last_step (which returns),
+            # so this never double-saves the final step.
+            if self.config.trainer.get("save_per_epoch", False):
+                self.save_checkpoint(step=global_step)
+
 
 def run_sft(config):
     device_name = get_device_name()
