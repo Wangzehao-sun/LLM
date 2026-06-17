@@ -9,7 +9,8 @@ to be one conversation: [system, user, assistant, ...].
 Usage:
     python prepare_sft.py \
         --in  ../data/deepmath_dgt6_n10000.parquet \
-        --out ../data/deepmath_dgt6_n10000_sft.parquet
+        --out ../data/deepmath_dgt6_n10000_sft.parquet \
+        --limit 2000          # 可选：只保存前 2000 条
 """
 import argparse
 
@@ -34,10 +35,16 @@ def main():
     ap.add_argument("--prompt-key", default="prompt")
     ap.add_argument("--target-key", default="target")
     ap.add_argument("--messages-key", default="messages")
+    ap.add_argument("--limit", type=int, default=None,
+                    help="只保存前 N 条；默认 None 表示全部保存。")
     args = ap.parse_args()
 
     df = pd.read_parquet(args.in_path)
     print(f"loaded {len(df)} rows from {args.in_path}; columns={list(df.columns)}")
+
+    if args.limit is not None:
+        df = df.head(args.limit)
+        print(f"limiting to first {len(df)} rows (--limit={args.limit})")
 
     df[args.messages_key] = df.apply(
         lambda r: build_messages(r, args.prompt_key, args.target_key), axis=1
