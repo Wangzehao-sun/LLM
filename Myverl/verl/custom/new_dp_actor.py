@@ -377,7 +377,10 @@ class NewDataParallelPPOActor(DataParallelPPOActor):
                             all_max_clip=self.config.all_max_clip if self.config.all_max_clip != -1 else None,
                             off_policy_strategy=current_loss_mode,
                             off_policy_reshape=off_policy_reshape,
+                            loss_remove_token_mean=self.config.loss_remove_token_mean,
                             loss_remove_clip=self.config.loss_remove_clip,
+                            on_loss_remove_clip=self.config.get("on_loss_remove_clip", None),
+                            off_loss_remove_clip=self.config.get("off_loss_remove_clip", None),
                             se_mask=se_mask
                         )
                         pg_loss = ret_dict['pg_loss']

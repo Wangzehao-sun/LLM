@@ -430,11 +430,18 @@ def compute_token_on_off_sft_loss(
     off_policy_loss_type="sft", # "sft", "none"
     sft_gate_threshold=0.2,
     sft_gate_tau=0.01,
+    on_loss_remove_clip=None,
+    off_loss_remove_clip=None,
 ):
     """
     """
     prefix_mask = prefix_mask.float()
     reward_mask = reward_mask.float()
+    # on/off 各自的 clip 开关：未显式指定时回退到全局 loss_remove_clip（向后兼容）。
+    if on_loss_remove_clip is None:
+        on_loss_remove_clip = loss_remove_clip
+    if off_loss_remove_clip is None:
+        off_loss_remove_clip = loss_remove_clip
     if off_policy_strategy == "rl-sft":
         on_policy_loss_type = "rl"
         off_policy_loss_type = "sft"
@@ -465,8 +472,8 @@ def compute_token_on_off_sft_loss(
         if cliprange_high is None:
             cliprange_high = cliprange
         upper_bound = max(1.0 + cliprange_high, 1.0 + cliprange)
-        
-        if loss_remove_clip is False:
+
+        if on_loss_remove_clip is False:
             on_pg_losses2 = -advantages * torch.clamp(ratio, 1.0 - cliprange_low, upper_bound)
             on_pg_losses_clip = torch.max(on_pg_losses, on_pg_losses2)
             on_pg_losses3 = -advantages * 3.0
@@ -559,7 +566,7 @@ def compute_token_on_off_sft_loss(
         upper_bound = max(1.0 + cliprange_high, 1.0 + cliprange)
 
         off_pg_losses = -advantages * off_ratio
-        if loss_remove_clip is False:
+        if off_loss_remove_clip is False:
             off_pg_losses2 = -advantages * torch.clamp(off_ratio, 1.0 - cliprange_low, upper_bound)
             off_pg_losses_clip = torch.max(off_pg_losses, off_pg_losses2)
             off_pg_losses3 = -advantages * 3.0
@@ -593,7 +600,11 @@ def compute_token_on_off_sft_loss(
         response_mask = response_mask * p_on_mask
         pg_losses = pg_losses * p_on_mask
 
-    pg_loss = verl_F.masked_mean(pg_losses, response_mask * reward_mask)
+    if loss_remove_token_mean is True:
+        # seq-sum 风格：按固定的 response 长度归一，而非有效 token 数。
+        pg_loss = (pg_losses * response_mask * reward_mask).sum() / response_mask.shape[-1]
+    else:
+        pg_loss = verl_F.masked_mean(pg_losses, response_mask * reward_mask)
 
     # ============= 统计 on/off 占比 + off 内 SFT/RL 占比 =============
     # 仅用于日志,不参与反向。使用与 pg_loss 相同的分母,

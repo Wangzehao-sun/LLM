@@ -2280,13 +2280,24 @@ class NewRayPPOTrainer(RayPPOTrainer):
                     orig_idx_np = np.array(original_indices)
                 else:
                     orig_idx_np = original_indices
-                    
+
+                # 收集难题时只统计真正的 on-policy rollout：off-policy 行（含 summarize_replace
+                # 注入的正确回复）是人工替换进来的，会把全错题伪装成“解出过一次”，从而被漏收。
+                # 按 prefix_mask 把这些行从准确率计算里剔除。n_off=0 / 无替换时该 mask 全 False，行为不变。
+                if 'prefix_mask' in batch.batch:
+                    on_policy_per_row = (~batch.batch['prefix_mask'].any(-1)).cpu().numpy()
+                else:
+                    on_policy_per_row = np.ones(len(orig_idx_np), dtype=bool)
+
                 # Iterate unique indices
                 failed_original_indices = []
                 for idx_val in unique_indices:
-                     # Get all rollouts for this question
-                     mask = (orig_idx_np == idx_val)
+                     # Get all rollouts for this question (on-policy 行 only)
+                     mask = (orig_idx_np == idx_val) & on_policy_per_row
                      rewards_for_q = reward_np[mask]
+                     if len(rewards_for_q) == 0:
+                         # 整组都是 off-policy 行（理论上不会发生），无法判定难度，跳过。
+                         continue
 
                      if is_failure_recycle_step and self.config.data.get('retain_hard_in_buffer', False):
                          # Recycle mode: retain questions with accuracy in (low_threshold, high_threshold)
