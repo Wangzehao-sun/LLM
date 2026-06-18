@@ -87,6 +87,7 @@ class RLHFDatasetWithTarget(RLHFDataset):
                  # ---- summarize-then-continue (explain-style) 新增 ----
                  use_summarize=False,
                  summarize_prompts_key='summarize_prompts',
+                 summarize_prompt_key='summarize_prompt',
                  max_summarize_prompts=8,           # K, 与训练时 n_prefix 对齐
                  max_summarize_length=8192,         # rollout-time 长 prompt 容量
         ):
@@ -106,6 +107,7 @@ class RLHFDatasetWithTarget(RLHFDataset):
         # ---- summarize-then-continue (explain-style) ----
         self.use_summarize = use_summarize
         self.summarize_prompts_key = summarize_prompts_key
+        self.summarize_prompt_key = summarize_prompt_key
         self.max_summarize_prompts = max_summarize_prompts
         self.max_summarize_length = max_summarize_length
         if self.filter_targets:
@@ -340,27 +342,7 @@ class RLHFDatasetWithTarget(RLHFDataset):
                 else:
                     sp_list = [sp_list[int(i / (K - 1) * (len(sp_list) - 1))] for i in range(K)]
 
-                sum_ids_list: List[torch.Tensor] = []
-                for messages in sp_list:
-                    if isinstance(messages, np.ndarray):
-                        messages = messages.tolist()
-                    full = self.tokenizer.apply_chat_template(
-                        messages, tokenize=False, add_generation_prompt=True
-                    )
-                    ids = self.tokenizer(
-                        full, add_special_tokens=False, return_tensors='pt'
-                    )['input_ids']
-                    if ids.shape[-1] < self.max_summarize_length:
-                        ids = pad_sequence_to_length(
-                            ids,
-                            max_seq_len=self.max_summarize_length,
-                            pad_token_id=self.tokenizer.pad_token_id,
-                            left_pad=True,  # prompt 左 pad，与父类约定一致
-                        )
-                    else:
-                        # 左截断保留尾部 generation_prompt
-                        ids = ids[:, -self.max_summarize_length:]
-                    sum_ids_list.append(ids.squeeze(0))
+                sum_ids_list = [self._render_summarize_ids(m) for m in sp_list]
                 summarize_input_ids = torch.stack(sum_ids_list, dim=0)  # [K, L_long]
 
             summarize_attention_mask = (
@@ -376,12 +358,67 @@ class RLHFDatasetWithTarget(RLHFDataset):
             row_dict['summarize_attention_mask'] = summarize_attention_mask
             row_dict['summarize_position_ids'] = summarize_position_ids
 
+            # ---- 单条 summarize_prompt（给 extra-step / recycle 用）----
+            # 物理隔离于上面的 K 条列表：extra-step 所有 off rollout 共用这一条。
+            # 该列存长度 1 数组（prepare_summarize_prompts.py 的 summarize_prompt 列）。
+            # 缺列 -> 回退用列表里最短那条（[0]，prepare 已保证升序）；都没有 -> 全 pad。
+            single_raw = original_row.get(self.summarize_prompt_key)
+            if isinstance(single_raw, np.ndarray):
+                single_raw = single_raw.tolist()
+            single_msgs = None
+            if single_raw:
+                single_msgs = single_raw[0]
+            elif sp_list:
+                single_msgs = sp_list[0]
+            if single_msgs is not None:
+                summarize_input_id = self._render_summarize_ids(single_msgs)  # [L_long]
+            else:
+                summarize_input_id = torch.full(
+                    (self.max_summarize_length,), self.tokenizer.pad_token_id, dtype=torch.long,
+                )
+            summarize_attention_mask_single = (
+                summarize_input_id != self.tokenizer.pad_token_id
+            ).to(torch.long)
+            summarize_position_id_single = compute_position_id_with_mask(
+                summarize_attention_mask_single
+            )
+            row_dict['summarize_input_id'] = summarize_input_id
+            row_dict['summarize_attention_mask_single'] = summarize_attention_mask_single
+            row_dict['summarize_position_id_single'] = summarize_position_id_single
+
         # 父类已经处理了 'raw_prompt', 'index' 等字段，我们无需重复
         # 直接返回被我们追加了 target 相关字段的 `row_dict`
         #print(row_dict["input_ids"].shape, row_dict["attention_mask"].shape, row_dict["position_ids"].shape, row_dict['tgt_input_ids'].shape)
         row_dict.pop("full_prompts", None)
         #print(row_dict)
         return row_dict
+
+    def _render_summarize_ids(self, messages) -> torch.Tensor:
+        """Render one summarize message-list -> [max_summarize_length] left-padded ids.
+
+        Shared by the K-list (summarize_input_ids) and the single column
+        (summarize_input_id). Left-pads short prompts and left-truncates long
+        ones so the trailing generation prompt is preserved, matching the parent
+        class's prompt-padding convention.
+        """
+        if isinstance(messages, np.ndarray):
+            messages = messages.tolist()
+        full = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        ids = self.tokenizer(
+            full, add_special_tokens=False, return_tensors='pt'
+        )['input_ids']
+        if ids.shape[-1] < self.max_summarize_length:
+            ids = pad_sequence_to_length(
+                ids,
+                max_seq_len=self.max_summarize_length,
+                pad_token_id=self.tokenizer.pad_token_id,
+                left_pad=True,
+            )
+        else:
+            ids = ids[:, -self.max_summarize_length:]
+        return ids.squeeze(0)
 
     def _process_target(self, tgt: str, prompt: str, add_eos=False) -> torch.Tensor:
         if prompt.endswith('<think>\n') and tgt.startswith('<think>\n'):

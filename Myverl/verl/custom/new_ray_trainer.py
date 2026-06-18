@@ -425,6 +425,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
                                          # ---- summarize-then-continue (explain-style) 新增 ----
                                          use_summarize=self.config.data.get('use_summarize', False),
                                          summarize_prompts_key=self.config.data.get('summarize_prompts_key', 'summarize_prompts'),
+                                         summarize_prompt_key=self.config.data.get('summarize_prompt_key', 'summarize_prompt'),
                                          max_summarize_prompts=self.config.data.get('max_summarize_prompts', 8),
                                          max_summarize_length=self.config.data.get('max_summarize_length', 8192),)
 
@@ -1137,6 +1138,12 @@ class NewRayPPOTrainer(RayPPOTrainer):
         "reward==success" 且通过 ``_trajectory_filter_reject`` 的候选，用一条 explain-style
         off-policy 行替换该题的一条错误 rollout：
 
+        关于"prefix 最短且正确": 本函数读 `summarize_input_ids`（normal-step 专用的
+        **列表**列，与 extra-step 用的单条 `summarize_input_id` 物理隔离）。
+        prepare_summarize_prompts.py 的 summarize_prompts 列按 prefix **升序** 渲染
+        （multi 模式 split point 升序 / custom 模式 ratio 排序），dataset 也按序保留，
+        所以这里"按 k 从小到大取第一条合格候选"等价于"选 prefix 最短且正确+过滤通过"。
+
           * 最终 input_ids = [原始短 question prompt, candidate_response]
           * prefix_mask = 1（该行走 off-policy explain loss）
           * off_old_log_probs / target_probs = candidate 在长 summarize prompt 下的 logprob
@@ -1667,22 +1674,34 @@ class NewRayPPOTrainer(RayPPOTrainer):
                  # 作为 loss-time prompts（actor forward 用），与 rollout-time 的长 summarize prompt 解耦。
                  if prefix_mode == 'summarize':
                      loss_prompts_for_summarize = original_input_ids.clone()
-                     sum_ids = batch.batch['summarize_input_ids']      # [B, K, L_long]
-                     if sum_ids.size(1) < n_repeat:
-                         raise ValueError(
-                             f"summarize_input_ids has K={sum_ids.size(1)} but n_prefix={n_repeat}; "
-                             "set data.max_summarize_prompts >= n_prefix"
-                         )
+                     # extra-step / recycle 用「单条」summarize_prompt：所有 n_prefix 个
+                     # off rollout 共用同一条（与 normal-step 的 K 条列表物理隔离）。
+                     # 缺单条列时回退到旧的 K 条列表（取每行第 step_i 条），保证旧数据可跑。
+                     if 'summarize_input_id' in batch.batch:
+                         single_sum_ids = batch.batch['summarize_input_id']   # [B, L_long]
+                         sum_ids = None
+                     else:
+                         single_sum_ids = None
+                         sum_ids = batch.batch['summarize_input_ids']         # [B, K, L_long]
+                         if sum_ids.size(1) < n_repeat:
+                             raise ValueError(
+                                 f"summarize_input_ids has K={sum_ids.size(1)} but n_prefix={n_repeat}; "
+                                 "set data.max_summarize_prompts >= n_prefix (or provide "
+                                 "the single 'summarize_prompt' column)"
+                             )
 
                  input_ids_list = []
 
                  total_prefix_list = []
                  for step_i, ratio in enumerate(ratios):
                      if prefix_mode == 'summarize':
-                         # 直接索引 dataset 预渲染的第 step_i 条 long prompt；
+                         # 每个 off rollout 用同一条单 prompt（缺单条列时回退第 step_i 条列表）。
                          # response 内不含 teacher prefix，prefix_list 对应位置给空列表，
                          # _build_hybrid_off_policy_output(mode='summarize') 会忽略它。
-                         input_ids_list.append(sum_ids[:, step_i, :])
+                         if single_sum_ids is not None:
+                             input_ids_list.append(single_sum_ids)
+                         else:
+                             input_ids_list.append(sum_ids[:, step_i, :])
                          total_prefix_list.append([[] for _ in range(train_batch_size)])
                          continue
 
@@ -2187,17 +2206,25 @@ class NewRayPPOTrainer(RayPPOTrainer):
                     uid_mask = uids == uid
                     uid_rewards = reward_tensor[uid_mask].sum(-1)  # Sum rewards for each sequence
 
-                    # calculate on_policy solved none
+                    # solve_none / solve_one 是给人看的统计指标，必须只看真正的
+                    # on-policy rollout：summarize_replace 注入的正确 off 行会把
+                    # 全错组伪装成“解出一条”，导致 solve_none 少算、solve_one 多算。
+                    # 这里用 on-policy 行单独计数；下方 valid_mask/reward_mask 仍用整组
+                    # uid_rewards（含 off 注入行），因为 GRPO 需要这条正样本给全错组提供
+                    # 对比——统计与训练逻辑刻意解耦。无替换 / n_off=0 时该 mask == uid_mask，
+                    # 计数与旧行为一致。
                     on_policy_in_group = uid_mask & (~off_policy_mask_np)
                     if on_policy_in_group.any():
                         on_policy_rewards = reward_tensor[on_policy_in_group].sum(-1)
                         if (on_policy_rewards == fail_value).all():
                             solve_none_on_policy += 1
-                    
-                    # Check if all rewards are 0 or all are 1 for this uid
+                            solve_none += 1
+                        elif (on_policy_rewards == success_value).sum() == 1:
+                            solve_one += 1
+
+                    # Check if all rewards are 0 or all are 1 for this uid (训练逻辑：整组判定)
                     if (uid_rewards == fail_value).all():
                         valid_mask[uid_mask] = False
-                        solve_none += 1
                     elif (uid_rewards == success_value).all():
                         valid_mask[uid_mask] = False
                         solve_all += 1
@@ -2207,7 +2234,6 @@ class NewRayPPOTrainer(RayPPOTrainer):
                     # 如果只有一个对的
                     elif (uid_rewards == success_value).sum() == 1:
                         reward_mask[uid_mask,:] = True
-                        solve_one += 1
                     
                     if off_policy_mask_np[uid_mask].any() and self.config.actor_rollout_ref.actor.policy_loss.off_policy_masking==True:
                         if is_failure_recycle_step:
