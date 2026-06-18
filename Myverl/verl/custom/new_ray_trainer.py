@@ -86,6 +86,7 @@ _DEFAULT_TRAJ_KEYWORDS = [
     "the draft",
     "this draft",
     "reasoning draft",
+    "let's summarize the reasoning",
     "partial reasoning draft",
     "[reasoning draft]",
     "[partial reasoning draft]",
