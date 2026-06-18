@@ -394,12 +394,18 @@ class RLHFDatasetWithTarget(RLHFDataset):
         return row_dict
 
     def _render_summarize_ids(self, messages) -> torch.Tensor:
-        """Render one summarize message-list -> [max_summarize_length] left-padded ids.
+        """Render one summarize message-list -> [max_summarize_length] ids.
 
         Shared by the K-list (summarize_input_ids) and the single column
-        (summarize_input_id). Left-pads short prompts and left-truncates long
-        ones so the trailing generation prompt is preserved, matching the parent
-        class's prompt-padding convention.
+        (summarize_input_id). Short prompts are left-padded (parent class's
+        prompt-padding convention). Over-long prompts are RIGHT-truncated:
+        we keep the head (system + instructions + [Problem]) and drop the tail
+        of the draft. Left-truncation was wrong here -- it deleted the problem
+        statement and produced headless prompt fragments. Right-truncation
+        loses the trailing generation prompt (so the model continues the draft
+        rather than re-deriving), but keeps the question visible, which is the
+        lesser evil. The real fix is to bound the draft length offline in
+        prepare_summarize_prompts.py.
         """
         if isinstance(messages, np.ndarray):
             messages = messages.tolist()
@@ -417,7 +423,7 @@ class RLHFDatasetWithTarget(RLHFDataset):
                 left_pad=True,
             )
         else:
-            ids = ids[:, -self.max_summarize_length:]
+            ids = ids[:, :self.max_summarize_length]
         return ids.squeeze(0)
 
     def _process_target(self, tgt: str, prompt: str, add_eos=False) -> torch.Tensor:
