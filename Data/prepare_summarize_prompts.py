@@ -1,44 +1,51 @@
-"""Add a ``summarize_prompts`` column to a parquet that already carries
-``token_split_points``.
+"""Add TWO summarize prompt columns to a parquet that (for ``--list-mode multi``)
+already carries ``token_split_points``.
 
-Two modes (``--mode``):
+This one run produces two physically-separated columns so the extra-step and
+normal-step paths never share data:
 
-* ``multi`` (default): for each row, given the K split points produced by
-  ``add_token_split_points.py``, render K user-turn messages -- one per prefix
-  length -- so a single question yields a length-K ``summarize_prompts`` array.
-* ``full``: ignore the split points and render a SINGLE user-turn message whose
-  [Reasoning Draft] is a leading fraction of the (answer-truncated) reasoning,
-  i.e. one prompt per question (length-1 ``summarize_prompts`` array). The
-  fraction is controlled by ``--full-ratio`` (default ``1.0`` = the complete
-  reasoning). With ``ratio < 1.0`` the prefix is cut at ``ratio * n_tgt``
-  tokens and then backed up to the nearest sentence/newline boundary so it
-  never ends mid-sentence. The downstream dataset replicates this single
-  prompt up to its configured K.
+* ``summarize_prompt`` (length-1 array): the SINGLE prompt consumed by the
+  extra-step / recycle path (all off rollouts share it). Controlled by
+  ``--single-mode``:
+    - ``full`` (default): prefix = a fixed ``--full-ratio`` fraction of the
+      answer-truncated reasoning, same for every row.
+    - ``progressive``: the fraction DECREASES across training steps. Rows are
+      grouped by ``--batch-size`` (row ``i`` -> step ``i // batch_size``) and the
+      ratio falls linearly from ``--ratio-start`` to ``--ratio-end`` over the
+      whole dataset. Assumes the trainer reads rows in order with shuffle off.
 
-In both modes each rendered user turn has the form::
+* ``summarize_prompts`` (length-K array, prefix ASCENDING): the prompt list
+  consumed by the normal-step summarize_replace path, which scans in order and
+  picks the SHORTEST correct candidate. Controlled by ``--list-mode``:
+    - ``multi`` (default): one prompt per ``token_split_points`` entry (the split
+      points are produced ascending, so prefixes are ascending).
+    - ``custom``: one prompt per ratio in ``--list-ratios`` (sorted ascending);
+      ``token_split_points`` not required.
 
-    You are an expert mathematician. You are given a [Problem] and a
-    [Reasoning Draft] ... re-author a single "Gold Standard" solution,
-    entirely self-contained, as if you solved it using only your own
-    mathematical intuition. ... final answer within \boxed{}.
+With ``ratio < 1.0`` a prefix is cut at ``round(ratio * n_tgt)`` tokens and then
+backed up to the nearest sentence/newline boundary so it never ends mid-sentence.
+
+Each rendered user turn has the form::
+
+    You are given a [Problem] and a [Reasoning Draft] ...
 
     [Problem]
     {question}
 
     [Reasoning Draft]
-    {prefix_text_at_split_k}
+    {prefix_text}
 
     [Your solution]
 
-These pre-rendered messages are consumed at training time by the
-``prefix_mode='summarize'`` branch of the trainer (explain-style off-policy
-loss). Doing the rendering offline avoids any decode/re-tokenize work in the
-training loop.
+These pre-rendered messages are consumed at training time: ``summarize_prompts``
+by the normal-step summarize_replace, ``summarize_prompt`` by the extra-step
+``prefix_mode='summarize'`` branch. Rendering offline avoids any decode/
+re-tokenize work in the training loop.
 
 Schema add:
-    summarize_prompts : np.ndarray[object] of length K (``multi``) or length 1
-                        (``full``), each element being a list[{role, content}]
-                        (system + user).
+    summarize_prompt  : np.ndarray[object] of length 1
+    summarize_prompts : np.ndarray[object] of length K (prefix ascending)
+                        each element being a list[{role, content}] (system + user).
 
 Usage:
 
@@ -46,8 +53,8 @@ Usage:
         --input  $HOME/LLM/Data/deepmath_dgt6_n10000_split.parquet \
         --output $HOME/LLM/Data/deepmath_dgt6_n10000_summarize.parquet \
         --tokenizer-path /home/shared/Qwen2.5-Math-7B-16k-think \
-        --mode full          # single prefix per question
-        --full-ratio 0.5     # use only the first ~50% of the reasoning as draft
+        --single-mode full --full-ratio 1.0 \
+        --list-mode custom --list-ratios 0.2,0.4,0.6,0.8
 """
 
 from __future__ import annotations
@@ -123,6 +130,31 @@ worker_tokenizer = None
 def init_worker(tokenizer_path: str) -> None:
     global worker_tokenizer
     worker_tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+
+
+def compute_progressive_ratios(
+    n_rows: int,
+    batch_size: int,
+    ratio_start: float,
+    ratio_end: float,
+) -> List[float]:
+    """``progressive`` 课程：每行一个随 step 递减的 prefix 比例。
+
+    训练时 dataloader 按顺序消费数据（要求 shuffle 关闭），所以第 ``i`` 行落在
+    step ``i // batch_size``。prefix 比例随 step 线性递减：第一个 step 用
+    ``ratio_start``，最后一个 step 用 ``ratio_end``，在整个数据集上均匀分布。
+    同一个 step（同一 batch）内的所有行共用一个比例。
+
+    返回长度为 ``n_rows`` 的 float 列表（每行一个比例）。
+    """
+    if batch_size <= 0:
+        raise ValueError("batch_size must be > 0 for progressive mode")
+    n_steps = (n_rows + batch_size - 1) // batch_size  # ceil
+    if n_steps <= 1:
+        step_ratio = [ratio_start]
+    else:
+        step_ratio = list(np.linspace(ratio_start, ratio_end, n_steps))
+    return [float(step_ratio[i // batch_size]) for i in range(n_rows)]
 
 
 # ---------------------------------------------------------------------------
@@ -318,79 +350,35 @@ def _build_summarize_prompt(
 # Per-row processing
 # ---------------------------------------------------------------------------
 
-def process_single_item(
-    item: Dict[str, Any],
+def _build_prompt_array(
+    system_msg: Dict[str, str] | None,
+    question: str,
     template: str,
-    mode: str = "multi",
-    full_ratio: float = 1.0,
-) -> Dict[str, Any]:
-    global worker_tokenizer
+    tgt_tokens: List[int],
+    n_tgt: int,
+    sp_backup_pairs: List[Tuple[int, bool]],
+) -> np.ndarray:
+    """Render a 1D object array of message-lists, one per (split_point, backup).
 
-    question = _extract_question(item)
-    system_msg = _system_message(item)
-    think_process = _extract_think_process(item)
-    # Drop the answer-revealing tail so no prefix can leak the final answer.
-    # split_points were computed on the FULL think process; after truncation
-    # n_tgt shrinks and the existing clamp(sp, n_tgt) below squashes any
-    # split point past the cut down to the truncated end (i.e. just before
-    # the final-answer sentence).
-    think_process = _truncate_before_final_answer(think_process)
-    split_points = item.get("token_split_points")
-
-    # Defensive fallbacks: if anything is missing, emit an empty np.array so
-    # downstream code can detect and skip these rows.
-    #
-    # NOTE: ``full`` mode does not consume split_points (it always uses the
-    # whole truncated think_process as the single prefix), so a missing
-    # token_split_points column is NOT a blocker there.
-    if (
-        worker_tokenizer is None
-        or not question
-        or not think_process
-        or (mode != "full" and split_points is None)
-    ):
-        item["summarize_prompts"] = np.array([], dtype=object)
-        return item
-
-    if isinstance(split_points, np.ndarray):
-        split_points = split_points.tolist()
-
-    # Encode the think_process once; we'll slice tokens by split_point and
-    # decode each prefix back to text.
-    tgt_tokens = worker_tokenizer(
-        think_process, add_special_tokens=False
-    )["input_ids"]
-    n_tgt = len(tgt_tokens)
-
-    # ``full`` mode: a single prefix = a leading fraction of the
-    # (answer-truncated) reasoning, i.e. one synthetic split point at
-    # ``round(full_ratio * n_tgt)``. With ratio == 1.0 this is the whole
-    # truncated reasoning (original behaviour); with ratio < 1.0 the decoded
-    # prefix is backed up to the nearest sentence boundary so it never ends
-    # mid-sentence. Yields a length-1 summarize_prompts array; the downstream
-    # dataset replicates it up to K.
-    if mode == "full":
-        sp_full = int(round(full_ratio * n_tgt))
-        effective_points: List[int] = [sp_full]
-        apply_boundary_backup = full_ratio < 1.0
-    else:
-        effective_points = [int(sp) for sp in split_points]
-        apply_boundary_backup = False
-
+    ``sp_backup_pairs`` is a list of ``(sp, do_backup)`` where ``sp`` is a token
+    count into the (answer-truncated) reasoning and ``do_backup`` says whether to
+    back the decoded prefix up to a sentence boundary (used when the prefix is a
+    fractional cut rather than a sentence-aligned split point).
+    """
     prompts_list: List[List[Dict[str, str]]] = []
-    for sp in effective_points:
-        sp = int(sp)
-        sp = max(0, min(sp, n_tgt))  # clamp
+    for sp, do_backup in sp_backup_pairs:
+        sp = max(0, min(int(sp), n_tgt))  # clamp
         if sp == 0:
             prefix_text = ""
         else:
             prefix_text = worker_tokenizer.decode(
                 tgt_tokens[:sp], skip_special_tokens=True
             )
-            if apply_boundary_backup:
+            if do_backup:
                 prefix_text = _backup_to_sentence_boundary(prefix_text)
-        msgs = _build_summarize_prompt(system_msg, question, prefix_text, template)
-        prompts_list.append(msgs)
+        prompts_list.append(
+            _build_summarize_prompt(system_msg, question, prefix_text, template)
+        )
 
     # IMPORTANT: 不能用 np.array(prompts_list, dtype=object)。
     # 每个 msgs 都是 [system, user] 长度 2 的 list，numpy 会自动推断成 2D
@@ -400,13 +388,88 @@ def process_single_item(
     arr = np.empty(len(prompts_list), dtype=object)
     for i, p in enumerate(prompts_list):
         arr[i] = p
-    item["summarize_prompts"] = arr
+    return arr
+
+
+def process_single_item(
+    item: Dict[str, Any],
+    template: str,
+    single_mode: str = "full",
+    single_ratio: float = 1.0,
+    list_mode: str = "multi",
+    list_ratios: List[float] | None = None,
+) -> Dict[str, Any]:
+    """Render BOTH summarize columns for one row.
+
+    * ``summarize_prompt`` (length-1 array): the SINGLE prompt consumed by the
+      extra-step / recycle path. Its prefix is a leading fraction
+      (``single_ratio``) of the answer-truncated reasoning. ``single_mode`` is
+      "full" (fixed ratio for every row) or "progressive" (the caller passes a
+      per-row ``single_ratio`` that decreases with the training step).
+    * ``summarize_prompts`` (length-K array, prefix ASCENDING): the prompt list
+      consumed by the normal-step summarize_replace path, which picks the
+      shortest correct candidate by scanning in order. ``list_mode`` is "multi"
+      (one prompt per ``token_split_points`` entry -- already ascending) or
+      "custom" (one prompt per ratio in the sorted ``list_ratios``).
+    """
+    global worker_tokenizer
+
+    question = _extract_question(item)
+    system_msg = _system_message(item)
+    think_process = _extract_think_process(item)
+    # Drop the answer-revealing tail so no prefix can leak the final answer.
+    think_process = _truncate_before_final_answer(think_process)
+    split_points = item.get("token_split_points")
+
+    # ``multi`` list mode is the only consumer of token_split_points; the single
+    # column and ``custom`` list mode derive prefixes from ratios, so a missing
+    # split-points column only blocks ``multi``.
+    need_split = (list_mode == "multi")
+    if (
+        worker_tokenizer is None
+        or not question
+        or not think_process
+        or (need_split and split_points is None)
+    ):
+        item["summarize_prompt"] = np.array([], dtype=object)
+        item["summarize_prompts"] = np.array([], dtype=object)
+        return item
+
+    if isinstance(split_points, np.ndarray):
+        split_points = split_points.tolist()
+
+    # Encode the think_process once; reused for both columns.
+    tgt_tokens = worker_tokenizer(
+        think_process, add_special_tokens=False
+    )["input_ids"]
+    n_tgt = len(tgt_tokens)
+
+    # --- single column (extra-step): one fractional prefix ---
+    sp_single = int(round(single_ratio * n_tgt))
+    item["summarize_prompt"] = _build_prompt_array(
+        system_msg, question, template, tgt_tokens, n_tgt,
+        [(sp_single, single_ratio < 1.0)],
+    )
+
+    # --- list column (normal-step): prefix ASCENDING ---
+    if list_mode == "multi":
+        # token_split_points are produced ascending by add_token_split_points.py.
+        list_pairs = [(int(sp), False) for sp in split_points]
+    else:  # custom: one prompt per (pre-sorted) ratio
+        list_pairs = [(int(round(r * n_tgt)), r < 1.0) for r in (list_ratios or [])]
+    item["summarize_prompts"] = _build_prompt_array(
+        system_msg, question, template, tgt_tokens, n_tgt, list_pairs,
+    )
     return item
 
 
-def _worker_process(args: Tuple[Dict[str, Any], str, str, float]) -> Dict[str, Any]:
-    item, template, mode, full_ratio = args
-    return process_single_item(item, template, mode, full_ratio)
+def _worker_process(
+    args: Tuple[Dict[str, Any], str, str, float, str, List[float] | None],
+) -> Dict[str, Any]:
+    item, template, single_mode, single_ratio, list_mode, list_ratios = args
+    return process_single_item(
+        item, template, single_mode, single_ratio, list_mode, list_ratios
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -427,22 +490,66 @@ def main() -> None:
              "or split-point token counts will misalign with text offsets.",
     )
     parser.add_argument("--workers", type=int, default=16, help="Worker process count (1 = sync).")
+    # ---- single column (summarize_prompt, for extra-step / recycle) ----
     parser.add_argument(
-        "--mode",
-        choices=["multi", "full"],
-        default="multi",
-        help="multi (default): one prompt per split point -> length-K array. "
-             "full: a single prompt whose draft is a leading fraction of the "
-             "(answer-truncated) reasoning -> length-1 array (split points ignored).",
+        "--single-mode",
+        choices=["full", "progressive"],
+        default="full",
+        help="How to build the SINGLE prompt column 'summarize_prompt' (extra-step). "
+             "full: prefix = a fixed --full-ratio fraction of the answer-truncated "
+             "reasoning (same for every row). progressive: the fraction DECREASES "
+             "per training step -- row i uses step i // --batch-size, ratio linearly "
+             "from --ratio-start down to --ratio-end across the dataset (assumes the "
+             "trainer reads rows in order with shuffle off).",
     )
     parser.add_argument(
         "--full-ratio",
         type=float,
         default=1.0,
-        help="Only used in --mode full. Fraction (0, 1] of the answer-truncated "
-             "reasoning (in token space) to use as the [Reasoning Draft]. "
+        help="Only used in --single-mode full. Fraction (0, 1] of the answer-truncated "
+             "reasoning (in token space) to use as the single [Reasoning Draft]. "
              "1.0 (default) = the complete reasoning; e.g. 0.5 = the first ~50%% "
              "of tokens, backed up to the nearest sentence boundary.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=0,
+        help="Only used in --single-mode progressive. Training batch size, so rows "
+             "can be grouped into steps (row i -> step i // batch_size).",
+    )
+    parser.add_argument(
+        "--ratio-start",
+        type=float,
+        default=1.0,
+        help="Only used in --single-mode progressive. Prefix ratio at the FIRST step "
+             "(default 1.0 = longest draft).",
+    )
+    parser.add_argument(
+        "--ratio-end",
+        type=float,
+        default=0.0,
+        help="Only used in --single-mode progressive. Prefix ratio at the LAST step "
+             "(default 0.0 = no draft, model derives alone).",
+    )
+    # ---- list column (summarize_prompts, for normal-step summarize_replace) ----
+    parser.add_argument(
+        "--list-mode",
+        choices=["multi", "custom"],
+        default="multi",
+        help="How to build the LIST prompt column 'summarize_prompts' (normal-step). "
+             "multi (default): one prompt per token_split_points entry (already prefix "
+             "ASCENDING). custom: one prompt per ratio in --list-ratios (split points "
+             "not needed). Both keep prefixes ascending so the trainer's "
+             "summarize_replace picks the shortest correct candidate first.",
+    )
+    parser.add_argument(
+        "--list-ratios",
+        type=str,
+        default="0.2,0.4,0.6,0.8,1.0",
+        help="Only used in --list-mode custom. Comma-separated fractions in (0, 1] "
+             "for the list prompts, e.g. '0.2,0.4,0.6,0.8'. Sorted ascending before "
+             "use so summarize_replace scans shortest prefix first.",
     )
     parser.add_argument(
         "--template",
@@ -455,43 +562,89 @@ def main() -> None:
     if "{question}" not in args.template or "{prefix}" not in args.template:
         raise SystemExit("--template must contain both {question} and {prefix}")
 
+    # single-column validation
     if not (0.0 < args.full_ratio <= 1.0):
         raise SystemExit("--full-ratio must be in the (0, 1] range")
-    if args.mode != "full" and args.full_ratio != 1.0:
-        print("  (--full-ratio is ignored unless --mode full)")
+    if args.single_mode == "progressive":
+        if args.batch_size <= 0:
+            raise SystemExit("--single-mode progressive requires --batch-size > 0")
+        if not (0.0 <= args.ratio_end <= args.ratio_start <= 1.0):
+            raise SystemExit(
+                "--single-mode progressive expects 0 <= --ratio-end <= --ratio-start <= 1"
+            )
+
+    # list-column validation: parse + sort ratios ascending
+    list_ratios: List[float] = []
+    if args.list_mode == "custom":
+        try:
+            list_ratios = sorted(
+                float(x) for x in args.list_ratios.split(",") if x.strip() != ""
+            )
+        except ValueError:
+            raise SystemExit("--list-ratios must be comma-separated floats, e.g. '0.2,0.5,1.0'")
+        if not list_ratios:
+            raise SystemExit("--list-mode custom requires a non-empty --list-ratios")
+        if not all(0.0 < r <= 1.0 for r in list_ratios):
+            raise SystemExit("each --list-ratios value must be in the (0, 1] range")
 
     print(f"Reading {args.input}")
     df = pd.read_parquet(args.input)
     if "token_split_points" not in df.columns:
-        # ``full`` mode never reads split points, so a missing column is fine
-        # there; ``multi`` mode requires them.
-        if args.mode == "full":
+        # Only --list-mode multi reads split points; the single column and
+        # --list-mode custom derive prefixes from ratios.
+        if args.list_mode != "multi":
             print(
-                "  (no 'token_split_points' column; OK in --mode full, "
-                "split points are not used)"
+                f"  (no 'token_split_points' column; OK with --list-mode "
+                f"{args.list_mode}, split points are not used)"
             )
         else:
             raise SystemExit(
                 "Input parquet has no 'token_split_points' column. "
-                "Run Data/add_token_split_points.py first."
+                "Run Data/add_token_split_points.py first (or use --list-mode custom)."
             )
 
     if args.limit is not None:
         df = df.head(args.limit)
     records = df.to_dict(orient="records")
-    print(f"  -> {len(records):,} rows. Tokenizer: {args.tokenizer_path}. Mode: {args.mode}")
-    if args.mode == "full":
-        print(f"     full-ratio: {args.full_ratio}")
+    print(
+        f"  -> {len(records):,} rows. Tokenizer: {args.tokenizer_path}. "
+        f"single-mode: {args.single_mode}, list-mode: {args.list_mode}"
+    )
+    if args.list_mode == "custom":
+        print(f"     list-ratios (sorted): {list_ratios}")
+
+    # Per-row single_ratio. For single-mode full every row shares args.full_ratio;
+    # for progressive each row gets a step-decreasing ratio (row i -> step
+    # i // batch_size, ratio linear from ratio_start to ratio_end).
+    if args.single_mode == "progressive":
+        row_ratios = compute_progressive_ratios(
+            len(records), args.batch_size, args.ratio_start, args.ratio_end
+        )
+        n_steps = (len(records) + args.batch_size - 1) // args.batch_size
+        print(
+            f"     progressive single: {len(records)} rows / batch_size "
+            f"{args.batch_size} = {n_steps} steps; ratio {args.ratio_start} -> "
+            f"{args.ratio_end}"
+        )
+    else:
+        row_ratios = [args.full_ratio] * len(records)
 
     workers = max(1, min(args.workers, mp.cpu_count()))
     if workers == 1:
         init_worker(args.tokenizer_path)
         processed = [
-            process_single_item(item, args.template, args.mode, args.full_ratio)
-            for item in tqdm(records, total=len(records), desc="rendering")
+            process_single_item(
+                item, args.template, args.single_mode, row_ratios[i],
+                args.list_mode, list_ratios,
+            )
+            for i, item in enumerate(tqdm(records, total=len(records), desc="rendering"))
         ]
     else:
-        task_iter = ((item, args.template, args.mode, args.full_ratio) for item in records)
+        task_iter = (
+            (item, args.template, args.single_mode, row_ratios[i],
+             args.list_mode, list_ratios)
+            for i, item in enumerate(records)
+        )
         with mp.Pool(
             processes=workers,
             initializer=init_worker,
@@ -507,15 +660,14 @@ def main() -> None:
             )
 
     out_df = pd.DataFrame(processed)
-    n_emitted = sum(
-        1 for p in out_df["summarize_prompts"]
-        if isinstance(p, np.ndarray) and len(p) > 0
-    )
-    print(f"  -> {n_emitted:,}/{len(out_df):,} rows have non-empty summarize_prompts.")
+    for col in ("summarize_prompt", "summarize_prompts"):
+        n_emitted = sum(
+            1 for p in out_df[col]
+            if isinstance(p, np.ndarray) and len(p) > 0
+        )
+        print(f"  -> {n_emitted:,}/{len(out_df):,} rows have non-empty {col}.")
 
-    # Print a sample for human-eyeball verification. ``full`` mode emits
-    # length-1 arrays, so require >= 1 (not >= 2) and only index entries that
-    # exist. token_split_points may be absent in ``full`` mode, so guard it.
+    # Print a sample of BOTH columns for human-eyeball verification.
     sample = next(
         (
             row for _, row in out_df.iterrows()
@@ -525,19 +677,22 @@ def main() -> None:
         None,
     )
     if sample is not None:
-        sps = sample["summarize_prompts"]
         sample_points = sample.get("token_split_points")
-        idxs = sorted({0, len(sps) // 2, len(sps) - 1})
-        for idx in idxs:
-            sp_str = ""
-            if isinstance(sample_points, (list, np.ndarray)) and idx < len(sample_points):
-                sp_str = f" (split_point={sample_points[idx]})"
-            print(f"\n--- sample summarize_prompts[{idx}]{sp_str} ---")
-            for msg in sps[idx]:
-                content = msg.get("content", "")
-                head = content[:300].replace("\n", " ")
-                tail = content[-200:].replace("\n", " ") if len(content) > 500 else ""
-                print(f"  [{msg.get('role')}] {head}{' ... ' + tail if tail else ''}")
+        for col in ("summarize_prompt", "summarize_prompts"):
+            arr = sample[col]
+            if not (isinstance(arr, np.ndarray) and len(arr) >= 1):
+                continue
+            idxs = sorted({0, len(arr) // 2, len(arr) - 1})
+            for idx in idxs:
+                sp_str = ""
+                if isinstance(sample_points, (list, np.ndarray)) and idx < len(sample_points):
+                    sp_str = f" (split_point={sample_points[idx]})"
+                print(f"\n--- sample {col}[{idx}]{sp_str} ---")
+                for msg in arr[idx]:
+                    content = msg.get("content", "")
+                    head = content[:300].replace("\n", " ")
+                    tail = content[-200:].replace("\n", " ") if len(content) > 500 else ""
+                    print(f"  [{msg.get('role')}] {head}{' ... ' + tail if tail else ''}")
 
     out_df.to_parquet(args.output, index=False)
     size_mb = pd.Series([0]).memory_usage()  # placeholder, real size below

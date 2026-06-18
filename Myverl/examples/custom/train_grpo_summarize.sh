@@ -77,6 +77,7 @@ python -m verl.trainer.main_ppo_new \
     +data.use_se=False \
     +data.use_summarize=True \
     +data.summarize_prompts_key=summarize_prompts \
+    +data.summarize_prompt_key=summarize_prompt \
     +data.max_summarize_prompts=8 \
     +data.max_summarize_length=8192 \
     +data.collect_failures=True \
