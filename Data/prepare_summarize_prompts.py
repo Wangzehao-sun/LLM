@@ -14,6 +14,13 @@ Two modes (``--mode``):
   tokens and then backed up to the nearest sentence/newline boundary so it
   never ends mid-sentence. The downstream dataset replicates this single
   prompt up to its configured K.
+* ``progressive``: like ``full`` (single prompt per row, split points ignored),
+  but the draft fraction DECREASES across training steps. Rows are grouped into
+  steps by ``--batch-size`` (row ``i`` -> step ``i // batch_size``) and the
+  ratio falls linearly from ``--ratio-start`` (first step) to ``--ratio-end``
+  (last step) over the whole dataset. This realises a curriculum where the model
+  is handed less and less of the draft as training proceeds. Assumes the trainer
+  consumes rows in order with shuffle disabled.
 
 In both modes each rendered user turn has the form::
 
@@ -122,6 +129,31 @@ worker_tokenizer = None
 def init_worker(tokenizer_path: str) -> None:
     global worker_tokenizer
     worker_tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+
+
+def compute_progressive_ratios(
+    n_rows: int,
+    batch_size: int,
+    ratio_start: float,
+    ratio_end: float,
+) -> List[float]:
+    """``progressive`` 课程：每行一个随 step 递减的 prefix 比例。
+
+    训练时 dataloader 按顺序消费数据（要求 shuffle 关闭），所以第 ``i`` 行落在
+    step ``i // batch_size``。prefix 比例随 step 线性递减：第一个 step 用
+    ``ratio_start``，最后一个 step 用 ``ratio_end``，在整个数据集上均匀分布。
+    同一个 step（同一 batch）内的所有行共用一个比例。
+
+    返回长度为 ``n_rows`` 的 float 列表（每行一个比例）。
+    """
+    if batch_size <= 0:
+        raise ValueError("batch_size must be > 0 for progressive mode")
+    n_steps = (n_rows + batch_size - 1) // batch_size  # ceil
+    if n_steps <= 1:
+        step_ratio = [ratio_start]
+    else:
+        step_ratio = list(np.linspace(ratio_start, ratio_end, n_steps))
+    return [float(step_ratio[i // batch_size]) for i in range(n_rows)]
 
 
 # ---------------------------------------------------------------------------
@@ -339,14 +371,15 @@ def process_single_item(
     # Defensive fallbacks: if anything is missing, emit an empty np.array so
     # downstream code can detect and skip these rows.
     #
-    # NOTE: ``full`` mode does not consume split_points (it always uses the
-    # whole truncated think_process as the single prefix), so a missing
+    # NOTE: ``full`` / ``progressive`` modes do not consume split_points (they
+    # always derive the single prefix from full_ratio), so a missing
     # token_split_points column is NOT a blocker there.
+    single_prefix_mode = mode in ("full", "progressive")
     if (
         worker_tokenizer is None
         or not question
         or not think_process
-        or (mode != "full" and split_points is None)
+        or (not single_prefix_mode and split_points is None)
     ):
         item["summarize_prompts"] = np.array([], dtype=object)
         return item
@@ -361,14 +394,16 @@ def process_single_item(
     )["input_ids"]
     n_tgt = len(tgt_tokens)
 
-    # ``full`` mode: a single prefix = a leading fraction of the
-    # (answer-truncated) reasoning, i.e. one synthetic split point at
-    # ``round(full_ratio * n_tgt)``. With ratio == 1.0 this is the whole
-    # truncated reasoning (original behaviour); with ratio < 1.0 the decoded
-    # prefix is backed up to the nearest sentence boundary so it never ends
-    # mid-sentence. Yields a length-1 summarize_prompts array; the downstream
-    # dataset replicates it up to K.
-    if mode == "full":
+    # ``full`` / ``progressive`` mode: a single prefix = a leading fraction of
+    # the (answer-truncated) reasoning, i.e. one synthetic split point at
+    # ``round(full_ratio * n_tgt)``. In ``full`` mode full_ratio is a fixed CLI
+    # value shared by every row; in ``progressive`` mode the caller passes a
+    # per-row full_ratio that decreases with the training step. With ratio == 1.0
+    # this is the whole truncated reasoning; with ratio < 1.0 the decoded prefix
+    # is backed up to the nearest sentence boundary so it never ends mid-sentence.
+    # Yields a length-1 summarize_prompts array; the downstream dataset
+    # replicates it up to K.
+    if single_prefix_mode:
         sp_full = int(round(full_ratio * n_tgt))
         effective_points: List[int] = [sp_full]
         apply_boundary_backup = full_ratio < 1.0
@@ -428,11 +463,16 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=16, help="Worker process count (1 = sync).")
     parser.add_argument(
         "--mode",
-        choices=["multi", "full"],
+        choices=["multi", "full", "progressive"],
         default="multi",
         help="multi (default): one prompt per split point -> length-K array. "
-             "full: a single prompt whose draft is a leading fraction of the "
-             "(answer-truncated) reasoning -> length-1 array (split points ignored).",
+             "full: a single prompt whose draft is a leading fraction "
+             "(--full-ratio) of the (answer-truncated) reasoning -> length-1 "
+             "array (split points ignored). progressive: like full but the "
+             "fraction DECREASES per training step -- row i uses step "
+             "i // --batch-size, ratio linearly from --ratio-start down to "
+             "--ratio-end across the whole dataset (split points ignored; "
+             "assumes the trainer reads rows in order with shuffle off).",
     )
     parser.add_argument(
         "--full-ratio",
@@ -442,6 +482,27 @@ def main() -> None:
              "reasoning (in token space) to use as the [Reasoning Draft]. "
              "1.0 (default) = the complete reasoning; e.g. 0.5 = the first ~50%% "
              "of tokens, backed up to the nearest sentence boundary.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=0,
+        help="Only used in --mode progressive. Training batch size, so rows can "
+             "be grouped into steps (row i -> step i // batch_size).",
+    )
+    parser.add_argument(
+        "--ratio-start",
+        type=float,
+        default=1.0,
+        help="Only used in --mode progressive. Prefix ratio at the FIRST step "
+             "(default 1.0 = longest draft).",
+    )
+    parser.add_argument(
+        "--ratio-end",
+        type=float,
+        default=0.0,
+        help="Only used in --mode progressive. Prefix ratio at the LAST step "
+             "(default 0.0 = no draft, model derives alone).",
     )
     parser.add_argument(
         "--template",
@@ -456,17 +517,24 @@ def main() -> None:
 
     if not (0.0 < args.full_ratio <= 1.0):
         raise SystemExit("--full-ratio must be in the (0, 1] range")
-    if args.mode != "full" and args.full_ratio != 1.0:
+    if args.mode not in ("full", "progressive") and args.full_ratio != 1.0:
         print("  (--full-ratio is ignored unless --mode full)")
+    if args.mode == "progressive":
+        if args.batch_size <= 0:
+            raise SystemExit("--mode progressive requires --batch-size > 0")
+        if not (0.0 <= args.ratio_end <= args.ratio_start <= 1.0):
+            raise SystemExit(
+                "--mode progressive expects 0 <= --ratio-end <= --ratio-start <= 1"
+            )
 
     print(f"Reading {args.input}")
     df = pd.read_parquet(args.input)
     if "token_split_points" not in df.columns:
-        # ``full`` mode never reads split points, so a missing column is fine
-        # there; ``multi`` mode requires them.
-        if args.mode == "full":
+        # ``full`` / ``progressive`` modes never read split points, so a missing
+        # column is fine there; ``multi`` mode requires them.
+        if args.mode in ("full", "progressive"):
             print(
-                "  (no 'token_split_points' column; OK in --mode full, "
+                f"  (no 'token_split_points' column; OK in --mode {args.mode}, "
                 "split points are not used)"
             )
         else:
@@ -482,15 +550,33 @@ def main() -> None:
     if args.mode == "full":
         print(f"     full-ratio: {args.full_ratio}")
 
+    # Per-row full_ratio. For multi/full every row shares args.full_ratio; for
+    # progressive each row gets a step-decreasing ratio (row i -> step
+    # i // batch_size, ratio linear from ratio_start to ratio_end).
+    if args.mode == "progressive":
+        row_ratios = compute_progressive_ratios(
+            len(records), args.batch_size, args.ratio_start, args.ratio_end
+        )
+        n_steps = (len(records) + args.batch_size - 1) // args.batch_size
+        print(
+            f"     progressive: {len(records)} rows / batch_size {args.batch_size} "
+            f"= {n_steps} steps; ratio {args.ratio_start} -> {args.ratio_end}"
+        )
+    else:
+        row_ratios = [args.full_ratio] * len(records)
+
     workers = max(1, min(args.workers, mp.cpu_count()))
     if workers == 1:
         init_worker(args.tokenizer_path)
         processed = [
-            process_single_item(item, args.template, args.mode, args.full_ratio)
-            for item in tqdm(records, total=len(records), desc="rendering")
+            process_single_item(item, args.template, args.mode, row_ratios[i])
+            for i, item in enumerate(tqdm(records, total=len(records), desc="rendering"))
         ]
     else:
-        task_iter = ((item, args.template, args.mode, args.full_ratio) for item in records)
+        task_iter = (
+            (item, args.template, args.mode, row_ratios[i])
+            for i, item in enumerate(records)
+        )
         with mp.Pool(
             processes=workers,
             initializer=init_worker,
