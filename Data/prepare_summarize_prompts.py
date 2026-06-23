@@ -683,10 +683,19 @@ def main() -> None:
                 continue
             idxs = sorted({0, len(arr) // 2, len(arr) - 1})
             for idx in idxs:
-                sp_str = ""
-                if isinstance(sample_points, (list, np.ndarray)) and idx < len(sample_points):
-                    sp_str = f" (split_point={sample_points[idx]})"
-                print(f"\n--- sample {col}[{idx}]{sp_str} ---")
+                # 标注每条 prompt 的 prefix 来源，三种情形各不相同：
+                #   - summarize_prompt（单条）：来自 single_ratio，与 split_points 无关。
+                #   - summarize_prompts + list-mode multi：一条对一个 token_split_points。
+                #   - summarize_prompts + list-mode custom：来自 list_ratios[idx]。
+                if col == "summarize_prompt":
+                    tag = f" (single, mode={args.single_mode})"
+                elif args.list_mode == "multi":
+                    tag = ""
+                    if isinstance(sample_points, (list, np.ndarray)) and idx < len(sample_points):
+                        tag = f" (split_point={sample_points[idx]})"
+                else:  # custom
+                    tag = f" (ratio={list_ratios[idx]})" if idx < len(list_ratios) else ""
+                print(f"\n--- sample {col}[{idx}]{tag} ---")
                 for msg in arr[idx]:
                     content = msg.get("content", "")
                     head = content[:300].replace("\n", " ")
