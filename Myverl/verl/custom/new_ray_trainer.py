@@ -2626,11 +2626,43 @@ class NewRayPPOTrainer(RayPPOTrainer):
                     inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
                     outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
                     scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
+                    # 额外保存数据集元信息（ground_truth / data_source / original_index 等）。
+                    # 这些列来自 parquet，存在 batch.non_tensor_batch 里。可用
+                    # trainer.rollout_dump_extra_keys 配置要保存哪些列；默认存常用几项。
+                    # 经由 reward_extra_infos_dict 传入 _dump_generations（它会把任何
+                    # 长度与样本数匹配的字段逐样本写进每行 JSON）。
+                    def _to_jsonable(v):
+                        # numpy 标量/数组、含 numpy 的 dict 都清洗成原生 python 类型，
+                        # 否则父类 _dump_generations 里的 json.dumps 可能报 not serializable。
+                        if hasattr(v, "item") and not isinstance(v, (dict, list)):
+                            try:
+                                return v.item()
+                            except (ValueError, AttributeError):
+                                pass
+                        if isinstance(v, np.ndarray):
+                            return [_to_jsonable(x) for x in v.tolist()]
+                        if isinstance(v, dict):
+                            return {k2: _to_jsonable(v2) for k2, v2 in v.items()}
+                        if isinstance(v, (list, tuple)):
+                            return [_to_jsonable(x) for x in v]
+                        return v
+
+                    dump_infos = dict(reward_extra_infos_dict) if reward_extra_infos_dict else {}
+                    extra_keys = self.config.trainer.get(
+                        "rollout_dump_extra_keys",
+                        ["reward_model", "data_source", "original_index", "uid"],
+                    )
+                    n_rows = len(inputs)
+                    for k in extra_keys:
+                        if k in batch.non_tensor_batch:
+                            col = batch.non_tensor_batch[k]
+                            if len(col) == n_rows:
+                                dump_infos[k] = [_to_jsonable(v) for v in col]
                     self._dump_generations(
                         inputs=inputs,
                         outputs=outputs,
                         scores=scores,
-                        reward_extra_infos_dict=reward_extra_infos_dict,
+                        reward_extra_infos_dict=dump_infos,
                         dump_path=rollout_data_dir,
                     )
 
