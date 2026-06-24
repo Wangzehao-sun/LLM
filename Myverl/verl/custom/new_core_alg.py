@@ -496,6 +496,8 @@ def compute_token_on_off_sft_loss(
     # off-policy RL 分支的 ratio 裁剪比例统计(仅 rl 分支会更新)
     off_ratio_max_clip_frac = torch.tensor(0.0)
     off_ratio_min_clip_frac = torch.tensor(0.0)
+    # off-policy PPO dual-clip 的 clipfrac(仅 off rl 分支且开启裁剪时更新)
+    off_pg_clipfrac = torch.tensor(0.0)
     if off_policy_loss_type == "sft":
         if off_policy_reshape == 'vanilla':
             off_sft_losses = -log_prob
@@ -572,6 +574,12 @@ def compute_token_on_off_sft_loss(
             off_pg_losses3 = -advantages * 3.0
             off_pg_losses_clip2 = torch.min(off_pg_losses3, off_pg_losses_clip)
             off_rl_losses = torch.where(advantages < 0, off_pg_losses_clip2, off_pg_losses_clip)
+            # off-policy PPO dual-clip 的 clipfrac：被裁剪项实际生效（clipped loss
+            # 大于未裁剪 loss）的 token 占比，仅在 off-policy 有效区域统计，与
+            # on-policy 的 on_pg_clipfrac 口径一致。
+            off_pg_clipfrac = verl_F.masked_mean(
+                torch.gt(off_pg_losses2, off_pg_losses).float(), off_clip_region
+            )
         else:
             off_rl_losses = off_pg_losses
     elif off_policy_loss_type == "none":
@@ -674,10 +682,9 @@ def compute_token_on_off_sft_loss(
     negative_approx_kl = torch.clamp(log_prob - old_log_prob, min=-20.0, max=20.0)
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
 
-    off_pg_clipfrac = torch.tensor(0.0)
     on_pg_clipfrac = torch.tensor(0.0)
-    # off_ratio_max_clip_frac / off_ratio_min_clip_frac 已在 off rl 分支中计算
-    # (非 rl 分支保持初始化的 0.0)
+    # off_pg_clipfrac / off_ratio_max_clip_frac / off_ratio_min_clip_frac 已在
+    # off rl 分支中计算（非 rl 分支保持初始化的 0.0），此处不再覆盖。
 
     return {
         "pg_loss": pg_loss,
