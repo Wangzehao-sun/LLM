@@ -2650,7 +2650,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
                     dump_infos = dict(reward_extra_infos_dict) if reward_extra_infos_dict else {}
                     extra_keys = self.config.trainer.get(
                         "rollout_dump_extra_keys",
-                        ["reward_model", "data_source", "original_index", "uid"],
+                        ["reward_model", "data_source", "original_index", "uid", "extra_info"],
                     )
                     n_rows = len(inputs)
                     for k in extra_keys:
@@ -2658,6 +2658,14 @@ class NewRayPPOTrainer(RayPPOTrainer):
                             col = batch.non_tensor_batch[k]
                             if len(col) == n_rows:
                                 dump_infos[k] = [_to_jsonable(v) for v in col]
+                    # 标注每行是否为 off-policy 注入行（summarize_replace 替换进来的、
+                    # 或 n_off/extra-step 的 off 行）。prefix_mask 在有效 response token
+                    # 上为 1 即视为被替换/注入；normal step 且 n_off=0 时，这等价于
+                    # "该行是 summarize_replace 注入的正确候选"。
+                    if "prefix_mask" in batch.batch:
+                        is_off = batch.batch["prefix_mask"].any(-1).cpu().tolist()
+                        if len(is_off) == n_rows:
+                            dump_infos["is_replaced"] = [bool(x) for x in is_off]
                     self._dump_generations(
                         inputs=inputs,
                         outputs=outputs,
