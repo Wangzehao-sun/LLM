@@ -2359,15 +2359,19 @@ class NewRayPPOTrainer(RayPPOTrainer):
                          if retain_low_threshold < accuracy < retain_high_threshold:
                              failed_original_indices.append(idx_val)
                      else:
-                         # Normal mode: collect when accuracy is at/below a threshold.
-                         # Default threshold 0.0 reproduces the old behaviour
-                         # (only collect when ALL rollouts failed). Raise it to
-                         # also recycle "hard but occasionally solved" questions,
-                         # e.g. collect_accuracy_threshold=0.25 keeps questions
-                         # solved in <= 25% of rollouts.
-                         collect_acc_threshold = self.config.data.get('collect_accuracy_threshold', 0.0)
+                         # Normal mode: collect when accuracy falls in a range [low, high).
+                         #   high = collect_accuracy_threshold (upper bound, exclusive)
+                         #   low  = collect_accuracy_low        (lower bound, inclusive)
+                         # Lower bound defaults to 0.0, so with only the high bound set the
+                         # behaviour is identical to the old single-threshold version
+                         # (accuracy < high). Set a low bound to skip too-easy/too-hard
+                         # extremes, e.g. collect_accuracy_low=0.1 + threshold=0.5 keeps
+                         # questions solved in [10%, 50%) of rollouts (excludes all-wrong
+                         # and the already-half-learned ones).
+                         collect_acc_high = self.config.data.get('collect_accuracy_threshold', 0.0)
+                         collect_acc_low = self.config.data.get('collect_accuracy_low', 0.0)
                          accuracy = (rewards_for_q == success_value).sum() / max(len(rewards_for_q), 1)
-                         if accuracy < collect_acc_threshold:
+                         if collect_acc_low <= accuracy < collect_acc_high:
                              failed_original_indices.append(idx_val)
                 
                 # Now extract items from batch_dict
