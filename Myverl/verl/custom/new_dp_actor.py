@@ -355,6 +355,8 @@ class NewDataParallelPPOActor(DataParallelPPOActor):
                             metrics_data['actor/off_ratio_max_clip_frac'] = ret_dict['off_ratio_max_clip_frac'].detach().item()
                         if 'off_ratio_min_clip_frac' in ret_dict:
                             metrics_data['actor/off_ratio_min_clip_frac'] = ret_dict['off_ratio_min_clip_frac'].detach().item()
+                        if 'off_ratio_scale' in ret_dict:
+                            metrics_data['actor/off_ratio_scale'] = ret_dict['off_ratio_scale'].detach().item()
                         append_to_dict(metrics, metrics_data)
                     elif current_loss_mode in ["relift",'hype-sft','sft','rl-sft','rl-rl','sft-sft','none-sft','none-rl']:
                         from .new_core_alg import compute_token_on_off_sft_loss
@@ -409,6 +411,8 @@ class NewDataParallelPPOActor(DataParallelPPOActor):
                             metrics_data['actor/off_ratio_max_clip_frac'] = ret_dict['off_ratio_max_clip_frac'].detach().item()
                         if 'off_ratio_min_clip_frac' in ret_dict:
                             metrics_data['actor/off_ratio_min_clip_frac'] = ret_dict['off_ratio_min_clip_frac'].detach().item()
+                        if 'off_ratio_scale' in ret_dict:
+                            metrics_data['actor/off_ratio_scale'] = ret_dict['off_ratio_scale'].detach().item()
                         # ===== loss 组成分析:on/off 占比 + off 内 SFT/RL 占比 =====
                         # 绝对贡献(同分母,可加,数值上 on_loss_contrib + off_loss_contrib == pg_loss)
                         if 'on_loss_contrib' in ret_dict:
