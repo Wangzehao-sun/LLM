@@ -564,12 +564,30 @@ def compute_token_on_off_sft_loss(
         #     ratio 整体缩放到均值=1，缩放因子 detach()（只改数值大小、不改梯度方向，类似
         #     ESS 加权）。注意：use_dynamic_bsz=True 时 micro-batch 的 off-token 成员随分桶
         #     变化，故“组”的构成逐 step 不稳定，这是该归一化粒度的固有特性。
+        #     'group_ess_weight'：group 级 ESS 加权。summarize_replace 每个被替换组恰好注入
+        #     1 条 off 行，故该 off 行的「序列级 ESS」即等于「组的 off ESS」（与
+        #     plot_off_ess.py 的口径一致）。对每条 off 行单独算 token-level ESS
+        #     （compute_sequence_ess，已 detach、归一化到 [0,1]），作为该行所有 off token
+        #     的 detached 权重缩放 off_ratio：ESS→1 不调整；ESS→0（少数 token 主导该轨迹）
+        #     则整条 off 轨迹的梯度被下调。该口径是 per-行 的，不依赖 uid，也不受 dynamic_bsz
+        #     分桶把同组行拆散的影响。若某组有多条 off 行（recycle 多 off rollout），此式
+        #     退化为 per-行 ESS（每条 off 行用自己的 ESS，而非整组 pool）。
         off_ratio_scale = torch.tensor(1.0, device=off_ratio.device)
         if off_policy_reshape == "batch_mean_norm":
             n_off_tok = off_clip_region.sum()
             if n_off_tok > 0:
                 off_ratio_scale = ((off_ratio * off_clip_region).sum() / n_off_tok).detach()
                 off_ratio = off_ratio / (off_ratio_scale + 1e-6)
+        elif off_policy_reshape == "group_ess_weight":
+            # ess_per_row[i] ∈ [0,1]，已在 no_grad 内算好（detached）。on 行 off 区域为空 →
+            # compute_sequence_ess 返回 1.0（不缩放），但 on 行 off_ratio 后续被 prefix_mask
+            # 掩掉，不影响 on loss。
+            ess_per_row = compute_sequence_ess(off_ratio, off_clip_region)  # [B], detached
+            off_ratio = off_ratio * ess_per_row.view(-1, 1)
+            # 监控：被替换 off 行的平均 ESS 权重（只在 off 行上取均值）。
+            off_row = (off_clip_region.sum(dim=-1) > 0)
+            if off_row.any():
+                off_ratio_scale = ess_per_row[off_row].mean().detach()
 
         # off-policy ratio 整形后、用于日志的均值（仅 off 区域，detach）
         off_ratio_mean = verl_F.masked_mean(off_ratio, off_clip_region).detach()
@@ -718,7 +736,8 @@ def compute_token_on_off_sft_loss(
         "ppo_kl": ppo_kl,
         "off_ratio_max_clip_frac": off_ratio_max_clip_frac,
         "off_ratio_min_clip_frac": off_ratio_min_clip_frac,
-        # off-policy ratio 整形后均值 + 缩放因子(batch_mean_norm 下=整形前均值,否则=1)
+        # off-policy ratio 整形后均值 + 缩放因子。batch_mean_norm 下=整形前均值；
+        # group_ess_weight 下=被替换 off 行的平均 ESS 权重；否则=1。
         "off_ratio_mean": off_ratio_mean,
         "off_ratio_scale": off_ratio_scale,
         # ===== loss 组成分析(同分母,绝对贡献可加) =====
