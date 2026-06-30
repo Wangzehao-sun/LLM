@@ -498,6 +498,10 @@ def compute_token_on_off_sft_loss(
     off_ratio_min_clip_frac = torch.tensor(0.0)
     # off-policy PPO dual-clip 的 clipfrac(仅 off rl 分支且开启裁剪时更新)
     off_pg_clipfrac = torch.tensor(0.0)
+    # off-policy ratio 整形监控(仅 off rl 分支更新):整形后 off 区域 ratio 均值,
+    # 以及 batch_mean_norm 用到的 detached 缩放因子(=整形前 off 区域 ratio 均值)。
+    off_ratio_mean = torch.tensor(0.0)
+    off_ratio_scale = torch.tensor(1.0)
     if off_policy_loss_type == "sft":
         if off_policy_reshape == 'vanilla':
             off_sft_losses = -log_prob
@@ -550,8 +554,27 @@ def compute_token_on_off_sft_loss(
         negative_approx_kl = torch.clamp(log_prob - old_log_prob, min=-20.0, max=20.0)
         off_ratio = torch.exp(negative_approx_kl)
 
-        # (1) 路径 A 风格的 off_ratio 上/下界硬裁剪 + clip-frac 统计
+        # off-policy 有效 token 区域（prefix=off 行、有效 response token、reward gate 命中），
+        # 既用于下面的 ratio 整形归一化，也用于 clip-frac 统计，保持口径一致。
         off_clip_region = prefix_mask * response_mask * reward_mask
+
+        # (0) off-policy ratio 整形（由 off_policy_reshape 控制）。默认（no_reshape / vanilla
+        #     / 其它历史取值）不整形，保留原始 IS ratio = exp(lp_short - lp_long)，与旧行为一致。
+        #     'batch_mean_norm'：组内均值归一化——把这个 micro-batch 内所有 off token 的
+        #     ratio 整体缩放到均值=1，缩放因子 detach()（只改数值大小、不改梯度方向，类似
+        #     ESS 加权）。注意：use_dynamic_bsz=True 时 micro-batch 的 off-token 成员随分桶
+        #     变化，故“组”的构成逐 step 不稳定，这是该归一化粒度的固有特性。
+        off_ratio_scale = torch.tensor(1.0, device=off_ratio.device)
+        if off_policy_reshape == "batch_mean_norm":
+            n_off_tok = off_clip_region.sum()
+            if n_off_tok > 0:
+                off_ratio_scale = ((off_ratio * off_clip_region).sum() / n_off_tok).detach()
+                off_ratio = off_ratio / (off_ratio_scale + 1e-6)
+
+        # off-policy ratio 整形后、用于日志的均值（仅 off 区域，detach）
+        off_ratio_mean = verl_F.masked_mean(off_ratio, off_clip_region).detach()
+
+        # (1) 路径 A 风格的 off_ratio 上/下界硬裁剪 + clip-frac 统计
         if off_max_clip is not None:
             off_ratio = torch.clamp(off_ratio, max=off_max_clip)
             off_ratio_max_clip_frac = verl_F.masked_mean((off_ratio == off_max_clip).float(), off_clip_region)
@@ -695,6 +718,9 @@ def compute_token_on_off_sft_loss(
         "ppo_kl": ppo_kl,
         "off_ratio_max_clip_frac": off_ratio_max_clip_frac,
         "off_ratio_min_clip_frac": off_ratio_min_clip_frac,
+        # off-policy ratio 整形后均值 + 缩放因子(batch_mean_norm 下=整形前均值,否则=1)
+        "off_ratio_mean": off_ratio_mean,
+        "off_ratio_scale": off_ratio_scale,
         # ===== loss 组成分析(同分母,绝对贡献可加) =====
         "on_loss_contrib": on_loss_contrib,
         "off_loss_contrib": off_loss_contrib,
