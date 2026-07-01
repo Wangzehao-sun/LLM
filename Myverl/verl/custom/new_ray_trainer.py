@@ -95,7 +95,6 @@ _DEFAULT_TRAJ_KEYWORDS = [
     "the reference reasoning",
     "reference reasoning",
     "provided reasoning",
-    "given reasoning",
     "based on the draft",
     "according to the draft",
     "as stated in the draft",
@@ -2716,7 +2715,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
         save_tensors_dir = self.config.trainer.get("save_tensors_dir", None)
         if save_tensors_dir is not None and save_tensors_dir != "":
             keys_to_save = ["old_log_probs", "log_probs","prefix_mask","reward_sum","uid",'se_mask','response_mask']
-            save_dtype = self.config.trainer.get("save_tensor_dtype", "fp16")
+            save_dtype = self.config.trainer.get("save_tensor_dtype", "fp32")
             self._save_tensors_from_batch(batch, save_dir=save_tensors_dir, keys_to_save=keys_to_save, save_dtype=save_dtype)
         
         if not is_failure_recycle_step:
