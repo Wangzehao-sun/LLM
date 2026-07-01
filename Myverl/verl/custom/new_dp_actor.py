@@ -127,7 +127,14 @@ class NewDataParallelPPOActor(DataParallelPPOActor):
             select_keys.append("loss_mask")
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
-        
+        # rephrase-KL (方案 B): 仅 extra-step 的 rephrase batch 才带这两个 key，
+        # normal-step batch 里没有，故「存在才 select」，避免 data.select 缺 key 报错。
+        if self.config.policy_loss.get('rephrase_kl_coef', 0.0) > 0:
+            if 'noprefix_logp' in data.batch.keys():
+                select_keys.append('noprefix_logp')
+            if 'summarize_rewritten_mask' in data.batch.keys():
+                select_keys.append('summarize_rewritten_mask')
+
         if self.config.use_off_policy_loss and self.config.off_policy_loss_impl == 'seq':
             select_keys.append('on_logprobs_mean')
             select_keys.append('on_logprobs_std')
@@ -472,6 +479,29 @@ class NewDataParallelPPOActor(DataParallelPPOActor):
                         policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                         metrics["actor/kl_loss"] = kl_loss.detach().item()
                         metrics["actor/kl_coef"] = self.config.kl_loss_coef
+
+                    # ==== rephrase-KL (方案 B) ====
+                    # 只在 extra-step 的 rephrase batch 生效：约束「长 prompt 下的
+                    # π_θ(·|x,prefix)」（= log_prob，梯度变量）贴近「短 prompt 下当前
+                    # actor 的 snapshot sg[π_θ(·|x)]」（= noprefix_logp, detached）。
+                    # 作用域用 summarize_rewritten_mask 精确圈 rephrase 行——此配置下这些行
+                    # 的 prefix_mask 被置全 False，无法用 prefix_mask 区分。normal-step 的
+                    # micro-batch 没有 noprefix_logp key，整段自动跳过。
+                    rephrase_kl_coef = self.config.policy_loss.get('rephrase_kl_coef', 0.0)
+                    if rephrase_kl_coef > 0 and 'noprefix_logp' in data.keys():
+                        noprefix_logp = data['noprefix_logp']  # sg[π_θ(·|x)], detached
+                        kld_rp = kl_penalty(
+                            logprob=log_prob, ref_logprob=noprefix_logp,
+                            kl_penalty=self.config.kl_loss_type,
+                        )  # KL(π(·|x,prefix) ‖ π(·|x))
+                        if 'summarize_rewritten_mask' in data.keys():
+                            rp_mask = data['summarize_rewritten_mask'].bool() & response_mask.bool()
+                        else:
+                            rp_mask = response_mask
+                        kl_rp = agg_loss(loss_mat=kld_rp, loss_mask=rp_mask, loss_agg_mode=loss_agg_mode)
+                        policy_loss = policy_loss + kl_rp * rephrase_kl_coef
+                        metrics["actor/rephrase_kl"] = kl_rp.detach().item()
+                        metrics["actor/rephrase_kl_coef"] = rephrase_kl_coef
 
 
                     #为什么要使用这个？

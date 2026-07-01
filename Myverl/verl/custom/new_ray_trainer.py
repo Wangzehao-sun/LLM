@@ -1841,6 +1841,40 @@ class NewRayPPOTrainer(RayPPOTrainer):
                               gen_batch_output.batch['responses'].size(1)),
                              dtype=torch.bool,
                          )
+                         # ==== rephrase-KL (方案 B): 为 rephrase 行算一份「短 prompt 下」的
+                         # actor log_prob，作为 KL 的参考分布 sg[π_θ(·|x)]。训练梯度走的是
+                         # 长 prompt 下的 π_θ(·|x,prefix)（gen_batch_output 本身），而这里额外
+                         # 用 _build_hybrid_off_policy_output(mode='summarize') 把同一批 response
+                         # 拼到「原始短 prompt」下再 forward 一次。compute_log_prob 是 forward-only
+                         # （no_grad），天然 detached，正好是当前 actor 的 snapshot。
+                         # response token 与长 prompt 结构逐位置对齐，可直接逐 token 做 KL。
+                         # 用 rephrase_kl_coef>0 门控，为 0 时零额外开销。
+                         rephrase_kl_coef = self.config.actor_rollout_ref.actor.policy_loss.get(
+                             'rephrase_kl_coef', 0.0
+                         )
+                         if rephrase_kl_coef > 0:
+                             with marked_timer("rephrase_noprefix_log_prob", timing_raw, color="blue"):
+                                 short_struct = self._build_hybrid_off_policy_output(
+                                     n_divide=self.config.actor_rollout_ref.rollout.n_prefix,
+                                     n_repeat=self.config.actor_rollout_ref.rollout.n_prefix,
+                                     gen_batch=gen_batch,
+                                     off_responses=gen_batch_output.batch['responses'],
+                                     prefix_list=prefix_lists,
+                                     train_batch_size=train_batch_size,
+                                     mode="summarize",
+                                     loss_prompts=loss_prompts_for_summarize,
+                                 )
+                                 _tmp_np = self.actor_rollout_wg.compute_log_prob(short_struct)
+                                 noprefix_logp = _tmp_np.batch.pop('old_log_probs')  # π_θ(·|x), detached
+                                 if 'entropys' in _tmp_np.batch.keys():
+                                     _tmp_np.batch.pop('entropys')
+                                 del _tmp_np, short_struct
+                             # 对齐到训练用 response 长度（短 prompt 结构可能被 pad 到
+                             # max_response_length，>= 训练 response 长度时右侧裁齐即可）。
+                             resp_len = gen_batch_output.batch['responses'].size(1)
+                             if noprefix_logp.size(1) != resp_len:
+                                 noprefix_logp = noprefix_logp[:, :resp_len]
+                             gen_batch_output.batch['noprefix_logp'] = noprefix_logp
                      elif loss_prompts_for_summarize is not None:
                          # explain-style: 在 build 替换 prompt 之前，先用此时 gen_batch_output
                          # 的 input_ids（= [长 summarize prompt, response]）算一份 actor log_prob。
@@ -2471,6 +2505,14 @@ class NewRayPPOTrainer(RayPPOTrainer):
                 old_probs_off = torch.exp(old_log_prob.batch["old_log_probs"])
                 old_prob_standard_off = verl_F.masked_mean(old_probs_off[standard_off_policy_mask], response_masks[standard_off_policy_mask])
                 old_prob_se_off = verl_F.masked_mean(old_probs_off[se_mask], response_masks[se_mask])
+                # off 行在「长 prompt(候选生成语境)」下的 prob：off_old_log_probs = long_log_prob，
+                # 尚未被下面的 swap pop 掉，此处先在 standard off 行上取均值。
+                # 与 old_prob_off_standard(短 prompt/loss 语境) 对照，看 prompt-shift 幅度。
+                if "off_old_log_probs" in batch.batch:
+                    long_probs_off = torch.exp(batch.batch["off_old_log_probs"])
+                    long_prob_standard_off = verl_F.masked_mean(long_probs_off[standard_off_policy_mask], response_masks[standard_off_policy_mask])
+                else:
+                    long_prob_standard_off = torch.tensor(0.0)
                 #print(f"Average old_log_prob on standard off-policy samples before update policy: {old_prob_standard_off:.4f}")
                 #print()
                 #根据prefix_mask将old_log_prob中off_policy的部分替换为old_log_prob_off
@@ -2497,10 +2539,10 @@ class NewRayPPOTrainer(RayPPOTrainer):
                 entropy_off_se = _safe_entropy_avg(se_mask)
                 old_probs = torch.exp(batch.batch["old_log_probs"])
                 old_on_prob = verl_F.masked_mean(old_probs[on_policy_mask], response_masks[on_policy_mask])
-                old_off_prob_se = verl_F.masked_mean(old_probs[se_mask], response_masks[se_mask])  
-                #old_off_prob_standard = verl_F.masked_mean(old_probs[standard_off_policy_mask], response_masks[standard_off_policy_mask])  
+                old_off_prob_se = verl_F.masked_mean(old_probs[se_mask], response_masks[se_mask])
+                #old_off_prob_standard = verl_F.masked_mean(old_probs[standard_off_policy_mask], response_masks[standard_off_policy_mask])
                 #计算old_on_prob和old_off_prob的平均值
-    
+
                 old_log_prob_metrics.update(
                         {
                             "batch/entropy_on": entropy_on,
@@ -2508,6 +2550,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
                             "batch/entropy_off_se": entropy_off_se,
                             "batch/old_prob_on": old_on_prob.detach().item(),
                             "batch/old_prob_off_standard": old_prob_standard_off.detach().item(),
+                            "batch/long_prob_off_standard": long_prob_standard_off.detach().item(),
                             "batch/old_prob_se": old_off_prob_se.detach().item(),
                             "batch/old_prob_se_off": old_prob_se_off.detach().item(),
                         }
