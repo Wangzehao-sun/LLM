@@ -21,27 +21,31 @@ Two category dimensions are used (one PNG each per folder):
 
 TWO-FOLDER COMPARISON
 ---------------------
-Pass a second folder with ``--input-dir2``. Its rollout files need NOT carry
-category info (topic / difficulty); they borrow it from ``--input-dir`` by
-STEP + POSITIONAL ORDER: for the same-step file, the i-th question (in
-first-appearance order) inherits folder-1's i-th question's topic / difficulty.
+Pass a second folder with ``--input-dir2``. Its rollout rows may carry ONLY a
+``score`` field -- no step, no uid, no extra_info. Folder-2 borrows everything
+from folder-1 by POSITION:
+
+  * files are paired by sorted filename order (folder-2 file i <-> folder-1
+    file i); folder-2 inherits that folder-1 file's ``step``;
+  * folder-1's ordered questions give the per-question rollout counts, which
+    are used to chunk folder-2's flat rows into the SAME questions (question i
+    = the next size_i rows);
+  * question i then inherits folder-1's question-i topic / difficulty.
+
 This yields 4 PNGs -- {topic, difficulty} x {folder1, folder2} -- so you can
 put the two runs side by side.
 
-Each PNG has one line per category: x = step, y = solvable fraction in [0, 1].
-
 A folder-1 file missing any required key (score / step / group-id / extra_info)
-is skipped. A folder-2 file only needs score / step / group-id; if its step has
-no folder-1 map it is skipped with a warning.
+is skipped (and its folder-2 partner with it, to keep pairing aligned).
 
 Usage:
     # single folder (2 PNGs)
     python Data/plot_solvable_by_category.py --input-dir /path/to/folder
 
-    # two folders compared (4 PNGs)
+    # two folders compared (4 PNGs); folder-2 rows may have only `score`
     python Data/plot_solvable_by_category.py \
         --input-dir  DIR_WITH_CATEGORIES \
-        --input-dir2 DIR_WITHOUT_CATEGORIES \
+        --input-dir2 DIR_SCORE_ONLY \
         --label1 baseline --label2 ours --output-dir OUT
 """
 import argparse
@@ -55,8 +59,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# Keys every record must carry. extra_info (with the nested category fields) is
-# required only for the category-owning folder (folder 1).
+# Keys every folder-1 record must carry (folder-1 owns the category info).
+# Folder-2 rows are allowed to have only `score`.
 REQUIRED_TOP_KEYS = ("score", "step")
 
 
@@ -83,14 +87,14 @@ def _load_records(path):
 
 
 def _group_key(rec):
-    """Identify the question a rollout belongs to."""
+    """Identify the question a rollout belongs to (folder-1 only)."""
     if rec.get("uid") is not None:
         return rec["uid"]
     return rec.get("original_index")
 
 
-def _has_required_keys(records, need_extra):
-    """True iff required keys exist. need_extra also demands extra_info (dict)."""
+def _folder1_ok(records):
+    """True iff folder-1 file has score/step, a group id, and extra_info dict."""
     if not records:
         return False
     sample = records[0]
@@ -99,7 +103,7 @@ def _has_required_keys(records, need_extra):
             return False
     if _group_key(sample) is None:
         return False
-    if need_extra and not isinstance(sample.get("extra_info"), dict):
+    if not isinstance(sample.get("extra_info"), dict):
         return False
     return True
 
@@ -117,13 +121,34 @@ def _ordered_question_rollouts(records):
     return [groups[k] for k in order]
 
 
+def _split_by_sizes(records, sizes):
+    """Chunk a FLAT record list into questions using folder-1's ``sizes``.
+
+    Consumes records sequentially: question i = the next ``sizes[i]`` rows.
+    Stops early if records run out, so the result may be shorter than
+    ``sizes`` (the caller warns on a count mismatch). Used for folder-2, whose
+    rows carry only ``score`` and have no group id to group by.
+    """
+    chunks = []
+    i = 0
+    n = len(records)
+    for s in sizes:
+        if i >= n:
+            break
+        chunk = records[i:i + s]
+        i += len(chunk)
+        chunks.append(chunk)
+    return chunks
+
+
 def _question_solvable(rollouts):
     """solve@8: True iff any *on-policy* rollout scored > 0.
 
     Rollouts with is_replaced == True are injected off-policy correct answers
     (a correct trajectory was spliced into an all-wrong group). They do NOT
     reflect the model actually solving the question, so they are excluded --
-    only genuine on-policy rollouts count toward solvability.
+    only genuine on-policy rollouts count toward solvability. Folder-2 rows
+    have no is_replaced key, so every score > 0 there counts (as intended).
     """
     return any(
         float(r.get("score", 0)) > 0.0 and not bool(r.get("is_replaced"))
@@ -166,50 +191,58 @@ def _own_label(rollouts, dimension, topic_level):
     return _difficulty_bucket(rollouts)
 
 
-def build_label_maps(folder_data, topic_level):
-    """Positional category maps for folder 1, keyed by step.
-
-    folder_data: list of (step, records). Returns
-    step -> {"topic": [labels...], "difficulty": [labels...]}, where the list
-    is aligned to the questions' first-appearance order in that step's file.
-    Later folders borrow these by position.
-    """
-    maps = {}
-    for step, records in folder_data:
-        qs = _ordered_question_rollouts(records)
-        maps[step] = {
-            "topic": [_own_label(q, "topic", topic_level) for q in qs],
-            "difficulty": [_own_label(q, "difficulty", topic_level) for q in qs],
-        }
-    return maps
-
-
-def aggregate(records, labels):
-    """Per-category (solvable, total) counts for one file given a label list.
-
-    ``labels`` is aligned to the questions' first-appearance order. Questions
-    beyond the shorter of (questions, labels) are dropped (with the caller
-    warning on length mismatch). None labels are skipped.
-    """
-    qs = _ordered_question_rollouts(records)
-    n = min(len(qs), len(labels))
-    counts = defaultdict(lambda: [0, 0])  # cat -> [solvable, total]
-    for i in range(n):
-        cat = labels[i]
-        if cat is None:
-            continue
-        counts[cat][1] += 1
-        if _question_solvable(qs[i]):
-            counts[cat][0] += 1
-    return counts, len(qs)
-
-
 def _step_of(records):
     """Representative step for a file (the most common value)."""
     counts = defaultdict(int)
     for r in records:
         counts[r["step"]] += 1
     return int(max(counts, key=counts.get))
+
+
+def process_folder1_path(path, topic_level):
+    """Load one folder-1 file into an info dict, or None if invalid.
+
+    Returns {step, sizes, questions, labels: {topic:[...], difficulty:[...]}}.
+    ``sizes`` and ``labels`` are aligned to the questions' first-appearance
+    order and are what folder-2 borrows by position.
+    """
+    try:
+        records = _load_records(path)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"[skip] {os.path.basename(path)}: failed to parse ({e})")
+        return None
+    if not _folder1_ok(records):
+        print(f"[skip] {os.path.basename(path)}: missing required key(s)")
+        return None
+    questions = _ordered_question_rollouts(records)
+    return {
+        "step": _step_of(records),
+        "sizes": [len(q) for q in questions],
+        "questions": questions,
+        "labels": {
+            "topic": [_own_label(q, "topic", topic_level) for q in questions],
+            "difficulty": [_own_label(q, "difficulty", topic_level) for q in questions],
+        },
+    }
+
+
+def aggregate(questions, labels):
+    """Per-category (solvable, total) counts for one file.
+
+    ``questions`` is a list of rollout-lists; ``labels`` is the aligned category
+    label per question (None labels are skipped). Aligns on the shorter of the
+    two lengths. Returns (counts dict cat -> [solvable, total], n_questions).
+    """
+    n = min(len(questions), len(labels))
+    counts = defaultdict(lambda: [0, 0])  # cat -> [solvable, total]
+    for i in range(n):
+        cat = labels[i]
+        if cat is None:
+            continue
+        counts[cat][1] += 1
+        if _question_solvable(questions[i]):
+            counts[cat][0] += 1
+    return counts, len(questions)
 
 
 def _sorted_categories(cats, dimension):
@@ -222,51 +255,6 @@ def _sorted_categories(cats, dimension):
                 return (1, c)
         return sorted(cats, key=_key)
     return sorted(cats)
-
-
-def load_folder(paths, need_extra):
-    """Load + validate a folder's files. Returns list of (step, records)."""
-    out = []
-    for path in paths:
-        try:
-            records = _load_records(path)
-        except (json.JSONDecodeError, OSError) as e:
-            print(f"[skip] {os.path.basename(path)}: failed to parse ({e})")
-            continue
-        if not _has_required_keys(records, need_extra):
-            print(f"[skip] {os.path.basename(path)}: missing required key(s)")
-            continue
-        out.append((_step_of(records), records))
-    return out
-
-
-def per_step_counts_own(folder_data, dimension, topic_level):
-    """folder-1 aggregation: each file labels its questions from its own info."""
-    per_step = []
-    for step, records in folder_data:
-        qs = _ordered_question_rollouts(records)
-        labels = [_own_label(q, dimension, topic_level) for q in qs]
-        counts, _ = aggregate(records, labels)
-        if counts:
-            per_step.append((step, counts))
-    return per_step
-
-
-def per_step_counts_borrowed(folder_data, dimension, label_maps, tag):
-    """folder-2 aggregation: labels borrowed from folder-1 by step + position."""
-    per_step = []
-    for step, records in folder_data:
-        if step not in label_maps:
-            print(f"[skip] {tag}: step={step} has no folder-1 map to borrow, skipping")
-            continue
-        labels = label_maps[step][dimension]
-        counts, n_q = aggregate(records, labels)
-        if n_q != len(labels):
-            print(f"[warn] {tag}: step={step} question count {n_q} != folder-1 "
-                  f"{len(labels)}; aligned on the first {min(n_q, len(labels))}")
-        if counts:
-            per_step.append((step, counts))
-    return per_step
 
 
 def plot_dimension(per_step, dimension, min_questions, out_path, title):
@@ -314,9 +302,10 @@ def main():
     ap.add_argument("--input-dir", required=True,
                     help="Folder-1: rollout dumps WITH category info (topic/difficulty).")
     ap.add_argument("--input-dir2", default=None,
-                    help="Folder-2 (optional): rollout dumps that borrow folder-1's "
-                         "categories by step + positional order. Produces a second set "
-                         "of PNGs for side-by-side comparison.")
+                    help="Folder-2 (optional): rollout dumps whose rows may carry ONLY "
+                         "`score`. Files are paired to folder-1 by sorted filename order; "
+                         "questions/categories are borrowed by position. Produces a "
+                         "second set of PNGs for side-by-side comparison.")
     ap.add_argument("--pattern", default="*.jsonl",
                     help="Glob pattern for data files (default: *.jsonl).")
     ap.add_argument("--label1", default=None,
@@ -339,36 +328,65 @@ def main():
     out_dir = args.output_dir or args.input_dir
     label1 = args.label1 or os.path.basename(os.path.normpath(args.input_dir))
 
-    folder1 = load_folder(paths1, need_extra=True)
-    if not folder1:
+    # Folder-1: process every file (aligned to paths1; None = skipped).
+    infos1 = [process_folder1_path(p, args.topic_level) for p in paths1]
+    if not any(infos1):
         raise SystemExit("No valid folder-1 files.")
-    print(f"[folder1={label1}] {len(folder1)} step file(s)")
+    print(f"[folder1={label1}] {sum(i is not None for i in infos1)} valid step file(s)")
 
-    label_maps = build_label_maps(folder1, args.topic_level)
-
-    folder2 = None
+    # Folder-2 (optional): pair by sorted filename position; borrow everything.
+    paths2 = None
     label2 = None
     if args.input_dir2:
         paths2 = sorted(glob.glob(os.path.join(args.input_dir2, args.pattern)))
         if not paths2:
             raise SystemExit(f"No files match {args.pattern!r} in {args.input_dir2}")
         label2 = args.label2 or os.path.basename(os.path.normpath(args.input_dir2))
-        folder2 = load_folder(paths2, need_extra=False)
-        if not folder2:
-            raise SystemExit("No valid folder-2 files.")
-        print(f"[folder2={label2}] {len(folder2)} step file(s)")
+        if len(paths2) != len(paths1):
+            print(f"[warn] folder counts differ (folder1={len(paths1)}, "
+                  f"folder2={len(paths2)}); pairing the first {min(len(paths1), len(paths2))}")
+
+    def _folder1_per_step(dim):
+        out = []
+        for info in infos1:
+            if info is None:
+                continue
+            counts, _ = aggregate(info["questions"], info["labels"][dim])
+            if counts:
+                out.append((info["step"], counts))
+        return out
+
+    def _folder2_per_step(dim):
+        out = []
+        for idx in range(min(len(paths1), len(paths2))):
+            info = infos1[idx]
+            if info is None:
+                continue  # can't borrow labels/sizes for this position
+            p2 = paths2[idx]
+            try:
+                recs2 = _load_records(p2)
+            except (json.JSONDecodeError, OSError) as e:
+                print(f"[skip] {os.path.basename(p2)}: failed to parse ({e})")
+                continue
+            chunks = _split_by_sizes(recs2, info["sizes"])
+            if len(chunks) != len(info["sizes"]):
+                print(f"[warn] {os.path.basename(p2)}: got {len(chunks)} questions vs "
+                      f"folder-1 {len(info['sizes'])}; aligned on the first "
+                      f"{min(len(chunks), len(info['sizes']))}")
+            counts, _ = aggregate(chunks, info["labels"][dim])
+            if counts:
+                out.append((info["step"], counts))
+        return out
 
     for dim in ("topic", "difficulty"):
-        p1 = per_step_counts_own(folder1, dim, args.topic_level)
         plot_dimension(
-            p1, dim, args.min_questions,
+            _folder1_per_step(dim), dim, args.min_questions,
             os.path.join(out_dir, f"solvable_by_{dim}_vs_step__{_safe(label1)}.png"),
             f"Solvable fraction (solve@8) by {dim} vs step -- {label1}",
         )
-        if folder2 is not None:
-            p2 = per_step_counts_borrowed(folder2, dim, label_maps, tag=label2)
+        if paths2 is not None:
             plot_dimension(
-                p2, dim, args.min_questions,
+                _folder2_per_step(dim), dim, args.min_questions,
                 os.path.join(out_dir, f"solvable_by_{dim}_vs_step__{_safe(label2)}.png"),
                 f"Solvable fraction (solve@8) by {dim} vs step -- {label2}",
             )
