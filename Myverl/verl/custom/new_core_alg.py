@@ -588,6 +588,25 @@ def compute_token_on_off_sft_loss(
             off_row = (off_clip_region.sum(dim=-1) > 0)
             if off_row.any():
                 off_ratio_scale = ess_per_row[off_row].mean().detach()
+        elif off_policy_reshape.startswith("low_clip"):
+            # 'low_clip'（可带阈值后缀，如 'low_clip_0.1'，缺省 0.1）：把当前策略概率
+            # prob = exp(log_prob) 低于阈值的 off token 直接 mask 掉（off_ratio 置 0），
+            # 使这些低置信 off token 不产生梯度。命名/解析沿用 'p_div_p_0.1' 约定。
+            # prob 用 detach——门控本身不制造梯度，只决定哪些 token 参与。
+            thr = 0.1
+            _suffix = off_policy_reshape[len("low_clip"):].lstrip("_")
+            if _suffix:
+                try:
+                    thr = float(_suffix)
+                except ValueError:
+                    thr = 0.1
+            prob = torch.exp(log_prob).detach()
+            keep_mask = (prob >= thr).to(off_ratio.dtype)
+            off_ratio = off_ratio * keep_mask
+            # 监控：off 区域内被保留（未 mask）的 token 占比。
+            n_off_tok = off_clip_region.sum()
+            if n_off_tok > 0:
+                off_ratio_scale = ((keep_mask * off_clip_region).sum() / n_off_tok).detach()
 
         # off-policy ratio 整形后、用于日志的均值（仅 off 区域，detach）
         off_ratio_mean = verl_F.masked_mean(off_ratio, off_clip_region).detach()
