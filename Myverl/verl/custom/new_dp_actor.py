@@ -390,7 +390,8 @@ class NewDataParallelPPOActor(DataParallelPPOActor):
                             loss_remove_clip=self.config.loss_remove_clip,
                             on_loss_remove_clip=self.config.get("on_loss_remove_clip", None),
                             off_loss_remove_clip=self.config.get("off_loss_remove_clip", None),
-                            se_mask=se_mask
+                            se_mask=se_mask,
+                            off_distill_coef=self.config.policy_loss.get('off_distill_coef', 0.0),
                         )
                         pg_loss = ret_dict['pg_loss']
                         off_pg_loss = ret_dict['off_pg_loss']
@@ -420,6 +421,8 @@ class NewDataParallelPPOActor(DataParallelPPOActor):
                             metrics_data['actor/off_ratio_min_clip_frac'] = ret_dict['off_ratio_min_clip_frac'].detach().item()
                         if 'off_ratio_scale' in ret_dict:
                             metrics_data['actor/off_ratio_scale'] = ret_dict['off_ratio_scale'].detach().item()
+                        if 'off_distill_loss' in ret_dict:
+                            metrics_data['actor/off_distill_loss'] = ret_dict['off_distill_loss'].detach().item()
                         # ===== loss 组成分析:on/off 占比 + off 内 SFT/RL 占比 =====
                         # 绝对贡献(同分母,可加,数值上 on_loss_contrib + off_loss_contrib == pg_loss)
                         if 'on_loss_contrib' in ret_dict:

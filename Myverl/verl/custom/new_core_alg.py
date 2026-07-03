@@ -432,6 +432,7 @@ def compute_token_on_off_sft_loss(
     sft_gate_tau=0.01,
     on_loss_remove_clip=None,
     off_loss_remove_clip=None,
+    off_distill_coef=0.0,
 ):
     """
     """
@@ -646,7 +647,25 @@ def compute_token_on_off_sft_loss(
         pass
     else:
         raise ValueError(f"Invalid off_policy_loss_type: {off_policy_loss_type}")
-    off_losses = off_sft_losses + off_rl_losses
+
+    # ============= off-token distillation（额外相加项）=============
+    # teacher = 长 prompt 下的自己。rl-rl 分支里 off 行的 old_log_prob 已被上层 swap 成
+    # 长 summarize prompt 下的 logprob（off_old_log_probs），故 teacher_prob 直接取
+    # exp(old_log_prob).detach()——无需额外传 target_probs。
+    # 加权 SFT / 交叉熵形式：L_distill = - teacher_prob * log_prob（只在 off token 生效），
+    # 把「短 prompt 下的学生 log_prob」在 teacher 高概率 token 上拉高，蒸进无 prefix 语境。
+    # off_distill_coef=0 时不生效（走原 off_losses）。
+    off_distill_losses = torch.zeros_like(log_prob)
+    off_distill_loss_log = torch.tensor(0.0)
+    if off_distill_coef > 0:
+        teacher_prob = torch.exp(old_log_prob).detach()
+        off_distill_losses = -teacher_prob * log_prob
+        off_distill_region = prefix_mask * response_mask * reward_mask
+        off_distill_loss_log = verl_F.masked_mean(off_distill_losses, off_distill_region).detach()
+        # 并入 off_losses：随 off token 区域参与最终 pg_loss（下方乘 prefix_mask*reward_mask）。
+        off_losses = off_sft_losses + off_rl_losses + off_distill_coef * off_distill_losses
+    else:
+        off_losses = off_sft_losses + off_rl_losses
 
     # 先分别统计 on/off 区域损失，再按 mask 合并
     off_pg_losses = off_losses * prefix_mask * reward_mask
@@ -759,6 +778,8 @@ def compute_token_on_off_sft_loss(
         # group_ess_weight 下=被替换 off 行的平均 ESS 权重；否则=1。
         "off_ratio_mean": off_ratio_mean,
         "off_ratio_scale": off_ratio_scale,
+        # off-token distillation 项均值(仅 off 区域, detached; coef=0 时为 0)
+        "off_distill_loss": off_distill_loss_log,
         # ===== loss 组成分析(同分母,绝对贡献可加) =====
         "on_loss_contrib": on_loss_contrib,
         "off_loss_contrib": off_loss_contrib,
