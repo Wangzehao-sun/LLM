@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pandas as pd
 
-DEFAULT_THRESHOLD = 0.5
+DEFAULT_THRESHOLD = 0.4
 
 
 def parse_args() -> argparse.Namespace:
