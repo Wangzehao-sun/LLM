@@ -59,6 +59,19 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Drop the test_score column from the output (smaller file, but loses accuracy info).",
     )
+    p.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Cap the final number of saved rows. If fewer rows pass the filter, "
+             "all are kept. Default: no cap.",
+    )
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed used when --limit subsamples the kept rows (default: %(default)s).",
+    )
     return p.parse_args()
 
 
@@ -106,6 +119,11 @@ def main() -> None:
         )
 
     out = df[mask].reset_index(drop=True)
+
+    if args.limit is not None and len(out) > args.limit:
+        out = out.sample(n=args.limit, random_state=args.seed).reset_index(drop=True)
+        print(f"Limit: subsampled to {args.limit:,} rows (seed={args.seed}).")
+
     if args.drop_test_score:
         out = out.drop(columns=["test_score"])
 
