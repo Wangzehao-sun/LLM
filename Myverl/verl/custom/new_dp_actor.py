@@ -392,6 +392,8 @@ class NewDataParallelPPOActor(DataParallelPPOActor):
                             off_loss_remove_clip=self.config.get("off_loss_remove_clip", None),
                             se_mask=se_mask,
                             off_distill_coef=self.config.policy_loss.get('off_distill_coef', 0.0),
+                            off_cliprange_high=self.config.get("off_clip_ratio_high", None),
+                            off_distill_gate=self.config.policy_loss.get('off_distill_gate', False),
                         )
                         pg_loss = ret_dict['pg_loss']
                         off_pg_loss = ret_dict['off_pg_loss']
