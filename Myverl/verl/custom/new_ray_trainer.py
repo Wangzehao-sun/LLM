@@ -1470,7 +1470,17 @@ class NewRayPPOTrainer(RayPPOTrainer):
                                 if isinstance(first_item[key], torch.Tensor):
                                     failed_batch_dict[key] = torch.stack(gathered).to(batch_dict['input_ids'].device)
                                 elif isinstance(first_item[key], np.ndarray):
-                                    failed_batch_dict[key] = np.stack(gathered)
+                                    # 变长字段（如 raw_prompt_ids：每题 prompt token 数不同）无法
+                                    # np.stack（要求同形）。仅当所有元素同形时才 stack；否则退回
+                                    # dtype=object 的一维数组，保留各自长度，避免 collate 崩。
+                                    shapes = {np.asarray(g).shape for g in gathered}
+                                    if len(shapes) == 1:
+                                        failed_batch_dict[key] = np.stack(gathered)
+                                    else:
+                                        obj = np.empty(len(gathered), dtype=object)
+                                        for _i, _g in enumerate(gathered):
+                                            obj[_i] = _g
+                                        failed_batch_dict[key] = obj
                                 else:
                                     failed_batch_dict[key] = np.array(gathered, dtype=object)
                             else:
