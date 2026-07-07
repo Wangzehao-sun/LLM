@@ -1293,10 +1293,23 @@ class NewRayPPOTrainer(RayPPOTrainer):
         off_batch.batch['target_probs'] = torch.exp(long_log_prob)
         off_batch.batch['off_old_log_probs'] = long_log_prob
 
-        # --- 7. 每题按 prompt 顺序取第一条合格候选，替换其一条错误 rollout ---
+        # 候选选择打分（近似 no-prefix 亲和度）：用已算好的 long_log_prob（候选在长
+        # summarize prompt 下的 per-token logprob）做「序列平均 log_prob」——在候选
+        # response 的有效 token 上取均值，长度归一化避免偏向短候选。分数越高＝模型对该
+        # 候选越有把握。注意这是长 prompt 下的自信度，作为 no-prefix 亲和度的零成本代理
+        # （不额外 forward）。select='logp' 时用它选合格里分数最高的；默认 'shortest'
+        # 保持旧行为（按 k 升序取第一条＝prefix 最短）。
+        cand_valid = (cand_resp != pad_token_id).float()            # [W*K, w]
+        cand_logp_mean = (long_log_prob * cand_valid).sum(-1) / (cand_valid.sum(-1) + 1e-8)  # [W*K]
+        sr_select = self.config.actor_rollout_ref.rollout.get('summarize_replace_select', 'shortest')
+
+        # --- 7. 每题挑一条合格候选，替换其一条错误 rollout ---
+        #     select='shortest'（默认）：按 k 升序取第一条合格＝prefix 最短。
+        #     select='logp'：合格候选里取 long_log_prob 序列平均最大的（最亲和当前策略）。
         n_acc = n_rej_inc = n_rej_flt = n_no_cand = 0
         for w_idx, p in enumerate(wrong_q):
             chosen = -1  # off_batch 内（W*K 展平）被选中的行
+            best_score = float('-inf')
             for k in range(K):
                 r = w_idx * K + k
                 if cand_reward_sum[r].item() != success_value:
@@ -1307,8 +1320,14 @@ class NewRayPPOTrainer(RayPPOTrainer):
                     if rej:
                         n_rej_flt += 1
                         continue
-                chosen = r
-                break  # 第一条合格的即用
+                if sr_select == 'logp':
+                    # 合格候选里保留分数最高的，遍历完 K 条再定。
+                    s = cand_logp_mean[r].item()
+                    if s > best_score:
+                        best_score, chosen = s, r
+                else:
+                    chosen = r
+                    break  # 第一条合格的即用（prefix 最短）
             if chosen < 0:
                 n_no_cand += 1
                 continue
@@ -1450,7 +1469,17 @@ class NewRayPPOTrainer(RayPPOTrainer):
                                 if isinstance(first_item[key], torch.Tensor):
                                     failed_batch_dict[key] = torch.stack(gathered).to(batch_dict['input_ids'].device)
                                 elif isinstance(first_item[key], np.ndarray):
-                                    failed_batch_dict[key] = np.stack(gathered)
+                                    # 变长字段（如 raw_prompt_ids：每题 prompt token 数不同）无法
+                                    # np.stack（要求同形）。仅当所有元素同形时才 stack；否则退回
+                                    # dtype=object 的一维数组，保留各自长度，避免 collate 崩。
+                                    shapes = {np.asarray(g).shape for g in gathered}
+                                    if len(shapes) == 1:
+                                        failed_batch_dict[key] = np.stack(gathered)
+                                    else:
+                                        obj = np.empty(len(gathered), dtype=object)
+                                        for _i, _g in enumerate(gathered):
+                                            obj[_i] = _g
+                                        failed_batch_dict[key] = obj
                                 else:
                                     failed_batch_dict[key] = np.array(gathered, dtype=object)
                             else:
@@ -2302,8 +2331,14 @@ class NewRayPPOTrainer(RayPPOTrainer):
                                  reward_mask[mixed_batch_indices] = reward_mask[mixed_batch_indices] & (~target_prefix_mask)
 
                         else:
-                            if self.config.actor_rollout_ref.actor.policy_loss.loss_mode in ['luffy','se']:
-                                
+                            # normal-step（非 recycle）：含 off 注入行的组。
+                            # mask_off_inject_group=True 时，把整组（on-policy 行 + off 注入行）
+                            # 的 loss 全部 mask 掉——该 group 完全不参与训练。默认 False 保持旧行为。
+                            # 依赖 off_policy_masking=True（本 if 块的进入条件）。
+                            if self.config.actor_rollout_ref.actor.policy_loss.get('mask_off_inject_group', False):
+                                reward_mask[uid_mask, :] = False
+                            elif self.config.actor_rollout_ref.actor.policy_loss.loss_mode in ['luffy','se']:
+
                                 if (uid_rewards == success_value).sum() == 1:
                                     reward_mask[uid_mask,:] = False
                             elif self.config.actor_rollout_ref.actor.policy_loss.loss_mode in ['se_filter']:

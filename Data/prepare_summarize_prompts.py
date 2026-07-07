@@ -560,6 +560,23 @@ def main() -> None:
         help="User-turn template, must include {question} and {prefix} placeholders.",
     )
     parser.add_argument("--limit", type=int, default=None, help="Optional row limit for quick smoke tests.")
+    parser.add_argument(
+        "--drop-empty",
+        dest="drop_empty",
+        action="store_true",
+        default=True,
+        help="Drop rows whose summarize_prompt / summarize_prompts came out empty "
+             "(no question / no reasoning / answer leaks in first sentence). ON by "
+             "default: such rows crash the failure-recycle np.stack collate in "
+             "new_ray_trainer.py when they mix with normal rows. Use --keep-empty "
+             "to disable.",
+    )
+    parser.add_argument(
+        "--keep-empty",
+        dest="drop_empty",
+        action="store_false",
+        help="Keep rows with empty summarize columns (disables the default cleanup).",
+    )
     args = parser.parse_args()
 
     if "{question}" not in args.template or "{prefix}" not in args.template:
@@ -669,6 +686,32 @@ def main() -> None:
             if isinstance(p, np.ndarray) and len(p) > 0
         )
         print(f"  -> {n_emitted:,}/{len(out_df):,} rows have non-empty {col}.")
+
+    # Cleanup: drop rows whose summarize columns came out empty. process_single_item
+    # emits np.array([], dtype=object) when a row cannot be rendered (no question,
+    # no reasoning, or the answer leaks in the first sentence). These empty (shape
+    # (0,)) cells are harmless during normal steps (the dataset pads them) but crash
+    # the failure-recycle np.stack collate in new_ray_trainer.py when they land in
+    # the failure buffer next to normal rows (mismatched shapes). Removing them here
+    # keeps the training data clean at the source. Disable with --keep-empty.
+    if args.drop_empty:
+        def _is_empty(v) -> bool:
+            return not (isinstance(v, np.ndarray) and len(v) > 0)
+
+        bad = out_df.apply(
+            lambda r: _is_empty(r["summarize_prompt"]) or _is_empty(r["summarize_prompts"]),
+            axis=1,
+        )
+        n_drop = int(bad.sum())
+        if n_drop > 0:
+            bad_pos = [int(i) for i in np.where(bad.to_numpy())[0][:20]]
+            print(
+                f"  -> dropping {n_drop:,} row(s) with empty summarize columns "
+                f"(positions: {bad_pos}{' ...' if n_drop > 20 else ''})."
+            )
+            out_df = out_df[~bad].reset_index(drop=True)
+        else:
+            print("  -> no empty summarize rows to drop.")
 
     # Print a sample of BOTH columns for human-eyeball verification.
     sample = next(

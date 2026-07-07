@@ -433,6 +433,8 @@ def compute_token_on_off_sft_loss(
     on_loss_remove_clip=None,
     off_loss_remove_clip=None,
     off_distill_coef=0.0,
+    off_cliprange_high=None,
+    off_distill_gate=False,
 ):
     """
     """
@@ -626,7 +628,10 @@ def compute_token_on_off_sft_loss(
             cliprange_low = cliprange
         if cliprange_high is None:
             cliprange_high = cliprange
-        upper_bound = max(1.0 + cliprange_high, 1.0 + cliprange)
+        # off-policy 上界可用 off_cliprange_high 单独控制；未设置时回退到 on-policy 的
+        # cliprange_high（向后兼容，与旧行为一致）。
+        _off_cliprange_high = off_cliprange_high if off_cliprange_high is not None else cliprange_high
+        upper_bound = max(1.0 + _off_cliprange_high, 1.0 + cliprange)
 
         off_pg_losses = -advantages * off_ratio
         if off_loss_remove_clip is False:
@@ -660,6 +665,14 @@ def compute_token_on_off_sft_loss(
     if off_distill_coef > 0:
         teacher_prob = torch.exp(old_log_prob).detach()
         off_distill_losses = -teacher_prob * log_prob
+        # off_distill_gate=True 时，只在「学生(短 prompt)概率 < 教师(SR/长 prompt)概率」的
+        # token 上蒸馏：把落后于教师的 token 往上拉，学生已比教师自信的 token 不再上拉，
+        # 避免过拟合到教师分布。False 时（默认）对所有 off token 蒸馏（旧行为）。
+        # prob 均 detach——门控本身不制造梯度，只决定哪些 token 参与蒸馏。
+        if off_distill_gate:
+            student_prob = torch.exp(log_prob).detach()
+            distill_gate = (student_prob < teacher_prob).to(log_prob.dtype)
+            off_distill_losses = off_distill_losses * distill_gate
         off_distill_region = prefix_mask * response_mask * reward_mask
         off_distill_loss_log = verl_F.masked_mean(off_distill_losses, off_distill_region).detach()
         # 并入 off_losses：随 off token 区域参与最终 pg_loss（下方乘 prefix_mask*reward_mask）。
