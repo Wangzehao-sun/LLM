@@ -1354,6 +1354,120 @@ class NewRayPPOTrainer(RayPPOTrainer):
         )
         return gen_batch_output
 
+    def _summarize_mix_postprocess(
+        self,
+        gen_batch: DataProto,
+        gen_batch_output: DataProto,
+        batch: DataProto,
+        short_prompts: torch.Tensor,
+        train_batch_size: int,
+        timing_raw: dict,
+        metrics: dict,
+    ) -> DataProto:
+        """Normal-step summarize_mix（两次 rollout，不用 n_off）：
+
+        入口时 gen_batch_output 是 on rollout 的 [B*(n-1)] 条短 prompt 结果。本方法：
+          1. 给 on 批补 explain-style key（prefix_mask/off_old_log_probs/target_probs 全 0），
+             使 on/off 两批 key 对齐，拼接不缺列；
+          2. off rollout：用长 summarize prompt（单条 summarize_input_id）再采 1 条/题；
+          3. 算 off response 在长 prompt 下的 per-token logprob（long_log_prob）；
+          4. _build_hybrid_off_policy_output(mode="summarize", loss_prompts=短 prompt) 把 off
+             重建成 [短 question prompt, response]，prefix_mask 有效 token 全 1；注入
+             off_old_log_probs=long_log_prob、target_probs=exp(long_log_prob)；
+          5. 按 interleaved 拼接：每题 (n-1) on + 1 off -> [B*n]（off 在每题末尾）。
+
+        off 行 loss 走 rl-rl explain-style：下游把 off_old_log_probs swap 进 old_log_probs，
+        off_ratio = exp(lp_short - lp_long)。on 行 prefix_mask=0，走标准 GRPO。
+        """
+        if 'summarize_input_id' not in batch.batch:
+            raise ValueError(
+                "summarize_normal_mode='mix' 需要 data.use_summarize=True（缺单条列 summarize_input_id）"
+            )
+        n = self.config.actor_rollout_ref.rollout.n
+        if n < 2:
+            raise ValueError(f"summarize_normal_mode='mix' 要求 rollout.n>=2，当前 n={n}")
+        pad_token_id = self.tokenizer.pad_token_id
+        device = gen_batch_output.batch['input_ids'].device
+
+        # --- 1. on 批补 explain-style key（全 0），对齐 off 批的 key 便于拼接 ---
+        resp_shape = gen_batch_output.batch['responses'].shape          # [B*(n-1), w]
+        gen_batch_output.batch['prefix_mask'] = torch.zeros(
+            resp_shape, dtype=torch.bool, device=device
+        )
+        gen_batch_output.batch['off_old_log_probs'] = torch.zeros(
+            resp_shape, dtype=torch.float32, device=device
+        )
+        gen_batch_output.batch['target_probs'] = torch.zeros(
+            resp_shape, dtype=torch.float32, device=device
+        )
+
+        # --- 2. off rollout：长 summarize prompt 生成 1 条/题 ---
+        long_prompts = batch.batch['summarize_input_id'].to(device)     # [B, L_long]
+        long_attn, long_pos = generate_masks_from_input_ids(
+            long_prompts, pad_token_id, gen_batch_output.batch['attention_mask'].dtype
+        )
+        off_gen = DataProto.from_single_dict({
+            'input_ids': long_prompts,
+            'attention_mask': long_attn,
+            'position_ids': long_pos,
+        })
+        off_gen.meta_info = deepcopy(gen_batch.meta_info)
+        off_gen.meta_info['is_se'] = False
+        off_gen.meta_info['is_extra'] = False
+        with marked_timer("smix_gen_off", timing_raw, color="cyan"):
+            off_out = self.actor_rollout_wg.generate_sequences(off_gen)
+            timing_raw.update(off_out.meta_info.get("timing", {}))
+            off_out.meta_info.pop("timing", None)
+        off_resp = off_out.batch['responses']                           # [B, w]
+
+        # --- 3. off response 在长 prompt 下的 logprob（off_old_log_probs / target_probs 来源）---
+        with marked_timer("smix_logprob", timing_raw, color="cyan"):
+            _lp = self.actor_rollout_wg.compute_log_prob(off_out)
+            long_log_prob = _lp.batch.pop('old_log_probs')              # [B, w]
+            if 'entropys' in _lp.batch.keys():
+                _lp.batch.pop('entropys')
+            del _lp
+
+        # --- 4. 重建 off 行成 [短 question prompt, response]（explain-style，prefix_mask 全 1）---
+        off_batch = self._build_hybrid_off_policy_output(
+            n_divide=1,
+            n_repeat=1,
+            gen_batch=off_gen,
+            off_responses=off_resp,
+            prefix_list=[[] for _ in range(train_batch_size)],
+            train_batch_size=train_batch_size,
+            mode="summarize",
+            loss_prompts=short_prompts,
+        )
+        off_batch.batch['off_old_log_probs'] = long_log_prob
+        off_batch.batch['target_probs'] = torch.exp(long_log_prob)
+
+        # --- 5. interleaved 拼接：每题 (n-1) on + 1 off -> [B*n] ---
+        merged = {}
+        for key in gen_batch_output.batch.keys():
+            if key not in off_batch.batch.keys():
+                continue  # off 缺的 key（如 rollout_log_probs）丢弃，与下游 guarded 行为一致
+            on_t = gen_batch_output.batch[key].view(
+                train_batch_size, n - 1, *gen_batch_output.batch[key].shape[1:]
+            )
+            off_t = off_batch.batch[key].to(on_t.device).view(
+                train_batch_size, 1, *off_batch.batch[key].shape[1:]
+            )
+            merged[key] = torch.cat([on_t, off_t], dim=1).reshape(
+                train_batch_size * n, *on_t.shape[2:]
+            )
+        out = DataProto(
+            batch=TensorDict(merged, batch_size=train_batch_size * n),
+            meta_info=gen_batch_output.meta_info,
+        )
+
+        metrics['batch/smix_off_injected'] = train_batch_size
+        print(
+            f"[summarize_mix] on={train_batch_size * (n - 1)} off={train_batch_size} "
+            f"-> total={train_batch_size * n}"
+        )
+        return out
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1647,6 +1761,35 @@ class NewRayPPOTrainer(RayPPOTrainer):
         # summarize 模式（explain-style loss）专用：保存替换前的原始短 prompt，
         # 在 _build_hybrid_off_policy_output 时作为 loss_prompts 传入。None 表示不走 summarize。
         loss_prompts_for_summarize = None
+        # normal-step 的 summarize 注入方式，单参数三选一（互斥）：
+        #   'none'    : 不注入（默认）
+        #   'replace' : 只对全错题生成 K 条候选，挑正确+过滤通过的替换一条错误 rollout
+        #   'mix'     : 对每题 (n-1) on + 1 rephrase off，两次 rollout + 拼接（不用 n_off）
+        # 向后兼容：旧的 summarize_replace=True（且未显式设 summarize_normal_mode）等价于 'replace'。
+        summarize_normal_mode = self.config.actor_rollout_ref.rollout.get(
+            'summarize_normal_mode', None
+        )
+        if summarize_normal_mode is None:
+            summarize_normal_mode = (
+                'replace'
+                if self.config.actor_rollout_ref.rollout.get('summarize_replace', False)
+                else 'none'
+            )
+        if summarize_normal_mode not in ('none', 'replace', 'mix'):
+            raise ValueError(
+                f"summarize_normal_mode must be one of none/replace/mix, got {summarize_normal_mode!r}"
+            )
+        # summarize_mix（normal-step，每题 (n-1) on + 1 rephrase off）：独立路径，不用 n_off。
+        # on rollout 只生成 (n-1) 条短 prompt；生成后 postprocess 用长 summarize prompt 再采
+        # 1 条 off、重建成短 prompt 行、按 interleaved 拼成每题 n 行。summarize_mix_short_prompts
+        # 是改造前的原始短 prompt 快照，供 postprocess 作 loss_prompts（此时 gen_batch.input_ids
+        # 还是纯 prompt，repeat 后即被拼接污染，故须先存）。None 表示不走该路径。
+        summarize_mix_short_prompts = None
+        summarize_mix_on = (not is_failure_recycle_step) and summarize_normal_mode == 'mix'
+        if summarize_mix_on:
+            summarize_mix_short_prompts = gen_batch.batch['input_ids'].clone()  # [B, L_short]
+            gen_batch = gen_batch.repeat(repeat_times=n_total - 1, interleave=True)
+            manual_repeat = True  # on 只生成 (n-1) 条，跳过 :1965 默认 repeat
         if is_failure_recycle_step:
             if 'se_input_ids' in batch.batch and self.config.actor_rollout_ref.rollout.n_se>0:
                  print(f"Recycle Step: Using se_input_ids for generation.")
@@ -1951,13 +2094,23 @@ class NewRayPPOTrainer(RayPPOTrainer):
                     #为gen_batch-output添加prefix_mask字段，表示哪些response token是离线的
                     gen_batch_output.batch['prefix_mask'] = torch.zeros((gen_batch_output.batch['responses'].size(0), gen_batch_output.batch['responses'].size(1)),
                                        dtype=torch.bool) # empty dummy tensor
-                    # Normal-step only: 对全错题用 summarize prompt[0] 生成候选，
-                    # 正确且过轨迹过滤则以 explain-style off 行替换一条错误 rollout。
-                    # 仅当开关开启且非 recycle step 时运行（extra_step 逻辑完全不受影响）。
-                    if (
-                        not is_failure_recycle_step
-                        and self.config.actor_rollout_ref.rollout.get('summarize_replace', False)
-                    ):
+                    # Normal-step summarize 注入方式由 summarize_normal_mode 单参数控制
+                    # （none/replace/mix，三选一互斥；recycle step 一律不注入）。
+                    # 'mix'：每题 (n-1) on + 1 rephrase off（两次 rollout）。on 批此时是
+                    # [B*(n-1)]，postprocess 用长 summarize prompt 再采 1 条 off，拼成每题 n 行。
+                    if summarize_mix_on:
+                        gen_batch_output = self._summarize_mix_postprocess(
+                            gen_batch=gen_batch,
+                            gen_batch_output=gen_batch_output,
+                            batch=batch,
+                            short_prompts=summarize_mix_short_prompts,
+                            train_batch_size=train_batch_size,
+                            timing_raw=timing_raw,
+                            metrics=metrics,
+                        )
+                    # 'replace'：对全错题用 summarize prompt 生成 K 条候选，挑正确+过轨迹
+                    # 过滤的替换一条错误 rollout。
+                    elif (not is_failure_recycle_step) and summarize_normal_mode == 'replace':
                         gen_batch_output = self._summarize_replace_normal_step(
                             gen_batch=gen_batch,
                             gen_batch_output=gen_batch_output,
@@ -2254,9 +2407,12 @@ class NewRayPPOTrainer(RayPPOTrainer):
                             # Overwrite this row's reward with the format-error value.
                             # The score lives on the last valid response token, matching
                             # MathRewardManager (reward_tensor[i, valid_len-1]).
+                            # mix 例外：off 行未通过时不走 format_error(-1)，而是整条置 0
+                            # （fail_value），看起来就是一条普通答错 rollout——用户要求的
+                            # 「不是过滤的形式，无法通过的 reward 为 0」。
                             valid_len = int(resp_mask_for_tf[i].sum().item())
                             reward_tensor[i, :] = 0
-                            if valid_len > 0:
+                            if valid_len > 0 and not summarize_mix_on:
                                 reward_tensor[i, valid_len - 1] = format_value
                             n_rej += 1
                             reason_counts[reason] = reason_counts.get(reason, 0) + 1
