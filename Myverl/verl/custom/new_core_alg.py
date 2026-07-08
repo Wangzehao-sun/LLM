@@ -610,6 +610,13 @@ def compute_token_on_off_sft_loss(
             n_off_tok = off_clip_region.sum()
             if n_off_tok > 0:
                 off_ratio_scale = ((keep_mask * off_clip_region).sum() / n_off_tok).detach()
+        elif off_policy_reshape == "p_div_p_0.1":
+            # 'p_div_p_0.1'：与 luffy 分支同名同公式。先丢弃 IS ratio、令 off_ratio =
+            # 当前策略概率 prob = exp(log_prob)（带梯度），再做 p/(p+0.1) 整形：
+            #   off_ratio = prob / (prob + 0.1)
+            # 不做 prompt-shift 重要性校正（不除以 old_log_prob / 长 prompt 概率）。
+            off_ratio = torch.exp(log_prob)
+            off_ratio = off_ratio / (off_ratio + 0.1)
 
         # off-policy ratio 整形后、用于日志的均值（仅 off 区域，detach）
         off_ratio_mean = verl_F.masked_mean(off_ratio, off_clip_region).detach()
