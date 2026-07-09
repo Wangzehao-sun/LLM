@@ -95,6 +95,11 @@ _DEFAULT_TRAJ_KEYWORDS = [
     "the reference reasoning",
     "reference reasoning",
     "provided reasoning",
+<<<<<<< HEAD
+=======
+    "based on the reasoning above"
+    "given reasoning",
+>>>>>>> 434cb60f48fa1f57b5af640be8a8930c9cde0825
     "based on the draft",
     "according to the draft",
     "as stated in the draft",
@@ -1131,12 +1136,13 @@ class NewRayPPOTrainer(RayPPOTrainer):
     ) -> DataProto:
         """Normal-step only (与 extra_step / recycle 逻辑完全无关) 的 summarize 替换。
 
-        对当前 normal step 里"全错"(或 accuracy <= accuracy_threshold) 的题目，用其
-        预渲染的 summarize prompt 让当前 actor 生成 **K 条** 候选 (K=summarize_replace_k)：
-        第 k 条用 prompt[min(k, K_data-1)]——数据集渲染多条时取前 K 条不同 prompt，
-        只渲染 1 条时则对该条重复采样 K 次。按 prompt 顺序取 **第一条** 同时满足
-        "reward==success" 且通过 ``_trajectory_filter_reject`` 的候选，用一条 explain-style
-        off-policy 行替换该题的一条错误 rollout：
+        对当前 normal step 里的 **每一道题**，用其预渲染的 summarize prompt 让当前 actor
+        生成 **K 条** 候选 (K=summarize_replace_k)：第 k 条用 prompt[min(k, K_data-1)]——
+        数据集渲染多条时取前 K 条不同 prompt，只渲染 1 条时则对该条重复采样 K 次。按
+        summarize_replace_select 从合格候选（同时满足 "reward==success" 且通过
+        ``_trajectory_filter_reject``）里选一条，用一条 explain-style off-policy 行替换该题
+        **最后一条 rollout**（interleaved 下第 n-1 槽，不管其对错）。某题 K 条候选全不合格
+        则**不替换**（保持该题原始 rollout 不变）。
 
         关于"prefix 最短且正确": 本函数读 `summarize_input_ids`（normal-step 专用的
         **列表**列，与 extra-step 用的单条 `summarize_input_id` 物理隔离）。
@@ -1150,8 +1156,8 @@ class NewRayPPOTrainer(RayPPOTrainer):
             -> loss 端 off_ratio = exp(log_prob_short - log_prob_long) 即 prompt-shift 修正
             (rl-rl 走 off_old_log_probs 替换 old_log_probs；luffy 走 target_probs 分支)。
 
-        其余 on-policy 行 prefix_mask=0，照常走 GRPO。只对全错题生成候选以省算力；
-        某题 K 条候选全不合格则不替换（保持原状，后续被 valid_mask 过滤）。
+        其余 on-policy 行 prefix_mask=0，照常走 GRPO。对每题都生成候选并尝试替换最后一槽；
+        无合格候选的题保持原状。
         """
         if 'summarize_input_ids' not in batch.batch:
             raise ValueError(
@@ -1178,36 +1184,13 @@ class NewRayPPOTrainer(RayPPOTrainer):
             (bn, resp_width), dtype=torch.float32, device=device
         )
 
-        # --- 2. 给 on-policy rollouts 打分，找出全错题 ---
-        def _repeat_nt(nt: dict, times: int) -> dict:
-            out = {}
-            for k, v in nt.items():
-                if isinstance(v, np.ndarray):
-                    out[k] = np.repeat(v, times, axis=0)
-                elif isinstance(v, list):
-                    out[k] = [it for it in v for _ in range(times)]
-                else:
-                    out[k] = v
-            return out
+        # --- 2. 对所有题都做替换：候选题集合 = 全部题 ---
+        #     旧逻辑只挑全错题；现改为每题都生成候选并尝试替换最后一槽。
+        #     不再需要给 on-policy 打分找全错题，省一次 compute_reward。
+        all_q = list(range(train_batch_size))
+        metrics['batch/sr_target_questions'] = len(all_q)
 
-        saved_nt = gen_batch_output.non_tensor_batch
-        gen_batch_output.non_tensor_batch = _repeat_nt(batch.non_tensor_batch, n)
-        on_reward, _ = compute_reward(gen_batch_output, self.reward_fn)
-        gen_batch_output.non_tensor_batch = saved_nt  # 还原，避免污染下游 union
-        on_reward_sum = on_reward.sum(-1).to(device).view(train_batch_size, n)
-
-        acc_thr = self.config.actor_rollout_ref.rollout.get('accuracy_threshold', 0.0)
-        if acc_thr and acc_thr > 0:
-            acc = (on_reward_sum == success_value).float().mean(-1)
-            wrong_q = torch.nonzero(acc <= acc_thr).squeeze(-1).tolist()
-        else:
-            has_succ = (on_reward_sum == success_value).any(-1)
-            wrong_q = torch.nonzero(~has_succ).squeeze(-1).tolist()
-        metrics['batch/sr_wrong_questions'] = len(wrong_q)
-        if not wrong_q:
-            return gen_batch_output
-
-        # --- 3. 每道全错题生成 K 条候选 ---
+        # --- 3. 每道题生成 K 条候选 ---
         #     第 k 条候选用 summarize prompt[min(k, K_data-1)]：
         #       * 数据集渲染多条 -> 前 K 条用不同 prompt（K_data>=K 时取前 K 条）；
         #       * 数据集只有 1 条 -> K 条都用这条，靠采样随机性得到 K 个不同候选；
@@ -1217,10 +1200,10 @@ class NewRayPPOTrainer(RayPPOTrainer):
         K_data = sum_ids.size(1)
         L_long = sum_ids.size(2)
         K = max(1, int(self.config.actor_rollout_ref.rollout.get('summarize_replace_k', 1)))
-        W = len(wrong_q)
-        # 展平成 [W*K, L_long]：行 r = w_idx*K + k -> 第 wrong_q[w_idx] 题的第 k 条候选。
+        W = len(all_q)
+        # 展平成 [W*K, L_long]：行 r = w_idx*K + k -> 第 all_q[w_idx] 题的第 k 条候选。
         long_rows = []
-        for w_idx in wrong_q:
+        for w_idx in all_q:
             for k in range(K):
                 long_rows.append(sum_ids[w_idx, min(k, K_data - 1), :])
         long_prompt = torch.stack(long_rows, dim=0).to(device)  # [W*K, L_long]
@@ -1262,7 +1245,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
             return out
 
         # ground-truth 展平到 W*K：每题 GT 重复 K 次（与候选行一一对应）。
-        flat_gt_idx = [wrong_q[w] for w in range(W) for _ in range(K)]
+        flat_gt_idx = [all_q[w] for w in range(W) for _ in range(K)]
         cand_out.non_tensor_batch = _index_nt(batch.non_tensor_batch, flat_gt_idx)
         cand_reward, _ = compute_reward(cand_out, self.reward_fn)
         cand_reward_sum = cand_reward.sum(-1)                 # [W*K]
@@ -1275,7 +1258,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
 
         # --- 6. 构建 explain-style off 行（短 prompt + 候选 response），展平到 W*K ---
         short_prompts = gen_batch.batch['input_ids'][::n]     # [B, L_short]
-        wq_idx = torch.tensor(wrong_q, device=short_prompts.device)
+        wq_idx = torch.tensor(all_q, device=short_prompts.device)
         # 每题短 prompt 重复 K 次，与 W*K 候选对齐。
         short_wk = short_prompts[wq_idx].repeat_interleave(K, dim=0).to(device)  # [W*K, L_short]
         off_batch = self._build_hybrid_off_policy_output(
@@ -1303,11 +1286,12 @@ class NewRayPPOTrainer(RayPPOTrainer):
         cand_logp_mean = (long_log_prob * cand_valid).sum(-1) / (cand_valid.sum(-1) + 1e-8)  # [W*K]
         sr_select = self.config.actor_rollout_ref.rollout.get('summarize_replace_select', 'shortest')
 
-        # --- 7. 每题挑一条合格候选，替换其一条错误 rollout ---
+        # --- 7. 每题挑一条合格候选，替换其最后一条 rollout（固定第 n-1 槽）---
         #     select='shortest'（默认）：按 k 升序取第一条合格＝prefix 最短。
         #     select='logp'：合格候选里取 long_log_prob 序列平均最大的（最亲和当前策略）。
+        #     合格判据：reward==success 且通过轨迹过滤；无合格候选则不替换。
         n_acc = n_rej_inc = n_rej_flt = n_no_cand = 0
-        for w_idx, p in enumerate(wrong_q):
+        for w_idx, p in enumerate(all_q):
             chosen = -1  # off_batch 内（W*K 展平）被选中的行
             best_score = float('-inf')
             for k in range(K):
@@ -1331,11 +1315,8 @@ class NewRayPPOTrainer(RayPPOTrainer):
             if chosen < 0:
                 n_no_cand += 1
                 continue
-            wrong_local = torch.nonzero(on_reward_sum[p] != success_value).squeeze(-1)
-            if wrong_local.numel() == 0:
-                continue
-            last_wrong = int(wrong_local[-1].item())
-            ti = p * n + last_wrong
+            # 固定替换每题最后一条 rollout（interleaved 下第 n-1 槽），不管其对错。
+            ti = p * n + (n - 1)
             for key in off_batch.batch.keys():
                 if key in gen_batch_output.batch.keys():
                     dst = gen_batch_output.batch[key]
@@ -1348,7 +1329,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
         metrics['batch/sr_rej_incorrect'] = n_rej_inc
         metrics['batch/sr_rej_filter'] = n_rej_flt
         print(
-            f"[summarize_replace] wrong={W}, K={K}, accepted={n_acc}, "
+            f"[summarize_replace] questions={W}, K={K}, accepted={n_acc}, "
             f"no_candidate={n_no_cand}, rej_incorrect={n_rej_inc}, rej_filter={n_rej_flt}"
         )
         return gen_batch_output
