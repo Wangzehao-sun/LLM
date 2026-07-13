@@ -13,6 +13,10 @@ normal-step paths never share data:
       grouped by ``--batch-size`` (row ``i`` -> step ``i // batch_size``) and the
       ratio falls linearly from ``--ratio-start`` to ``--ratio-end`` over the
       whole dataset. Assumes the trainer reads rows in order with shuffle off.
+    - ``random``: each row draws its prefix ratio independently and uniformly
+      from ``[--ratio-min, --ratio-max]`` (seeded by ``--seed`` for
+      reproducibility). Use this to diversify the recycle draft length per
+      question instead of a single fixed ratio.
 
 * ``summarize_prompts`` (length-K array, prefix ASCENDING): the prompt list
   consumed by the normal-step summarize_replace path, which scans in order and
@@ -101,8 +105,8 @@ DEFAULT_TEMPLATE1 = (
     "[Your solution]"
 )
 
-DEFAULT_TEMPLATE = (
-    "You are given a [Problem] and a [Noisy Reasoning Draft].\n\n"
+DEFAULT_TEMPLATE2 = (
+    "You are given a [Problem] and a [Partial Reasoning Draft].\n\n"
     "Your task is to write one complete, self-contained solution. "
     "Use the [Reference Reasoning Draft] as private mathematical guidance: understand its reasoning process, "
     "extract the useful and valid reasoning steps, and reconstruct them in your own step-by-step problem-solving style. "
@@ -122,6 +126,32 @@ DEFAULT_TEMPLATE = (
     "If the draft contains an obvious mathematical mistake, correct it silently and continue with a valid derivation. " 
     "Add any necessary new valid steps to complete the derivation and reach the final answer.\n"
     "5. Please reason step by step, and put your final answer within \\boxed{{}}."
+    "## Problem:\n{question}\n\n"
+    "## Reference Reasoning Draft:\n{prefix}\n\n"
+    "## Your solution:"
+)
+
+DEFAULT_TEMPLATE = (
+    "You are given a [Problem] and a [Noisy Reasoning Draft].\n\n"
+    "Your task is to write one complete, self-contained solution. "
+    "Use the [Reference Reasoning Draft] as private mathematical guidance: understand its reasoning process, "
+    "extract the useful and valid reasoning steps, and reconstruct them in your own step-by-step problem-solving style. "
+    "Then continue the derivation naturally until the problem is fully solved. "
+    "The final output should be a standard, well-organized solution to the problem, not a commentary on the draft.\n"
+    "## Strict requirements:\n" 
+    "1. Use the Reference Reasoning Draft as private mathematical guidance. " 
+    "Understand its reasoning process, extract its useful and valid steps, and rewrite them in your own step-by-step problem-solving style, as if solving the problem directly.\n" 
+    "Do not explicitly mention the draft, the prefix, or that any prior reasoning was provided. " 
+    "2. Reconstruct the reasoning rather than merely paraphrasing it. " 
+    "In the reconstructed part, preserve as many valid reasoning steps from the draft as possible, including important equations, intermediate conclusions, and useful verification or correction steps. " 
+    "For each reconstructed step, explain the reasoning in your own words rather than merely copying the draft's wording."
+    "The reasoning should be reorganized into a clear, coherent, and natural solution.\n" 
+    "3. Do not summarize, compress, or skip the draft's valid reasoning steps. " 
+    "For each step of the derivation, explain the underlying mathematical reasoning in your own words rather than only stating the result.\n" 
+    "4. Continue naturally from the reconstructed reasoning. " 
+    "Add any necessary new valid steps to complete the derivation and reach the final answer. "
+    "If the draft contains an obvious mathematical mistake, correct it silently and continue with a valid derivation.\n" 
+    "5. Please reason step by step, and put your final answer within \\boxed{{}}.\n"
     "## Problem:\n{question}\n\n"
     "## Reference Reasoning Draft:\n{prefix}\n\n"
     "## Your solution:"
@@ -496,14 +526,36 @@ def main() -> None:
     # ---- single column (summarize_prompt, for extra-step / recycle) ----
     parser.add_argument(
         "--single-mode",
-        choices=["full", "progressive"],
+        choices=["full", "progressive", "random"],
         default="full",
         help="How to build the SINGLE prompt column 'summarize_prompt' (extra-step). "
              "full: prefix = a fixed --full-ratio fraction of the answer-truncated "
              "reasoning (same for every row). progressive: the fraction DECREASES "
              "per training step -- row i uses step i // --batch-size, ratio linearly "
              "from --ratio-start down to --ratio-end across the dataset (assumes the "
-             "trainer reads rows in order with shuffle off).",
+             "trainer reads rows in order with shuffle off). random: each row draws "
+             "its ratio uniformly from [--ratio-min, --ratio-max] (seeded by --seed).",
+    )
+    parser.add_argument(
+        "--ratio-min",
+        type=float,
+        default=0.4,
+        help="Only used in --single-mode random. Lower bound (inclusive) of the "
+             "uniform prefix-ratio range. Must satisfy 0 < ratio-min <= ratio-max <= 1.",
+    )
+    parser.add_argument(
+        "--ratio-max",
+        type=float,
+        default=0.8,
+        help="Only used in --single-mode random. Upper bound (inclusive) of the "
+             "uniform prefix-ratio range.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Only used in --single-mode random. RNG seed for reproducible per-row "
+             "ratio sampling.",
     )
     parser.add_argument(
         "--full-ratio",
@@ -592,6 +644,11 @@ def main() -> None:
             raise SystemExit(
                 "--single-mode progressive expects 0 <= --ratio-end <= --ratio-start <= 1"
             )
+    if args.single_mode == "random":
+        if not (0.0 < args.ratio_min <= args.ratio_max <= 1.0):
+            raise SystemExit(
+                "--single-mode random expects 0 < --ratio-min <= --ratio-max <= 1"
+            )
 
     # list-column validation: parse + sort ratios ascending
     list_ratios: List[float] = []
@@ -635,7 +692,8 @@ def main() -> None:
 
     # Per-row single_ratio. For single-mode full every row shares args.full_ratio;
     # for progressive each row gets a step-decreasing ratio (row i -> step
-    # i // batch_size, ratio linear from ratio_start to ratio_end).
+    # i // batch_size, ratio linear from ratio_start to ratio_end);
+    # for random each row draws uniformly from [ratio_min, ratio_max].
     if args.single_mode == "progressive":
         row_ratios = compute_progressive_ratios(
             len(records), args.batch_size, args.ratio_start, args.ratio_end
@@ -645,6 +703,15 @@ def main() -> None:
             f"     progressive single: {len(records)} rows / batch_size "
             f"{args.batch_size} = {n_steps} steps; ratio {args.ratio_start} -> "
             f"{args.ratio_end}"
+        )
+    elif args.single_mode == "random":
+        rng = np.random.default_rng(args.seed)
+        row_ratios = rng.uniform(
+            args.ratio_min, args.ratio_max, size=len(records)
+        ).tolist()
+        print(
+            f"     random single: {len(records)} rows; ratio ~ U[{args.ratio_min}, "
+            f"{args.ratio_max}] (seed={args.seed})"
         )
     else:
         row_ratios = [args.full_ratio] * len(records)
