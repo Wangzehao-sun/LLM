@@ -102,14 +102,14 @@ DEFAULT_TEMPLATE1 = (
 )
 
 DEFAULT_TEMPLATE = (
-    "You are given a [Problem] and a [Partial Reasoning Draft].\n\n"
+    "You are given a [Problem] and a [Noisy Reasoning Draft].\n\n"
     "Your task is to write one complete, self-contained solution. "
-    "Use the [Partial Reasoning Draft] as private mathematical guidance: understand its reasoning process, "
+    "Use the [Reference Reasoning Draft] as private mathematical guidance: understand its reasoning process, "
     "extract the useful and valid reasoning steps, and reconstruct them in your own step-by-step problem-solving style. "
     "Then continue the derivation naturally until the problem is fully solved. "
     "The final output should be a standard, well-organized solution to the problem, not a commentary on the draft.\n"
     "## Strict requirements:\n" 
-    "1. Use the Partial Reasoning Draft as private mathematical guidance. " 
+    "1. Use the Reference Reasoning Draft as private mathematical guidance. " 
     "Understand its reasoning process, extract its useful and valid steps, and rewrite them in your own step-by-step problem-solving style, as if solving the problem directly.\n" 
     "Do not explicitly mention the draft, the prefix, or that any prior reasoning was provided. " 
     "2. Reconstruct the reasoning rather than merely paraphrasing it. " 
@@ -123,7 +123,7 @@ DEFAULT_TEMPLATE = (
     "Add any necessary new valid steps to complete the derivation and reach the final answer.\n"
     "5. Please reason step by step, and put your final answer within \\boxed{{}}."
     "## Problem:\n{question}\n\n"
-    "## Partial Reasoning Draft:\n{prefix}\n\n"
+    "## Reference Reasoning Draft:\n{prefix}\n\n"
     "## Your solution:"
 )
 

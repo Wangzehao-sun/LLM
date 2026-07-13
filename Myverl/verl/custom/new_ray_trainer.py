@@ -95,11 +95,8 @@ _DEFAULT_TRAJ_KEYWORDS = [
     "the reference reasoning",
     "reference reasoning",
     "provided reasoning",
-<<<<<<< HEAD
-=======
-    "based on the reasoning above"
+    "based on the reasoning above",
     "given reasoning",
->>>>>>> 434cb60f48fa1f57b5af640be8a8930c9cde0825
     "based on the draft",
     "according to the draft",
     "as stated in the draft",
