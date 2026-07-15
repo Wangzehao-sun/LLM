@@ -1105,10 +1105,12 @@ class NewRayPPOTrainer(RayPPOTrainer):
     ) -> DataProto:
         """Normal-step only (与 extra_step / recycle 逻辑完全无关) 的 summarize 替换。
 
-        对当前 normal step 里的 **每一道题**，用其预渲染的 summarize prompt 让当前 actor
-        生成 **K 条** 候选 (K=summarize_replace_k)：第 k 条用 prompt[min(k, K_data-1)]——
-        数据集渲染多条时取前 K 条不同 prompt，只渲染 1 条时则对该条重复采样 K 次。按
-        summarize_replace_select 从合格候选（同时满足 "reward==success" 且通过
+        候选题集合由 ``summarize_replace`` 控制：'all' 对**每一道题**都生成候选并替换；
+        'wrong_only' 先给 on-policy rollout 打分，只对"全错"(或 accuracy <=
+        accuracy_threshold) 的题生成候选、替换（'off' 时本函数根本不会被调用）。选定题集后，用其预渲染的 summarize prompt
+        让当前 actor 生成 **K 条** 候选 (K=summarize_replace_k)：第 k 条用 prompt[min(k,
+        K_data-1)]——数据集渲染多条时取前 K 条不同 prompt，只渲染 1 条时则对该条重复采样
+        K 次。按 summarize_replace_select 从合格候选（同时满足 "reward==success" 且通过
         ``_trajectory_filter_reject``）里选一条，用一条 explain-style off-policy 行替换该题
         **最后一条 rollout**（interleaved 下第 n-1 槽，不管其对错）。某题 K 条候选全不合格
         则**不替换**（保持该题原始 rollout 不变）。
@@ -1153,10 +1155,48 @@ class NewRayPPOTrainer(RayPPOTrainer):
             (bn, resp_width), dtype=torch.float32, device=device
         )
 
-        # --- 2. 对所有题都做替换：候选题集合 = 全部题 ---
-        #     旧逻辑只挑全错题；现改为每题都生成候选并尝试替换最后一槽。
-        #     不再需要给 on-policy 打分找全错题，省一次 compute_reward。
-        all_q = list(range(train_batch_size))
+        # --- 2. 决定候选题集合：全部题 或 只全错题（由 summarize_replace 控制）---
+        #     'all'：每题都生成候选并尝试替换最后一槽（省一次 compute_reward）。
+        #     'wrong_only'：先给 on-policy rollout 打分，只对"全错"(或 accuracy <=
+        #                   accuracy_threshold) 的题生成候选、替换（省算力）。
+        #     向后兼容：旧的 summarize_replace=True 等价于 'all'。
+        sr_target = self.config.actor_rollout_ref.rollout.get('summarize_replace', 'all')
+        if sr_target is True:
+            sr_target = 'all'
+        if sr_target not in ('all', 'wrong_only'):
+            raise ValueError(
+                f"summarize_replace must be 'all' or 'wrong_only' when replacing, got {sr_target!r}"
+            )
+        if sr_target == 'wrong_only':
+            def _repeat_nt(nt: dict, times: int) -> dict:
+                out = {}
+                for k, v in nt.items():
+                    if isinstance(v, np.ndarray):
+                        out[k] = np.repeat(v, times, axis=0)
+                    elif isinstance(v, list):
+                        out[k] = [it for it in v for _ in range(times)]
+                    else:
+                        out[k] = v
+                return out
+
+            saved_nt = gen_batch_output.non_tensor_batch
+            gen_batch_output.non_tensor_batch = _repeat_nt(batch.non_tensor_batch, n)
+            on_reward, _ = compute_reward(gen_batch_output, self.reward_fn)
+            gen_batch_output.non_tensor_batch = saved_nt  # 还原，避免污染下游 union
+            on_reward_sum = on_reward.sum(-1).to(device).view(train_batch_size, n)
+
+            acc_thr = self.config.actor_rollout_ref.rollout.get('accuracy_threshold', 0.0)
+            if acc_thr and acc_thr > 0:
+                acc = (on_reward_sum == success_value).float().mean(-1)
+                all_q = torch.nonzero(acc <= acc_thr).squeeze(-1).tolist()
+            else:
+                has_succ = (on_reward_sum == success_value).any(-1)
+                all_q = torch.nonzero(~has_succ).squeeze(-1).tolist()
+            metrics['batch/sr_wrong_questions'] = len(all_q)
+            if not all_q:
+                return gen_batch_output
+        else:
+            all_q = list(range(train_batch_size))
         metrics['batch/sr_target_questions'] = len(all_q)
 
         # --- 3. 每道题生成 K 条候选 ---
@@ -1897,13 +1937,17 @@ class NewRayPPOTrainer(RayPPOTrainer):
                     #为gen_batch-output添加prefix_mask字段，表示哪些response token是离线的
                     gen_batch_output.batch['prefix_mask'] = torch.zeros((gen_batch_output.batch['responses'].size(0), gen_batch_output.batch['responses'].size(1)),
                                        dtype=torch.bool) # empty dummy tensor
-                    # Normal-step only: 对全错题用 summarize prompt[0] 生成候选，
-                    # 正确且过轨迹过滤则以 explain-style off 行替换一条错误 rollout。
-                    # 仅当开关开启且非 recycle step 时运行（extra_step 逻辑完全不受影响）。
-                    if (
-                        not is_failure_recycle_step
-                        and self.config.actor_rollout_ref.rollout.get('summarize_replace', False)
-                    ):
+                    # Normal-step only: 对目标题用 summarize prompt 生成候选，正确且过
+                    # 轨迹过滤则以 explain-style off 行替换其最后一条 rollout。仅当非 recycle
+                    # step 且 summarize_replace != 'off' 时运行（extra_step 逻辑不受影响）。
+                    # summarize_replace: 'off'(默认,不替换) / 'all'(每题) / 'wrong_only'(仅全错题)。
+                    # 向后兼容：旧的 summarize_replace=True 等价于 'all'，False 等价于 'off'。
+                    _sr_mode = self.config.actor_rollout_ref.rollout.get('summarize_replace', False)
+                    if _sr_mode is True:
+                        _sr_mode = 'all'
+                    elif _sr_mode is False:
+                        _sr_mode = 'off'
+                    if (not is_failure_recycle_step) and _sr_mode != 'off':
                         gen_batch_output = self._summarize_replace_normal_step(
                             gen_batch=gen_batch,
                             gen_batch_output=gen_batch_output,
