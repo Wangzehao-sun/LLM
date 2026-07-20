@@ -163,6 +163,27 @@ def _trajectory_filter_reject(text: str, cfg: dict):
     if n_sub and re.search(r"(.{2,20}?)\1{%d,}" % (int(n_sub) - 1), text):
         return True, "noise_substr"
     return False, ""
+
+
+def _index_nt(nt: dict, idx: list) -> dict:
+    """Row-index a non_tensor_batch dict by a list of positions.
+
+    ndarray values are fancy-indexed, list values are list-comprehended, and
+    scalars/other values are passed through unchanged. Used to align a
+    per-question ground-truth (and other meta) to a flattened [W*K] candidate
+    layout for reward scoring.
+    """
+    out = {}
+    for k, v in nt.items():
+        if isinstance(v, np.ndarray):
+            out[k] = v[idx]
+        elif isinstance(v, list):
+            out[k] = [v[i] for i in idx]
+        else:
+            out[k] = v
+    return out
+
+
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl", multi_turn=False):
     """Apply KL penalty to the token-level rewards.
 
@@ -462,6 +483,37 @@ class NewRayPPOTrainer(RayPPOTrainer):
                                          shuffle=False,
                                          drop_last=True,
                                          collate_fn=defaultcollate_fn if collate_fn is None else collate_fn,)
+
+        # ---- 固定 summarize-val 子集（可选，观测 rephraser/summarize 能力漂移）----
+        # 仅当 data.summarize_val_files 配置时启用；否则 dataloader 为 None，
+        # _validate_summarize 会静默跳过（不影响任何原有流程）。用带 use_summarize
+        # 的 RLHFDatasetWithTarget，产出 summarize_input_ids [K_val, L_long]。
+        self.summarize_val_dataloader = None
+        sv_files = self.config.data.get('summarize_val_files', None)
+        if sv_files:
+            summarize_val_k = self.config.data.get('summarize_val_k', 8)
+            self.summarize_val_dataset = RLHFDatasetWithTarget(
+                parquet_files=sv_files,
+                tokenizer=self.tokenizer,
+                config=self.config.data,
+                max_target_length=self.config.actor_rollout_ref.rollout.max_prefix_len,
+                use_se=False,
+                use_summarize=True,
+                summarize_prompts_key=self.config.data.get('summarize_prompts_key', 'summarize_prompts'),
+                summarize_prompt_key=self.config.data.get('summarize_prompt_key', 'summarize_prompt'),
+                max_summarize_prompts=summarize_val_k,
+                max_summarize_length=self.config.data.get('max_summarize_length', 8192),
+            )
+            self.summarize_val_dataloader = StatefulDataLoader(
+                dataset=self.summarize_val_dataset,
+                batch_size=self.config.data.get('summarize_val_batch_size', 128),
+                num_workers=self.config.data.get("dataloader_num_workers", 8),
+                shuffle=False,
+                drop_last=False,
+                collate_fn=defaultcollate_fn if collate_fn is None else collate_fn,
+            )
+            print(f"Size of summarize-val dataloader: {len(self.summarize_val_dataloader)} "
+                  f"(rows={len(self.summarize_val_dataset)}, k={summarize_val_k})")
 
         assert len(self.train_dataloader) >= 1, "Train dataloader is empty!"
         assert len(self.val_dataloader) >= 1, "Validation dataloader is empty!"
@@ -1254,17 +1306,6 @@ class NewRayPPOTrainer(RayPPOTrainer):
             del _lp
 
         # --- 5. 候选打分 + 轨迹过滤（按 W*K 展平，每行一条候选）---
-        def _index_nt(nt: dict, idx: list) -> dict:
-            out = {}
-            for k, v in nt.items():
-                if isinstance(v, np.ndarray):
-                    out[k] = v[idx]
-                elif isinstance(v, list):
-                    out[k] = [v[i] for i in idx]
-                else:
-                    out[k] = v
-            return out
-
         # ground-truth 展平到 W*K：每题 GT 重复 K 次（与候选行一一对应）。
         flat_gt_idx = [all_q[w] for w in range(W) for _ in range(K)]
         cand_out.non_tensor_batch = _index_nt(batch.non_tensor_batch, flat_gt_idx)
@@ -1366,6 +1407,81 @@ class NewRayPPOTrainer(RayPPOTrainer):
         )
         return gen_batch_output
 
+    @torch.no_grad()
+    def _validate_summarize(self) -> dict:
+        """固定 summarize-val 子集上的 rephraser 准确率（口径 A：单一整体均值）。
+
+        对每题在其 summarize prompt 下生成 K_val 条候选（默认 1），用与训练同一套
+        reward 打分，统计 (reward==success) 的候选占比。数据与温度都固定，故该值随
+        step 的变化纯粹反映模型在 summarize prompt 下的解题能力漂移。
+
+        与 _summarize_replace_normal_step 的区别：不做替换、不算 log_prob、不过轨迹
+        过滤、不建 off 行——只 generate + score。未配置 summarize_val_files 时返回 {}，
+        不影响任何原有流程。
+        """
+        if getattr(self, "summarize_val_dataloader", None) is None:
+            return {}
+
+        pad_token_id = self.tokenizer.pad_token_id
+        success_value = 1
+        reward_fn = self.val_reward_fn if self.val_reward_fn is not None else self.reward_fn
+        n_correct = 0
+        n_total = 0
+
+        for data in self.summarize_val_dataloader:
+            batch = DataProto.from_single_dict(data)
+            sum_ids = batch.batch['summarize_input_ids']          # [B, K, L_long]
+            B, K, L_long = sum_ids.shape
+            long_prompt = sum_ids.reshape(B * K, L_long)          # 行 r = b*K + k
+            long_attn, long_pos = generate_masks_from_input_ids(
+                long_prompt, pad_token_id, long_prompt.dtype
+            )
+            cand_gen = DataProto.from_single_dict({
+                'input_ids': long_prompt,
+                'attention_mask': long_attn,
+                'position_ids': long_pos,
+            })
+            cand_gen.meta_info = {
+                "eos_token_id": self.tokenizer.eos_token_id,
+                "pad_token_id": pad_token_id,
+                "recompute_log_prob": False,
+                "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
+                "temperature": self.config.actor_rollout_ref.rollout.val_kwargs.temperature,
+                "validate": True,
+                "is_se": False,
+                "is_extra": False,
+            }
+
+            # pad 到 dp world_size 整除（SR 训练路径靠 batch 恰好可整除才免 pad；
+            # val 的 batch/GPU 数任意，必须 pad，与父类 _validate 同款）。
+            cand_gen_padded, pad_size = pad_dataproto_to_divisor(
+                cand_gen, self.actor_rollout_wg.world_size
+            )
+            if not self.async_rollout_mode:
+                cand_out_padded = self.actor_rollout_wg.generate_sequences(cand_gen_padded)
+            else:
+                self.async_rollout_manager.wake_up()
+                cand_out_padded = self.async_rollout_manager.generate_sequences(cand_gen_padded)
+                self.async_rollout_manager.sleep()
+            cand_out = unpad_dataproto(cand_out_padded, pad_size=pad_size)
+            cand_out.meta_info.pop("timing", None)
+
+            # GT 展平到 B*K（每题 reward_model 等重复 K 次），复用训练 reward 路径打分。
+            flat_gt_idx = [b for b in range(B) for _ in range(K)]
+            cand_out.non_tensor_batch = _index_nt(batch.non_tensor_batch, flat_gt_idx)
+            cand_reward, _ = compute_reward(cand_out, reward_fn)
+            cand_reward_sum = cand_reward.sum(-1)                 # [B*K]
+            n_correct += int((cand_reward_sum == success_value).sum().item())
+            n_total += B * K
+
+        acc = n_correct / max(1, n_total)
+        print(f"[validate_summarize] acc={acc:.4f} ({n_correct}/{n_total})")
+        return {
+            "val_summarize/acc": acc,
+            "val_summarize/n": n_total,
+            "val_summarize/k": self.config.data.get('summarize_val_k', 8),
+        }
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1402,6 +1518,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
+            val_metrics.update(self._validate_summarize())
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
@@ -2783,6 +2900,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
             if not is_failure_recycle_step and self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0):
                 with marked_timer("testing", timing_raw, color="green"):
                     val_metrics: dict = self._validate()
+                    val_metrics.update(self._validate_summarize())
                     if is_last_step:
                         last_val_metrics = val_metrics
                 metrics.update(val_metrics)
