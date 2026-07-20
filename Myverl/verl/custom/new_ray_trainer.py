@@ -76,7 +76,9 @@ import re
 
 # ---------------------------------------------------------------------------
 # Trajectory filter for rewritten (off-policy / summarize) rollouts.
-# Implements the paper's "Rule of Trajectory Filter" (minus the >6K length rule):
+# Implements the paper's "Rule of Trajectory Filter":
+#   - reject responses that are too short (opt-in via min_length_chars; a short
+#     response is likely a direct prefix continuation, not a real re-solve)
 #   - reject responses that still reference the draft / experience (keywords)
 #   - reject responses that restate the summarize-template instructions
 #   - reject noisy responses with long runs of repeated chars / substrings
@@ -134,12 +136,19 @@ def _trajectory_filter_reject(text: str, cfg: dict):
     """Return (reject: bool, reason: str) for a rewritten-trajectory response.
 
     cfg keys (all optional, sensible defaults baked in):
+      min_length_chars    : int      -> reject if the response is shorter than N
+                                          chars (default 200; likely a direct
+                                          continuation of the prefix rather than
+                                          a real re-solve)
       keywords            : list[str]  -> reject if any appears (case-insensitive)
       instruction_phrases : list[str]  -> reject if any appears (restates the
                                           summarize template)
       max_repeated_char_run : int      -> reject if a single char repeats >= N times
       max_repeated_substr   : int      -> reject if a 2-20 char block repeats >= K times
     """
+    n_min_len = cfg.get("min_length_chars", 200)
+    if n_min_len and len(text) < int(n_min_len):
+        return True, "too_short"
     low = text.lower()
     for kw in cfg.get("keywords", _DEFAULT_TRAJ_KEYWORDS):
         if kw.lower() in low:
@@ -1167,6 +1176,9 @@ class NewRayPPOTrainer(RayPPOTrainer):
             raise ValueError(
                 f"summarize_replace must be 'all' or 'wrong_only' when replacing, got {sr_target!r}"
             )
+        # on-policy 每题每条 rollout 的 reward 和 [B, n]（仅 wrong_only 分支会算；
+        # 'all' 模式为 None）。替换阶段用它优先替换一条"错误"rollout 而非固定末槽。
+        on_reward_sum = None
         if sr_target == 'wrong_only':
             def _repeat_nt(nt: dict, times: int) -> dict:
                 out = {}
@@ -1328,8 +1340,15 @@ class NewRayPPOTrainer(RayPPOTrainer):
             if chosen < 0:
                 n_no_cand += 1
                 continue
-            # 固定替换每题最后一条 rollout（interleaved 下第 n-1 槽），不管其对错。
-            ti = p * n + (n - 1)
+            # 选择被替换的槽位（interleaved 下第 p*n + slot）：
+            #   优先替换一条"错误"rollout（on_reward_sum 可用时，取该题第一条非 success
+            #   的槽），避免覆盖掉组内仅有的正样本；无 reward 信息或该题全对时回退到末槽。
+            slot = n - 1
+            if on_reward_sum is not None:
+                wrong_slots = (on_reward_sum[p] != success_value).nonzero().squeeze(-1)
+                if wrong_slots.numel() > 0:
+                    slot = int(wrong_slots[0].item())
+            ti = p * n + slot
             for key in off_batch.batch.keys():
                 if key in gen_batch_output.batch.keys():
                     dst = gen_batch_output.batch[key]
