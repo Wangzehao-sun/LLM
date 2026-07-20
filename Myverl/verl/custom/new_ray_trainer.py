@@ -76,7 +76,9 @@ import re
 
 # ---------------------------------------------------------------------------
 # Trajectory filter for rewritten (off-policy / summarize) rollouts.
-# Implements the paper's "Rule of Trajectory Filter" (minus the >6K length rule):
+# Implements the paper's "Rule of Trajectory Filter":
+#   - reject responses that are too short (opt-in via min_length_chars; a short
+#     response is likely a direct prefix continuation, not a real re-solve)
 #   - reject responses that still reference the draft / experience (keywords)
 #   - reject responses that restate the summarize-template instructions
 #   - reject noisy responses with long runs of repeated chars / substrings
@@ -134,12 +136,19 @@ def _trajectory_filter_reject(text: str, cfg: dict):
     """Return (reject: bool, reason: str) for a rewritten-trajectory response.
 
     cfg keys (all optional, sensible defaults baked in):
+      min_length_chars    : int      -> reject if the response is shorter than N
+                                          chars (default 200; likely a direct
+                                          continuation of the prefix rather than
+                                          a real re-solve)
       keywords            : list[str]  -> reject if any appears (case-insensitive)
       instruction_phrases : list[str]  -> reject if any appears (restates the
                                           summarize template)
       max_repeated_char_run : int      -> reject if a single char repeats >= N times
       max_repeated_substr   : int      -> reject if a 2-20 char block repeats >= K times
     """
+    n_min_len = cfg.get("min_length_chars", 200)
+    if n_min_len and len(text) < int(n_min_len):
+        return True, "too_short"
     low = text.lower()
     for kw in cfg.get("keywords", _DEFAULT_TRAJ_KEYWORDS):
         if kw.lower() in low:
