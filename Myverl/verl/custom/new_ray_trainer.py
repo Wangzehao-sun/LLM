@@ -1176,6 +1176,9 @@ class NewRayPPOTrainer(RayPPOTrainer):
             raise ValueError(
                 f"summarize_replace must be 'all' or 'wrong_only' when replacing, got {sr_target!r}"
             )
+        # on-policy 每题每条 rollout 的 reward 和 [B, n]（仅 wrong_only 分支会算；
+        # 'all' 模式为 None）。替换阶段用它优先替换一条"错误"rollout 而非固定末槽。
+        on_reward_sum = None
         if sr_target == 'wrong_only':
             def _repeat_nt(nt: dict, times: int) -> dict:
                 out = {}
@@ -1337,8 +1340,15 @@ class NewRayPPOTrainer(RayPPOTrainer):
             if chosen < 0:
                 n_no_cand += 1
                 continue
-            # 固定替换每题最后一条 rollout（interleaved 下第 n-1 槽），不管其对错。
-            ti = p * n + (n - 1)
+            # 选择被替换的槽位（interleaved 下第 p*n + slot）：
+            #   优先替换一条"错误"rollout（on_reward_sum 可用时，取该题第一条非 success
+            #   的槽），避免覆盖掉组内仅有的正样本；无 reward 信息或该题全对时回退到末槽。
+            slot = n - 1
+            if on_reward_sum is not None:
+                wrong_slots = (on_reward_sum[p] != success_value).nonzero().squeeze(-1)
+                if wrong_slots.numel() > 0:
+                    slot = int(wrong_slots[0].item())
+            ti = p * n + slot
             for key in off_batch.batch.keys():
                 if key in gen_batch_output.batch.keys():
                     dst = gen_batch_output.batch[key]
