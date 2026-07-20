@@ -1297,6 +1297,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
 
         # --- 7. 每题挑一条合格候选，替换其最后一条 rollout（固定第 n-1 槽）---
         #     select='shortest'（默认）：按 k 升序取第一条合格＝prefix 最短。
+        #     select='longest'：合格候选里取 k 最大的＝prefix 最多（信息最充分的改写）。
         #     select='logp'：合格候选里取 long_log_prob 序列平均最大的（最亲和当前策略）。
         #     合格判据：reward==success 且通过轨迹过滤；无合格候选则不替换。
         n_acc = n_rej_inc = n_rej_flt = n_no_cand = 0
@@ -1318,6 +1319,9 @@ class NewRayPPOTrainer(RayPPOTrainer):
                     s = cand_logp_mean[r].item()
                     if s > best_score:
                         best_score, chosen = s, r
+                elif sr_select == 'longest':
+                    # k 升序遍历，每遇到合格的就更新，遍历完即得 k 最大＝prefix 最多。
+                    chosen = r
                 else:
                     chosen = r
                     break  # 第一条合格的即用（prefix 最短）
