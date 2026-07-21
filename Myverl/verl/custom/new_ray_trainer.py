@@ -1428,9 +1428,21 @@ class NewRayPPOTrainer(RayPPOTrainer):
 
         pad_token_id = self.tokenizer.pad_token_id
         success_value = 1
+        fail_value = 0
+        format_value = -1
         reward_fn = self.val_reward_fn if self.val_reward_fn is not None else self.reward_fn
         n_correct = 0
         n_total = 0
+
+        # 额外统计累积量（跨 batch）：
+        #   solve_*   : 按题分组（每题 K 条候选）——全错 / 恰好一条对 / 全对 / 全格式错
+        #   entropy   : sum(entropy over valid tokens) / total valid tokens
+        #   resp_len  : sum(valid response tokens) / 候选数
+        n_questions = 0
+        solve_none = solve_one = solve_all = solve_none_format = 0
+        ent_sum = 0.0
+        resp_tok_sum = 0
+        loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
 
         # rollout dump（可选）：累积到循环外一次性写，避免同名 {step}.jsonl 被多 batch 覆盖。
         rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
@@ -1483,9 +1495,37 @@ class NewRayPPOTrainer(RayPPOTrainer):
             n_correct += int((cand_reward_sum == success_value).sum().item())
             n_total += B * K
 
+            # ---- response length（有效 response token 数）----
+            cand_resp = cand_out.batch['responses']               # [B*K, w]
+            resp_valid = (cand_resp != pad_token_id)
+            resp_tok_sum += int(resp_valid.sum().item())
+
+            # ---- entropy（forward-only compute_log_prob 的副产物）----
+            _lp = self.actor_rollout_wg.compute_log_prob(cand_out)
+            if 'entropys' in _lp.batch.keys():
+                entropys = _lp.batch['entropys']                  # [B*K, w]
+                ent_mask = resp_valid.to(entropys.dtype)
+                # 用与训练一致的 agg_loss 聚合，再乘 token 数还原成 sum，末尾统一除总 token。
+                _ent_mean = agg_loss(loss_mat=entropys, loss_mask=ent_mask, loss_agg_mode=loss_agg_mode)
+                ent_sum += float(_ent_mean.detach().item()) * int(ent_mask.sum().item())
+            del _lp
+
+            # ---- solve_* 分组统计（每题 K 条候选）----
+            rw = cand_reward_sum.view(B, K)                       # [B, K]
+            for b in range(B):
+                grp = rw[b]
+                n_questions += 1
+                if (grp == fail_value).all():
+                    solve_none += 1
+                elif (grp == format_value).all():
+                    solve_none_format += 1
+                elif (grp == success_value).all():
+                    solve_all += 1
+                elif (grp == success_value).sum() == 1:
+                    solve_one += 1
+
             # ---- 收集 rollout dump 数据（复用父类 _dump_generations 的格式）----
             if rollout_data_dir:
-                cand_resp = cand_out.batch['responses']
                 dump_inputs.extend(
                     self.tokenizer.batch_decode(long_prompt, skip_special_tokens=True)
                 )
@@ -1514,11 +1554,25 @@ class NewRayPPOTrainer(RayPPOTrainer):
             )
 
         acc = n_correct / max(1, n_total)
-        print(f"[validate_summarize] acc={acc:.4f} ({n_correct}/{n_total})")
+        avg_resp_len = resp_tok_sum / max(1, n_total)
+        avg_entropy = ent_sum / max(1, resp_tok_sum)
+        print(
+            f"[validate_summarize] acc={acc:.4f} ({n_correct}/{n_total}), "
+            f"solve_none={solve_none}, solve_one={solve_one}, solve_all={solve_all}, "
+            f"solve_none_format={solve_none_format}, avg_len={avg_resp_len:.1f}, "
+            f"entropy={avg_entropy:.4f}"
+        )
         return {
             "val_summarize/acc": acc,
             "val_summarize/n": n_total,
             "val_summarize/k": self.config.data.get('summarize_val_k', 8),
+            "val_summarize/entropy": avg_entropy,
+            "val_summarize/avg_response_len": avg_resp_len,
+            "val_summarize/solve_none": solve_none,
+            "val_summarize/solve_one": solve_one,
+            "val_summarize/solve_all": solve_all,
+            "val_summarize/solve_none_format": solve_none_format,
+            "val_summarize/n_questions": n_questions,
         }
 
     def fit(self):
