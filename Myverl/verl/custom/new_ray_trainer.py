@@ -1418,6 +1418,10 @@ class NewRayPPOTrainer(RayPPOTrainer):
         与 _summarize_replace_normal_step 的区别：不做替换、不算 log_prob、不过轨迹
         过滤、不建 off 行——只 generate + score。未配置 summarize_val_files 时返回 {}，
         不影响任何原有流程。
+
+        若配置了 trainer.rollout_data_dir，会复用父类 _dump_generations 把候选逐条
+        存成 JSONL（含 input/output/score + reward_model/data_source/uid/target），
+        路径 <rollout_data_dir>/summarize_val/，可直接喂给 Data/visualize_rollouts.py。
         """
         if getattr(self, "summarize_val_dataloader", None) is None:
             return {}
@@ -1427,6 +1431,11 @@ class NewRayPPOTrainer(RayPPOTrainer):
         reward_fn = self.val_reward_fn if self.val_reward_fn is not None else self.reward_fn
         n_correct = 0
         n_total = 0
+
+        # rollout dump（可选）：累积到循环外一次性写，避免同名 {step}.jsonl 被多 batch 覆盖。
+        rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+        dump_inputs, dump_outputs, dump_scores = [], [], []
+        dump_infos = defaultdict(list)
 
         for data in self.summarize_val_dataloader:
             batch = DataProto.from_single_dict(data)
@@ -1473,6 +1482,36 @@ class NewRayPPOTrainer(RayPPOTrainer):
             cand_reward_sum = cand_reward.sum(-1)                 # [B*K]
             n_correct += int((cand_reward_sum == success_value).sum().item())
             n_total += B * K
+
+            # ---- 收集 rollout dump 数据（复用父类 _dump_generations 的格式）----
+            if rollout_data_dir:
+                cand_resp = cand_out.batch['responses']
+                dump_inputs.extend(
+                    self.tokenizer.batch_decode(long_prompt, skip_special_tokens=True)
+                )
+                dump_outputs.extend(
+                    self.tokenizer.batch_decode(cand_resp, skip_special_tokens=True)
+                )
+                dump_scores.extend(cand_reward_sum.cpu().tolist())
+                n_rows = B * K
+                for key in ("reward_model", "data_source", "original_index", "uid", "extra_info"):
+                    if key in cand_out.non_tensor_batch:
+                        col = cand_out.non_tensor_batch[key]
+                        if len(col) == n_rows:
+                            dump_infos[key].extend(
+                                v.item() if hasattr(v, "item") and not isinstance(v, (dict, list)) else v
+                                for v in col
+                            )
+
+        if rollout_data_dir:
+            sv_dir = os.path.join(rollout_data_dir, "summarize_val")
+            self._dump_generations(
+                inputs=dump_inputs,
+                outputs=dump_outputs,
+                scores=dump_scores,
+                reward_extra_infos_dict=dict(dump_infos),
+                dump_path=sv_dir,
+            )
 
         acc = n_correct / max(1, n_total)
         print(f"[validate_summarize] acc={acc:.4f} ({n_correct}/{n_total})")
