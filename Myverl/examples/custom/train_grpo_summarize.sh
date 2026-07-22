@@ -27,6 +27,7 @@ export WANDB_MODE=offline
 
 train_path=$HOME/LLM/Data/deepmath_dgt6_n10000_summarize.parquet
 test_path=$HOME/LLM/Train/data/valid_with_aime25_new.parquet
+summarize_val_path=$HOME/LLM/Data/deepmath_dgt6_summarize_val128.parquet
 test1_path=$HOME/LLM/Train/data/split_by_source_new/aime.parquet
 test2_path=$HOME/LLM/Train/data/split_by_source_new/aime25.parquet
 test3_path=$HOME/LLM/Train/data/split_by_source_new/amc.parquet
@@ -80,6 +81,9 @@ python -m verl.trainer.main_ppo_new \
     +data.summarize_prompt_key=summarize_prompt \
     +data.max_summarize_prompts=8 \
     +data.max_summarize_length=8192 \
+    +data.summarize_val_files="['$summarize_val_path']" \
+    +data.summarize_val_k=8 \
+    +data.summarize_val_batch_size=128 \
     +data.collect_failures=True \
     +data.failure_buffer_max_size=128 \
     +data.n_recycle_failure=3 \
