@@ -6,11 +6,12 @@ already carries the ``summarize_prompts`` column (produced by
 ``_validate_summarize`` to observe the rephraser/summarize accuracy on a
 constant set of questions during RL, isolating ability drift from data drift.
 
-Writes TWO files:
-  1. --output       : the 128-row frozen val subset.
+Writes TWO files (both default to sit next to --input):
+  1. --output       : the 128-row frozen val subset. Defaults to
+                      ``<input_stem>_val<N>.parquet``.
   2. --train-output : the input MINUS those 128 rows, so the val questions are
                       never trained on (zero leakage). Defaults to
-                      ``<input_stem>_excl_val<N>.parquet`` next to the input.
+                      ``<input_stem>_excl_val<N>.parquet``.
 
 Rows without a usable ``summarize_prompts`` array are never picked for the val
 subset (but are kept in the train-output). Both outputs keep the input schema
@@ -37,15 +38,15 @@ import numpy as np
 import pandas as pd
 
 DEFAULT_INPUT = Path("/Users/zenohaoz/LLM/Data/deepmath_dgt6_n10000_summarize.parquet")
-DEFAULT_OUTPUT = Path("/Users/zenohaoz/LLM/Data/deepmath_dgt6_summarize_val128.parquet")
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--input", type=Path, default=DEFAULT_INPUT,
                    help="Source summarize parquet with a summarize_prompts column (default: %(default)s)")
-    p.add_argument("--output", type=Path, default=DEFAULT_OUTPUT,
-                   help="Destination parquet for the frozen val subset (default: %(default)s)")
+    p.add_argument("--output", type=Path, default=None,
+                   help="Destination parquet for the frozen val subset. "
+                        "Defaults to <input_stem>_val<N>.parquet next to the input.")
     p.add_argument("--train-output", type=Path, default=None,
                    help="Destination parquet for the input MINUS the val rows. "
                         "Defaults to <input_stem>_excl_val<N>.parquet next to the input.")
@@ -100,17 +101,22 @@ def main() -> None:
     # 无泄漏自检：val 与 train 行数之和 == 原始行数，且无索引交集。
     assert len(val_df) + len(train_df) == len(df), "row count mismatch after split"
 
+    if args.output is None:
+        out_path = args.input.with_name(f"{args.input.stem}_val{n}.parquet")
+    else:
+        out_path = args.output
+
     if args.train_output is None:
         train_out = args.input.with_name(f"{args.input.stem}_excl_val{n}.parquet")
     else:
         train_out = args.train_output
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     train_out.parent.mkdir(parents=True, exist_ok=True)
-    val_df.to_parquet(args.output, index=False)
+    val_df.to_parquet(out_path, index=False)
     train_df.to_parquet(train_out, index=False)
 
-    print(f"Wrote VAL   {args.output} ({args.output.stat().st_size / 1e6:.2f} MB)")
+    print(f"Wrote VAL   {out_path} ({out_path.stat().st_size / 1e6:.2f} MB)")
     print(f"  rows    : {len(val_df):,}  (seed={args.seed}, frozen)")
     print(f"Wrote TRAIN {train_out} ({train_out.stat().st_size / 1e6:.2f} MB)")
     print(f"  rows    : {len(train_df):,}  (= {len(df):,} input - {len(val_df):,} val)")
