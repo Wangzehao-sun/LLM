@@ -6,10 +6,17 @@ already carries the ``summarize_prompts`` column (produced by
 ``_validate_summarize`` to observe the rephraser/summarize accuracy on a
 constant set of questions during RL, isolating ability drift from data drift.
 
-Rows without a usable ``summarize_prompts`` array are dropped before sampling.
-The output schema is byte-for-byte identical to the input — only rows are
-selected, never altered. A dedicated fixed seed (distinct from the train-filter
-seed) keeps the subset stable across regenerations.
+Writes TWO files:
+  1. --output       : the 128-row frozen val subset.
+  2. --train-output : the input MINUS those 128 rows, so the val questions are
+                      never trained on (zero leakage). Defaults to
+                      ``<input_stem>_excl_val<N>.parquet`` next to the input.
+
+Rows without a usable ``summarize_prompts`` array are never picked for the val
+subset (but are kept in the train-output). Both outputs keep the input schema
+byte-for-byte — only rows are selected/dropped, never altered. A dedicated
+fixed seed (distinct from the train-filter seed) keeps the subset stable
+across regenerations.
 
 CLI:
 
@@ -17,6 +24,7 @@ CLI:
     python Data/prepare_summarize_val.py --num-samples 256
     python Data/prepare_summarize_val.py --input /path/to/summarize.parquet
     python Data/prepare_summarize_val.py --output /path/to/val.parquet
+    python Data/prepare_summarize_val.py --train-output /path/to/train.parquet
     python Data/prepare_summarize_val.py --seed 7
 """
 
@@ -37,7 +45,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--input", type=Path, default=DEFAULT_INPUT,
                    help="Source summarize parquet with a summarize_prompts column (default: %(default)s)")
     p.add_argument("--output", type=Path, default=DEFAULT_OUTPUT,
-                   help="Destination parquet (default: %(default)s)")
+                   help="Destination parquet for the frozen val subset (default: %(default)s)")
+    p.add_argument("--train-output", type=Path, default=None,
+                   help="Destination parquet for the input MINUS the val rows. "
+                        "Defaults to <input_stem>_excl_val<N>.parquet next to the input.")
     p.add_argument("--summarize-prompts-key", type=str, default="summarize_prompts",
                    help="Column holding the rendered summarize prompts (default: %(default)s)")
     p.add_argument("--num-samples", type=int, default=128, help="Rows to sample (default: %(default)s)")
@@ -70,26 +81,42 @@ def main() -> None:
             "Run Data/prepare_summarize_prompts.py first."
         )
 
-    mask = df[args.summarize_prompts_key].apply(_has_prompt)
-    filtered = df[mask].reset_index(drop=True)
-    print(f"Rows with usable '{args.summarize_prompts_key}': {len(filtered):,}")
+    # 只从"有可用 summarize_prompts"的行里抽 val；保留原始行索引以便从 df 精确剔除。
+    eligible = df[df[args.summarize_prompts_key].apply(_has_prompt)]
+    print(f"Rows with usable '{args.summarize_prompts_key}': {len(eligible):,}")
 
-    if len(filtered) == 0:
+    if len(eligible) == 0:
         raise SystemExit("No rows carry a summarize prompt — refusing to write an empty parquet.")
 
-    n = min(args.num_samples, len(filtered))
+    n = min(args.num_samples, len(eligible))
     if n < args.num_samples:
         print(f"  WARNING: only {n} rows available; capping --num-samples accordingly.")
 
-    sampled = filtered.sample(n=n, random_state=args.seed).reset_index(drop=True)
+    sampled = eligible.sample(n=n, random_state=args.seed)  # 保留原始索引，勿 reset
+    val_df = sampled.reset_index(drop=True)
+    # 从完整 df 按原始索引剔除 val 行（没有 summarize_prompts 的行仍留在 train）。
+    train_df = df.drop(index=sampled.index).reset_index(drop=True)
+
+    # 无泄漏自检：val 与 train 行数之和 == 原始行数，且无索引交集。
+    assert len(val_df) + len(train_df) == len(df), "row count mismatch after split"
+
+    if args.train_output is None:
+        train_out = args.input.with_name(f"{args.input.stem}_excl_val{n}.parquet")
+    else:
+        train_out = args.train_output
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    sampled.to_parquet(args.output, index=False)
+    train_out.parent.mkdir(parents=True, exist_ok=True)
+    val_df.to_parquet(args.output, index=False)
+    train_df.to_parquet(train_out, index=False)
 
-    print(f"Wrote {args.output} ({args.output.stat().st_size / 1e6:.2f} MB)")
-    print(f"  rows    : {len(sampled):,}  (seed={args.seed}, frozen)")
-    print(f"  columns : {sampled.columns.tolist()}")
+    print(f"Wrote VAL   {args.output} ({args.output.stat().st_size / 1e6:.2f} MB)")
+    print(f"  rows    : {len(val_df):,}  (seed={args.seed}, frozen)")
+    print(f"Wrote TRAIN {train_out} ({train_out.stat().st_size / 1e6:.2f} MB)")
+    print(f"  rows    : {len(train_df):,}  (= {len(df):,} input - {len(val_df):,} val)")
+    print(f"  columns : {val_df.columns.tolist()}")
 
 
 if __name__ == "__main__":
     main()
+
