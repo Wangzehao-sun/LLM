@@ -1668,7 +1668,11 @@ class NewRayPPOTrainer(RayPPOTrainer):
 
                 # Check if buffer is full enough to trigger training on failed samples
                 # Also requires at least extra_step_interval normal steps since last extra_step
-                if len(failed_questions_buffer) >= failure_buffer_max_size and steps_since_last_extra >= extra_step_interval:
+                # disable_after_step（可选）：超过该 step 后彻底停用 failure-recycle 与 SR 替换，
+                # 让训练回落到纯 on-policy GRPO。<=0 或未配置 = 永不停用（保持原行为）。
+                disable_after_step = self.config.data.get('recycle_sr_disable_after', 0)
+                recycle_sr_active = (disable_after_step <= 0) or (self.global_steps < disable_after_step)
+                if recycle_sr_active and len(failed_questions_buffer) >= failure_buffer_max_size and steps_since_last_extra >= extra_step_interval:
                     print(f"Failed questions buffer reached {len(failed_questions_buffer)} items. Training on failed samples...")
 
                     n_recycle_failure = self.config.data.get('n_recycle_failure', 2)
@@ -1739,7 +1743,11 @@ class NewRayPPOTrainer(RayPPOTrainer):
                     steps_since_last_extra = 0  # reset cooldown after extra_step
 
                 # Normal training step
-                _collect_failures = self.config.data.get('collect_failures', False) and self.global_steps >= self.config.data.get('extra_step_start_after', 0)
+                _collect_failures = (
+                    recycle_sr_active
+                    and self.config.data.get('collect_failures', False)
+                    and self.global_steps >= self.config.data.get('extra_step_start_after', 0)
+                )
                 is_last_step, last_val_metrics, new_failed_items = self._train_step_internal(batch_dict, epoch, logger, progress_bar, collect_failures=_collect_failures, is_failure_recycle_step=False)
                 steps_since_last_extra += 1  # increment cooldown counter after each normal step
                 
@@ -2180,7 +2188,11 @@ class NewRayPPOTrainer(RayPPOTrainer):
                         _sr_mode = 'all'
                     elif _sr_mode is False:
                         _sr_mode = 'off'
-                    if (not is_failure_recycle_step) and _sr_mode != 'off':
+                    # disable_after_step（可选，与 fit 里的 recycle 停用共用同一开关）：
+                    # 超过该 step 后停用 SR 替换，回落到纯 on-policy。<=0/未配置 = 永不停用。
+                    _sr_disable_after = self.config.data.get('recycle_sr_disable_after', 0)
+                    _sr_disabled_now = (_sr_disable_after > 0) and (self.global_steps >= _sr_disable_after)
+                    if (not is_failure_recycle_step) and _sr_mode != 'off' and (not _sr_disabled_now):
                         gen_batch_output = self._summarize_replace_normal_step(
                             gen_batch=gen_batch,
                             gen_batch_output=gen_batch_output,
