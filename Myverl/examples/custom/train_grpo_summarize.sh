@@ -25,7 +25,9 @@ export WANDB_MODE=offline
 #   4. Data/prepare_summarize_prompts.py -> deepmath_dgt6_n10000_summarize.parquet  <-- this is what we train on
 # ---------------------------------------------------------------------------
 
-train_path=$HOME/LLM/Data/deepmath_dgt6_n10000_summarize.parquet
+# train_path 使用剔除了 summarize-val 128 题的版本（由 Data/prepare_summarize_val.py
+# 生成），保证 val 题目零泄漏。若未跑该脚本，回退到完整 summarize parquet。
+train_path=$HOME/LLM/Data/deepmath_dgt6_n10000_summarize_excl_val128.parquet
 test_path=$HOME/LLM/Train/data/valid_with_aime25_new.parquet
 summarize_val_path=$HOME/LLM/Data/deepmath_dgt6_summarize_val128.parquet
 test1_path=$HOME/LLM/Train/data/split_by_source_new/aime.parquet
