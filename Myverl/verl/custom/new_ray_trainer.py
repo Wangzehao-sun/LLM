@@ -2123,10 +2123,15 @@ class NewRayPPOTrainer(RayPPOTrainer):
                          # （no_grad），天然 detached，正好是当前 actor 的 snapshot。
                          # response token 与长 prompt 结构逐位置对齐，可直接逐 token 做 KL。
                          # 用 rephrase_kl_coef>0 门控，为 0 时零额外开销。
+                         # reasoner_affinity_coef>0 也需要这份短 prompt logp（作为序列级
+                         # 亲和 reward f(y) 的来源），故两开关任一 >0 都要算 noprefix_logp。
                          rephrase_kl_coef = self.config.actor_rollout_ref.actor.policy_loss.get(
                              'rephrase_kl_coef', 0.0
                          )
-                         if rephrase_kl_coef > 0:
+                         affinity_coef = self.config.actor_rollout_ref.actor.policy_loss.get(
+                             'reasoner_affinity_coef', 0.0
+                         )
+                         if rephrase_kl_coef > 0 or affinity_coef > 0:
                              with marked_timer("rephrase_noprefix_log_prob", timing_raw, color="blue"):
                                  short_struct = self._build_hybrid_off_policy_output(
                                      n_divide=self.config.actor_rollout_ref.rollout.n_prefix,
@@ -2900,6 +2905,48 @@ class NewRayPPOTrainer(RayPPOTrainer):
                     metrics.update(kl_metrics)
                 else:
                     batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+
+                # ---- reasoner-affinity reward (序列级 RL 塑形项) ----
+                # recycle-step summarize 路径下改写行在长 summarize prompt 下生成/训练；
+                # noprefix_logp 是同一批改写在「原始短 prompt」下的 detached per-token logp
+                # (= reasoner 的接受度)。把长度归一化序列均值 f(y) 以 λ 加到「正确改写行」的
+                # 最后有效 token，让 rephraser 在解对前提下偏向 reasoner 更能顺下去的表达。
+                # detached 标量 -> 纯 RL reward（梯度只经 GRPO log π 回传，不穿 reasoner）。
+                #
+                # 关键：只改 token_level_rewards（advantage 的输入），绝不动 token_level_scores /
+                # reward_tensor —— 上面 uid 分组的 valid_mask/solve_* 判定、batch/solved 指标、
+                # rollout dump、failure-buffer 通过率全靠 scores 的整数正确性做精确 == 比较，
+                # 加了非整数 bonus 会污染它们。此处 scores 已定稿、分组已完成，注入最安全。
+                # 双门控（coef>0 且有 noprefix_logp key）：不开或非 summarize 路径时静默跳过。
+                affinity_coef = self.config.actor_rollout_ref.actor.policy_loss.get(
+                    'reasoner_affinity_coef', 0.0
+                )
+                if affinity_coef > 0 and 'noprefix_logp' in batch.batch.keys():
+                    tlr = batch.batch["token_level_rewards"].clone()   # 不原地改 scores（union 共享底层）
+                    npl = batch.batch['noprefix_logp']                 # [B, resp_len] detached 短 prompt logp
+                    rmask = batch.batch['response_mask'].bool()
+                    f_y = (npl * rmask).sum(-1) / rmask.sum(-1).clamp(min=1)   # [B] 长度归一化 log-prob
+                    row_score_sum = batch.batch["token_level_scores"].sum(-1)  # [B] 整数正确性(未污染)
+                    f_y = f_y.to(row_score_sum.device)
+                    if 'summarize_rewritten_mask' in batch.batch.keys():
+                        rewritten = batch.batch['summarize_rewritten_mask'].any(-1)
+                    else:
+                        rewritten = torch.zeros_like(row_score_sum, dtype=torch.bool)
+                    rewritten = rewritten.to(row_score_sum.device)
+                    target_rows = rewritten & (row_score_sum == 1)     # success_value=1（此作用域外，用字面量）
+                    tlr_flat = tlr.to(row_score_sum.device)
+                    n_aff = 0
+                    for i in torch.nonzero(target_rows).squeeze(-1).tolist():
+                        valid_len = int(rmask[i].sum().item())
+                        if valid_len > 0:
+                            tlr_flat[i, valid_len - 1] += affinity_coef * f_y[i].item()
+                            n_aff += 1
+                    batch.batch["token_level_rewards"] = tlr_flat.to(batch.batch["token_level_rewards"].device)
+                    metrics['batch/affinity_rows'] = n_aff
+                    metrics['batch/affinity_coef'] = affinity_coef
+                    metrics['batch/affinity_f_mean'] = (
+                        f_y[target_rows].mean().item() if n_aff else 0.0
+                    )
 
                 # compute advantages, executed on the driver process
 
