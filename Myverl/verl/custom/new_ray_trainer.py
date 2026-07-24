@@ -1396,6 +1396,21 @@ class NewRayPPOTrainer(RayPPOTrainer):
                     dst[ti] = off_batch.batch[key][chosen].to(dst.device)
             n_acc += 1
 
+        # rephrase rollout 正确率（口径 A，与替换选择解耦）：所有 W*K 条候选里
+        # reward==success 的占比。反映 normal-step 下模型在 summarize prompt 上的
+        # 解题能力，直接从 cand_reward_sum 统计（不受 select 的 early-break 影响，
+        # n_rej_incorrect 因 shortest 模式提前 break 并非全量正确率）。
+        # 另附「至少解出一条」的题级正确率，供与 K>1 的 pass@K 直觉对照。
+        sr_n_total = int(cand_reward_sum.numel())
+        sr_n_correct = int((cand_reward_sum == success_value).sum().item())
+        sr_q_solved = int(
+            (cand_reward_sum.view(W, K) == success_value).any(-1).sum().item()
+        ) if sr_n_total else 0
+        metrics['batch/sr_rollout_acc'] = sr_n_correct / max(1, sr_n_total)
+        metrics['batch/sr_rollout_correct'] = sr_n_correct
+        metrics['batch/sr_rollout_total'] = sr_n_total
+        metrics['batch/sr_question_solve_rate'] = sr_q_solved / max(1, W)
+
         metrics['batch/sr_k'] = K
         metrics['batch/sr_accepted'] = n_acc
         metrics['batch/sr_no_candidate'] = n_no_cand
@@ -1403,7 +1418,9 @@ class NewRayPPOTrainer(RayPPOTrainer):
         metrics['batch/sr_rej_filter'] = n_rej_flt
         print(
             f"[summarize_replace] questions={W}, K={K}, accepted={n_acc}, "
-            f"no_candidate={n_no_cand}, rej_incorrect={n_rej_inc}, rej_filter={n_rej_flt}"
+            f"no_candidate={n_no_cand}, rej_incorrect={n_rej_inc}, rej_filter={n_rej_flt}, "
+            f"rollout_acc={sr_n_correct}/{sr_n_total}={sr_n_correct / max(1, sr_n_total):.3f}, "
+            f"question_solve_rate={sr_q_solved}/{W}"
         )
         return gen_batch_output
 
