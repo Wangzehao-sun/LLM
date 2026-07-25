@@ -108,6 +108,7 @@ python -m verl.trainer.main_ppo_new \
     actor_rollout_ref.actor.entropy_coeff=0.001 \
     actor_rollout_ref.actor.policy_loss.loss_mode=$name \
     +actor_rollout_ref.actor.policy_loss.recycle_loss_mode='luffy' \
+    +actor_rollout_ref.actor.policy_loss.reasoner_affinity_coef=0.01 \
     actor_rollout_ref.actor.clip_ratio=0.28 \
     +actor_rollout_ref.actor.policy_loss.off_policy_masking=True \
     +actor_rollout_ref.actor.policy_loss.off_policy_reshape="vanilla" \
