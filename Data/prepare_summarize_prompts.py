@@ -50,6 +50,13 @@ Schema add:
     summarize_prompt  : np.ndarray[object] of length 1
     summarize_prompts : np.ndarray[object] of length K (prefix ascending)
                         each element being a list[{role, content}] (system + user).
+    teacher_prompts   : (OPTIONAL, with --teacher-prompts) np.ndarray[object] of
+                        length 1, the online teacher-API's OWN single pre-rendered
+                        prompt, built with a SEPARATE template (--teacher-template) and
+                        a single prefix (--teacher-ratio), kept physically apart from
+                        summarize_prompts. Column name is --teacher-col and must match
+                        teacher_api.prompt_key at train time. The K summarize-replace
+                        candidates all reuse this one prompt.
 
 Usage:
 
@@ -59,6 +66,24 @@ Usage:
         --tokenizer-path /home/shared/Qwen2.5-Math-7B-16k-think \
         --single-mode full --full-ratio 1.0 \
         --list-mode custom --list-ratios 0.2,0.4,0.6,0.8
+
+    # also render the separate SINGLE teacher-API prompt column (teacher_prompts):
+    python prepare_summarize_prompts.py \
+        --input  ..._split.parquet --output ..._summarize.parquet \
+        --tokenizer-path /home/shared/Qwen2.5-Math-7B-16k-think \
+        --list-mode custom --list-ratios 0.2,0.4,0.6,0.8 \
+        --teacher-prompts --teacher-ratio 0.5
+
+    # teacher-ONLY: render just the teacher column, no token_split_points needed:
+    python prepare_summarize_prompts.py \
+        --input  ..._nosplit.parquet --output ..._teacher.parquet \
+        --tokenizer-path /home/shared/Qwen2.5-Math-7B-16k-think \
+        --teacher-only --teacher-ratio 0.5
+
+    # teacher-ONLY, no tokenizer at all (char-space prefix; no transformers needed):
+    python prepare_summarize_prompts.py \
+        --input  ..._nosplit.parquet --output ..._teacher.parquet \
+        --teacher-only --no-tokenizer --teacher-ratio 0.5
 """
 
 from __future__ import annotations
@@ -72,7 +97,8 @@ from typing import Any, Dict, List, Tuple
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
-from transformers import AutoTokenizer
+# NOTE: transformers is imported lazily inside init_worker so that --no-tokenizer /
+# --teacher-only (char-space) runs need neither the library nor a model download.
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -131,6 +157,31 @@ DEFAULT_TEMPLATE2 = (
     "## Your solution:"
 )
 
+DEFAULT_TEMPLATE3 = (
+    "You are given a [Problem] and a [Noisy Reasoning Draft].\n\n"
+    "Your task is to write one complete, self-contained solution. "
+    "Use the [Reference Reasoning Draft] as private mathematical guidance: understand its reasoning process, "
+    "extract the useful and valid reasoning steps, and reconstruct them in your own step-by-step problem-solving style. "
+    "Then continue the derivation naturally until the problem is fully solved. "
+    "The final output should be a standard, well-organized solution to the problem, not a commentary on the draft.\n"
+    "## Strict requirements:\n" 
+    "1. Use the Reference Reasoning Draft as private mathematical guidance. " 
+    "Understand its reasoning process, extract its useful and valid steps, and rewrite them in your own step-by-step problem-solving style, as if solving the problem directly.\n" 
+    "Do not explicitly mention the draft, the prefix, or that any prior reasoning was provided. " 
+    "2. Reconstruct the reasoning rather than merely paraphrasing it. " 
+    "In the reconstructed part, preserve as many valid reasoning steps from the draft as possible, including important equations, intermediate conclusions, and useful verification or correction steps. " 
+    "For each reconstructed step, explain the reasoning in your own words rather than merely copying the draft's wording."
+    "The reasoning should be reorganized into a clear, coherent, and natural solution.\n" 
+    "3. Do not summarize, compress, or skip the draft's valid reasoning steps. " 
+    "For each step of the derivation, explain the underlying mathematical reasoning in your own words rather than only stating the result.\n" 
+    "4. Continue naturally from the reconstructed reasoning. " 
+    "Add any necessary new valid steps to complete the derivation and reach the final answer. "
+    "If the draft contains an obvious mathematical mistake, correct it silently and continue with a valid derivation.\n" 
+    "5. Please reason step by step, and put your final answer within \\boxed{{}}.\n"
+    "## Problem:\n{question}\n\n"
+    "## Reference Reasoning Draft:\n{prefix}\n\n"
+    "## Your solution:"
+)
 DEFAULT_TEMPLATE = (
     "You are given a [Problem] and a [Noisy Reasoning Draft].\n\n"
     "Your task is to write one complete, self-contained solution. "
@@ -159,9 +210,68 @@ DEFAULT_TEMPLATE = (
 
 worker_tokenizer = None
 
+# Sentinel meaning "run without a tokenizer": teacher-only mode then cuts the prefix
+# in CHARACTER space instead of token space (no transformers / model download needed).
+NO_TOKENIZER = "__no_tokenizer__"
+
+
+# ---------------------------------------------------------------------------
+# teacher-API prompts (independent column, separate template)
+# ---------------------------------------------------------------------------
+# Rendered into a SEPARATE column (default 'teacher_prompts') consumed ONLY by the
+# online teacher-API rephraser (teacher_api.prompt_key). Kept physically apart from
+# the policy's summarize_prompts so the two prompt designs never mix. Same prefix
+# machinery (split points / ratios, ascending), but its own template below.
+TEACHER_TEMPLATE_DEFAULT = (
+    "You are given a mathematical problem, a detailed expert reasoning draft, and several "
+    "outputs that illustrate the target model's natural reasoning style.\n\n"
+    "Write one complete solution to the problem.\n\n"
+    "Use the expert draft for mathematical guidance: reconstruct its valid reasoning path, "
+    "preserve its useful intermediate steps, equations, checks, and corrections, and fill in "
+    "any implicit transitions needed for a self-contained solution.\n\n"
+    "Use the style examples only to learn the target model's reasoning tone, pacing, and way "
+    "of connecting steps. Do not reuse their mathematical content, conclusions, or "
+    "problem-specific wording.\n\n"
+    "Requirements:\n"
+    "1. Solve the problem directly without mentioning the expert draft or the style examples.\n"
+    "2. Preserve the useful detail of the expert reasoning rather than summarizing it.\n"
+    "3. Express the reasoning naturally in the target style, without artificial headings or "
+    "deliberately imitated mistakes.\n"
+    "4. Silently correct any clear error in the draft, while keeping its valid reasoning path "
+    "whenever possible.\n"
+    "5. Output only the solution and place the final answer in \\boxed{}.\n\n"
+    "## Target Style Examples\n\n"
+    "### Example 1\n{style_example_1}\n\n"
+    "### Example 2\n{style_example_2}\n\n"
+    "## Problem\n{question}\n\n"
+    "## Expert Reasoning Draft\n{prefix}\n\n"
+    "## Solution"
+)
+
+# Style-example placeholders left UNFILLED at offline render time and substituted at
+# training time by the trainer with the policy's own recent correct rollouts. Offline we
+# only fill {question} and {prefix}; these tokens pass through verbatim.
+TEACHER_STYLE_PLACEHOLDERS = ("{style_example_1}", "{style_example_2}")
+
+
+def _render_teacher_template(template: str, question: str, prefix_text: str) -> str:
+    """Render the teacher template WITHOUT str.format.
+
+    The teacher template intentionally contains (a) literal ``\\boxed{}`` braces and
+    (b) style-example placeholders that must survive offline rendering to be filled at
+    train time. str.format would choke on the literal braces / unknown fields, so we do
+    targeted string replacement of only ``{question}`` and ``{prefix}``.
+    """
+    return template.replace("{question}", question).replace("{prefix}", prefix_text)
+
 
 def init_worker(tokenizer_path: str) -> None:
     global worker_tokenizer
+    # Empty / "none" path -> char-space mode: skip loading any tokenizer.
+    if not tokenizer_path or str(tokenizer_path).lower() in ("none", "null", "no_tokenizer"):
+        worker_tokenizer = NO_TOKENIZER
+        return
+    from transformers import AutoTokenizer  # lazy: only needed with a real tokenizer
     worker_tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
 
 
@@ -365,13 +475,21 @@ def _build_summarize_prompt(
     question: str,
     prefix_text: str,
     template: str,
+    is_teacher: bool = False,
 ) -> List[Dict[str, str]]:
     """Build a [system?, user] messages list. Empty prefix -> still wraps the
     question in the template (the user explicitly asked the model to summarize
     "what's been done so far"; with empty prefix the summary will just be
     trivial, training keeps working). The trainer / dataset can choose to
-    short-circuit step_i==0 separately if desired."""
-    user_content = template.format(question=question, prefix=prefix_text)
+    short-circuit step_i==0 separately if desired.
+
+    ``is_teacher`` selects the teacher render path (str.replace, preserves literal
+    ``\\boxed{}`` and the {style_example_*} placeholders) instead of str.format.
+    """
+    if is_teacher:
+        user_content = _render_teacher_template(template, question, prefix_text)
+    else:
+        user_content = template.format(question=question, prefix=prefix_text)
     messages: List[Dict[str, str]] = []
     if system_msg is not None:
         messages.append(system_msg)
@@ -390,27 +508,38 @@ def _build_prompt_array(
     tgt_tokens: List[int],
     n_tgt: int,
     sp_backup_pairs: List[Tuple[int, bool]],
+    is_teacher: bool = False,
 ) -> np.ndarray:
     """Render a 1D object array of message-lists, one per (split_point, backup).
 
-    ``sp_backup_pairs`` is a list of ``(sp, do_backup)`` where ``sp`` is a token
-    count into the (answer-truncated) reasoning and ``do_backup`` says whether to
-    back the decoded prefix up to a sentence boundary (used when the prefix is a
-    fractional cut rather than a sentence-aligned split point).
+    ``sp_backup_pairs`` is a list of ``(sp, do_backup)`` where ``sp`` is an offset
+    into the (answer-truncated) reasoning and ``do_backup`` says whether to back the
+    prefix up to a sentence boundary (used when the prefix is a fractional cut rather
+    than a sentence-aligned split point).
+
+    With a real tokenizer ``tgt_tokens`` are token ids and ``sp`` is a token count
+    (decoded back to text). In no-tokenizer mode ``tgt_tokens`` is the raw reasoning
+    STRING and ``sp`` is a CHARACTER count -- the prefix is sliced directly in char
+    space (no decode). Both paths then optionally back up to a sentence boundary.
     """
+    no_tok = (worker_tokenizer == NO_TOKENIZER)
     prompts_list: List[List[Dict[str, str]]] = []
     for sp, do_backup in sp_backup_pairs:
         sp = max(0, min(int(sp), n_tgt))  # clamp
         if sp == 0:
             prefix_text = ""
         else:
-            prefix_text = worker_tokenizer.decode(
-                tgt_tokens[:sp], skip_special_tokens=True
-            )
+            if no_tok:
+                # char-space slice: tgt_tokens is the reasoning string here
+                prefix_text = tgt_tokens[:sp]
+            else:
+                prefix_text = worker_tokenizer.decode(
+                    tgt_tokens[:sp], skip_special_tokens=True
+                )
             if do_backup:
                 prefix_text = _backup_to_sentence_boundary(prefix_text)
         prompts_list.append(
-            _build_summarize_prompt(system_msg, question, prefix_text, template)
+            _build_summarize_prompt(system_msg, question, prefix_text, template, is_teacher)
         )
 
     # IMPORTANT: 不能用 np.array(prompts_list, dtype=object)。
@@ -431,8 +560,12 @@ def process_single_item(
     single_ratio: float = 1.0,
     list_mode: str = "multi",
     list_ratios: List[float] | None = None,
+    teacher_template: str | None = None,
+    teacher_ratio: float = 1.0,
+    teacher_col: str = "teacher_prompts",
+    teacher_only: bool = False,
 ) -> Dict[str, Any]:
-    """Render BOTH summarize columns for one row.
+    """Render the summarize columns (and, if requested, the teacher column) for one row.
 
     * ``summarize_prompt`` (length-1 array): the SINGLE prompt consumed by the
       extra-step / recycle path. Its prefix is a leading fraction
@@ -444,6 +577,12 @@ def process_single_item(
       shortest correct candidate by scanning in order. ``list_mode`` is "multi"
       (one prompt per ``token_split_points`` entry -- already ascending) or
       "custom" (one prompt per ratio in the sorted ``list_ratios``).
+    * ``<teacher_col>`` (length-1 array): OPTIONAL, only when ``teacher_template``
+      is not None. The teacher-API's OWN single pre-rendered prompt, built with
+      ``teacher_template`` and a single prefix at ``teacher_ratio``. Kept in a
+      separate column so the teacher prompt design never mixes with the policy's.
+      (The K summarize-replace candidates all reuse this one prompt -- K stochastic
+      teacher samples of the same request.)
     """
     global worker_tokenizer
 
@@ -455,27 +594,48 @@ def process_single_item(
     split_points = item.get("token_split_points")
 
     # ``multi`` list mode is the only consumer of token_split_points; the single
-    # column and ``custom`` list mode derive prefixes from ratios, so a missing
-    # split-points column only blocks ``multi``.
-    need_split = (list_mode == "multi")
+    # column, ``custom`` list mode and the teacher column derive prefixes from
+    # ratios, so a missing split-points column only blocks ``multi``. In
+    # ``teacher_only`` we render ONLY the teacher column and never need split points.
+    need_split = (list_mode == "multi") and (not teacher_only)
     if (
         worker_tokenizer is None
         or not question
         or not think_process
         or (need_split and split_points is None)
     ):
-        item["summarize_prompt"] = np.array([], dtype=object)
-        item["summarize_prompts"] = np.array([], dtype=object)
+        if teacher_only:
+            item[teacher_col] = np.array([], dtype=object)
+        else:
+            item["summarize_prompt"] = np.array([], dtype=object)
+            item["summarize_prompts"] = np.array([], dtype=object)
+            if teacher_template is not None:
+                item[teacher_col] = np.array([], dtype=object)
         return item
 
     if isinstance(split_points, np.ndarray):
         split_points = split_points.tolist()
 
-    # Encode the think_process once; reused for both columns.
-    tgt_tokens = worker_tokenizer(
-        think_process, add_special_tokens=False
-    )["input_ids"]
-    n_tgt = len(tgt_tokens)
+    # Encode the think_process once; reused for all columns.
+    # No-tokenizer mode: work in CHARACTER space -- tgt_tokens IS the string, n_tgt its
+    # char length. Only teacher-only supports this (summarize split points are token-space).
+    if worker_tokenizer == NO_TOKENIZER:
+        tgt_tokens = think_process
+        n_tgt = len(think_process)
+    else:
+        tgt_tokens = worker_tokenizer(
+            think_process, add_special_tokens=False
+        )["input_ids"]
+        n_tgt = len(tgt_tokens)
+
+    # --- teacher-only: render just the teacher column, skip summarize entirely ---
+    if teacher_only:
+        sp_teacher = int(round(teacher_ratio * n_tgt))
+        item[teacher_col] = _build_prompt_array(
+            system_msg, question, teacher_template, tgt_tokens, n_tgt,
+            [(sp_teacher, teacher_ratio < 1.0)], is_teacher=True,
+        )
+        return item
 
     # --- single column (extra-step): one fractional prefix ---
     sp_single = int(round(single_ratio * n_tgt))
@@ -493,15 +653,26 @@ def process_single_item(
     item["summarize_prompts"] = _build_prompt_array(
         system_msg, question, template, tgt_tokens, n_tgt, list_pairs,
     )
+
+    # --- teacher column (online teacher-API): its own template + a SINGLE prefix ---
+    if teacher_template is not None:
+        sp_teacher = int(round(teacher_ratio * n_tgt))
+        item[teacher_col] = _build_prompt_array(
+            system_msg, question, teacher_template, tgt_tokens, n_tgt,
+            [(sp_teacher, teacher_ratio < 1.0)], is_teacher=True,
+        )
     return item
 
 
 def _worker_process(
-    args: Tuple[Dict[str, Any], str, str, float, str, List[float] | None],
+    args: Tuple[Dict[str, Any], str, str, float, str, List[float] | None,
+                str | None, float, str, bool],
 ) -> Dict[str, Any]:
-    item, template, single_mode, single_ratio, list_mode, list_ratios = args
+    (item, template, single_mode, single_ratio, list_mode, list_ratios,
+     teacher_template, teacher_ratio, teacher_col, teacher_only) = args
     return process_single_item(
-        item, template, single_mode, single_ratio, list_mode, list_ratios
+        item, template, single_mode, single_ratio, list_mode, list_ratios,
+        teacher_template, teacher_ratio, teacher_col, teacher_only,
     )
 
 
@@ -520,7 +691,18 @@ def main() -> None:
         "--tokenizer-path",
         default="/home/shared/Qwen2.5-Math-7B-16k-think",
         help="Tokenizer path. MUST match the tokenizer used by add_token_split_points.py "
-             "or split-point token counts will misalign with text offsets.",
+             "or split-point token counts will misalign with text offsets. Set to empty "
+             "'' or 'none' (or pass --no-tokenizer) to run WITHOUT a tokenizer -- only "
+             "valid with --teacher-only, where the prefix is cut in CHARACTER space.",
+    )
+    parser.add_argument(
+        "--no-tokenizer",
+        dest="no_tokenizer",
+        action="store_true",
+        default=False,
+        help="Run without loading any tokenizer (teacher-only): the --teacher-ratio prefix "
+             "is sliced in CHARACTER space instead of token space. Avoids the transformers "
+             "dependency / model download. Ignored unless --teacher-only.",
     )
     parser.add_argument("--workers", type=int, default=16, help="Worker process count (1 = sync).")
     # ---- single column (summarize_prompt, for extra-step / recycle) ----
@@ -611,6 +793,50 @@ def main() -> None:
         default=DEFAULT_TEMPLATE,
         help="User-turn template, must include {question} and {prefix} placeholders.",
     )
+    # ---- teacher column (teacher_prompts, for the online teacher-API rephraser) ----
+    parser.add_argument(
+        "--teacher-prompts",
+        dest="teacher_prompts",
+        action="store_true",
+        default=False,
+        help="Also render a SEPARATE teacher-API prompt column (--teacher-col, "
+             "default 'teacher_prompts'), kept apart from summarize_prompts. It is a "
+             "SINGLE prompt (length-1) built with --teacher-template and a single "
+             "--teacher-ratio prefix; the K summarize-replace candidates reuse it. The "
+             "training-time teacher_api.prompt_key must match --teacher-col.",
+    )
+    parser.add_argument(
+        "--teacher-col",
+        default="teacher_prompts",
+        help="Column name for the teacher-API prompts (must equal teacher_api.prompt_key).",
+    )
+    parser.add_argument(
+        "--teacher-template",
+        default=None,
+        help="User-turn template for the teacher column, must include {question} and "
+             "{prefix}. Defaults to the built-in TEACHER_TEMPLATE_DEFAULT when "
+             "--teacher-prompts is set.",
+    )
+    parser.add_argument(
+        "--teacher-ratio",
+        type=float,
+        default=1.0,
+        help="Prefix fraction (0, 1] for the SINGLE teacher prompt. 1.0 (default) = the "
+             "full answer-truncated reasoning as the [Reasoning Draft]; e.g. 0.5 = the "
+             "first ~50%% of tokens, backed up to a sentence boundary. The teacher column "
+             "is length-1; the K summarize-replace candidates reuse this one prompt.",
+    )
+    parser.add_argument(
+        "--teacher-only",
+        dest="teacher_only",
+        action="store_true",
+        default=False,
+        help="Render ONLY the teacher column (implies --teacher-prompts); skip the "
+             "summarize_prompt / summarize_prompts columns entirely. In this mode "
+             "token_split_points is NOT required (the teacher prefix comes from "
+             "--teacher-ratio). Use when the input parquet has no split points and you "
+             "only need teacher prompts.",
+    )
     parser.add_argument("--limit", type=int, default=None, help="Optional row limit for quick smoke tests.")
     parser.add_argument(
         "--drop-empty",
@@ -633,6 +859,32 @@ def main() -> None:
 
     if "{question}" not in args.template or "{prefix}" not in args.template:
         raise SystemExit("--template must contain both {question} and {prefix}")
+
+    # --teacher-only implies --teacher-prompts (render only the teacher column).
+    if args.teacher_only:
+        args.teacher_prompts = True
+
+    # Resolve the effective tokenizer path. No-tokenizer (char-space) mode is triggered
+    # by --no-tokenizer or an empty/none --tokenizer-path, and is ONLY valid with
+    # --teacher-only (summarize split points are token-space and need a real tokenizer).
+    tok_path = args.tokenizer_path
+    no_tok = args.no_tokenizer or (not tok_path) or str(tok_path).lower() in ("none", "null", "no_tokenizer")
+    if no_tok:
+        if not args.teacher_only:
+            raise SystemExit(
+                "no-tokenizer / empty --tokenizer-path is only supported with --teacher-only "
+                "(summarize columns need a real tokenizer for token-space split points)."
+            )
+        tok_path = ""  # init_worker treats empty as char-space mode
+
+    # teacher-column setup (optional)
+    teacher_template = None
+    if args.teacher_prompts:
+        teacher_template = args.teacher_template or TEACHER_TEMPLATE_DEFAULT
+        if "{question}" not in teacher_template or "{prefix}" not in teacher_template:
+            raise SystemExit("--teacher-template must contain both {question} and {prefix}")
+        if not (0.0 < args.teacher_ratio <= 1.0):
+            raise SystemExit("--teacher-ratio must be in the (0, 1] range")
 
     # single-column validation
     if not (0.0 < args.full_ratio <= 1.0):
@@ -667,24 +919,22 @@ def main() -> None:
     print(f"Reading {args.input}")
     df = pd.read_parquet(args.input)
     if "token_split_points" not in df.columns:
-        # Only --list-mode multi reads split points; the single column and
-        # --list-mode custom derive prefixes from ratios.
-        if args.list_mode != "multi":
-            print(
-                f"  (no 'token_split_points' column; OK with --list-mode "
-                f"{args.list_mode}, split points are not used)"
-            )
+        # Split points are only read by --list-mode multi. The single column,
+        # --list-mode custom, and --teacher-only all derive prefixes from ratios.
+        if args.teacher_only or args.list_mode != "multi":
+            reason = "teacher-only" if args.teacher_only else f"--list-mode {args.list_mode}"
+            print(f"  (no 'token_split_points' column; OK with {reason}, split points are not used)")
         else:
             raise SystemExit(
                 "Input parquet has no 'token_split_points' column. "
-                "Run Data/add_token_split_points.py first (or use --list-mode custom)."
+                "Run Data/add_token_split_points.py first (or use --list-mode custom / --teacher-only)."
             )
 
     if args.limit is not None:
         df = df.head(args.limit)
     records = df.to_dict(orient="records")
     print(
-        f"  -> {len(records):,} rows. Tokenizer: {args.tokenizer_path}. "
+        f"  -> {len(records):,} rows. Tokenizer: {tok_path or '(none / char-space)'}. "
         f"single-mode: {args.single_mode}, list-mode: {args.list_mode}"
     )
     if args.list_mode == "custom":
@@ -718,24 +968,26 @@ def main() -> None:
 
     workers = max(1, min(args.workers, mp.cpu_count()))
     if workers == 1:
-        init_worker(args.tokenizer_path)
+        init_worker(tok_path)
         processed = [
             process_single_item(
                 item, args.template, args.single_mode, row_ratios[i],
                 args.list_mode, list_ratios,
+                teacher_template, args.teacher_ratio, args.teacher_col, args.teacher_only,
             )
             for i, item in enumerate(tqdm(records, total=len(records), desc="rendering"))
         ]
     else:
         task_iter = (
             (item, args.template, args.single_mode, row_ratios[i],
-             args.list_mode, list_ratios)
+             args.list_mode, list_ratios,
+             teacher_template, args.teacher_ratio, args.teacher_col, args.teacher_only)
             for i, item in enumerate(records)
         )
         with mp.Pool(
             processes=workers,
             initializer=init_worker,
-            initargs=(args.tokenizer_path,),
+            initargs=(tok_path,),
         ) as pool:
             chunksize = max(1, len(records) // (workers * 4)) if records else 1
             processed = list(
@@ -747,14 +999,20 @@ def main() -> None:
             )
 
     out_df = pd.DataFrame(processed)
-    for col in ("summarize_prompt", "summarize_prompts"):
+    if args.teacher_only:
+        emitted_cols = [args.teacher_col]
+    else:
+        emitted_cols = ["summarize_prompt", "summarize_prompts"]
+        if teacher_template is not None:
+            emitted_cols.append(args.teacher_col)
+    for col in emitted_cols:
         n_emitted = sum(
             1 for p in out_df[col]
             if isinstance(p, np.ndarray) and len(p) > 0
         )
         print(f"  -> {n_emitted:,}/{len(out_df):,} rows have non-empty {col}.")
 
-    # Cleanup: drop rows whose summarize columns came out empty. process_single_item
+    # Cleanup: drop rows whose emitted prompt columns came out empty. process_single_item
     # emits np.array([], dtype=object) when a row cannot be rendered (no question,
     # no reasoning, or the answer leaks in the first sentence). These empty (shape
     # (0,)) cells are harmless during normal steps (the dataset pads them) but crash
@@ -765,44 +1023,51 @@ def main() -> None:
         def _is_empty(v) -> bool:
             return not (isinstance(v, np.ndarray) and len(v) > 0)
 
-        bad = out_df.apply(
-            lambda r: _is_empty(r["summarize_prompt"]) or _is_empty(r["summarize_prompts"]),
-            axis=1,
-        )
+        def _row_bad(r) -> bool:
+            # Only check the columns this run actually emitted.
+            return any(_is_empty(r[c]) for c in emitted_cols)
+
+        bad = out_df.apply(_row_bad, axis=1)
         n_drop = int(bad.sum())
         if n_drop > 0:
             bad_pos = [int(i) for i in np.where(bad.to_numpy())[0][:20]]
             print(
-                f"  -> dropping {n_drop:,} row(s) with empty summarize columns "
+                f"  -> dropping {n_drop:,} row(s) with empty prompt columns "
                 f"(positions: {bad_pos}{' ...' if n_drop > 20 else ''})."
             )
             out_df = out_df[~bad].reset_index(drop=True)
         else:
-            print("  -> no empty summarize rows to drop.")
+            print("  -> no empty prompt rows to drop.")
 
     # Print a sample of BOTH columns for human-eyeball verification.
+    # Print a sample of the emitted columns for human-eyeball verification.
+    _seed_col = args.teacher_col if args.teacher_only else "summarize_prompts"
     sample = next(
         (
             row for _, row in out_df.iterrows()
-            if isinstance(row["summarize_prompts"], np.ndarray)
-            and len(row["summarize_prompts"]) >= 1
+            if isinstance(row[_seed_col], np.ndarray)
+            and len(row[_seed_col]) >= 1
         ),
         None,
     )
     if sample is not None:
         sample_points = sample.get("token_split_points")
-        for col in ("summarize_prompt", "summarize_prompts"):
+        sample_cols = list(emitted_cols)
+        for col in sample_cols:
             arr = sample[col]
             if not (isinstance(arr, np.ndarray) and len(arr) >= 1):
                 continue
             idxs = sorted({0, len(arr) // 2, len(arr) - 1})
             for idx in idxs:
-                # 标注每条 prompt 的 prefix 来源，三种情形各不相同：
+                # 标注每条 prompt 的 prefix 来源，各列情形不同：
                 #   - summarize_prompt（单条）：来自 single_ratio，与 split_points 无关。
                 #   - summarize_prompts + list-mode multi：一条对一个 token_split_points。
                 #   - summarize_prompts + list-mode custom：来自 list_ratios[idx]。
+                #   - teacher 列：单条，prefix 来自 teacher_ratio。
                 if col == "summarize_prompt":
                     tag = f" (single, mode={args.single_mode})"
+                elif col == args.teacher_col and teacher_template is not None:
+                    tag = f" (teacher, single, ratio={args.teacher_ratio})"
                 elif args.list_mode == "multi":
                     tag = ""
                     if isinstance(sample_points, (list, np.ndarray)) and idx < len(sample_points):
