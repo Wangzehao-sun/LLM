@@ -19,6 +19,7 @@ data:
   add_tgt_with_acc: False
   add_tgt_acc_upper_bound: 0.5
   disable_truncation_advantage: False
+  keep_summarize_raw: False   # teacher-API：额外保留 K 对齐后的原始 summarize messages（拼 teacher prompt 用）
 
 
 actor_rollout_ref:

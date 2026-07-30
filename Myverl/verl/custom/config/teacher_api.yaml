@@ -1,0 +1,46 @@
+# Standalone teacher-API rephraser config.
+#
+# Loaded INDEPENDENTLY of the trainer's Hydra config (see
+# verl/custom/teacher_api_client.py::load_teacher_config). API-calling params
+# live only here and never mix with training hyperparameters.
+#
+# Location: this file by default; override the path via env TEACHER_API_CONFIG.
+# enable=True is the single master switch: it also makes the train dataset keep
+# the raw summarize messages automatically (no separate data flag needed).
+#
+# api_key: leave empty and use env TEACHER_API_KEY / DASHSCOPE_API_KEY instead —
+# do NOT commit secrets.
+#
+# NOTE: no behavior logprob is available for teacher content, so off_old_log_probs
+# / target_probs stay zero -> the off-row loss must be a behavior-logprob-free
+# mode (off_policy_reshape in {vanilla, rl-sft}); 'luffy' is rejected at startup.
+
+enable: False
+
+# --- endpoint (OpenAI-compatible /v1/chat/completions) ---
+url: ""                 # single endpoint; empty -> use api_list
+api_list: []            # multiple endpoints, round-robined per request
+api_key: ""             # empty -> read env TEACHER_API_KEY / DASHSCOPE_API_KEY
+
+# --- input data ---
+# Dataset column holding the teacher's OWN pre-rendered chat prompts (a per-row
+# array of K messages-arrays), built by a dedicated offline script — kept SEPARATE
+# from the policy's `summarize_prompts`. The trainer reads only this column when
+# building teacher requests. Falls back to decoding the summarize prompt only if
+# this column is absent.
+prompt_key: "teacher_prompts"
+
+# --- generation ---
+model: "Qwen3-235B-A22B-Instruct-2507"
+threads: 100            # concurrent requests
+retry: 3                # retries per request (exponential backoff)
+timeout: 1500           # seconds per request
+temperature: 0.7
+top_p: 0.95
+max_tokens: 16384
+enable_thinking: False  # chat_template_kwargs.enable_thinking
+
+# --- Target Style Examples (sampled from the policy's own recent correct rollouts) ---
+style_examples_k: 2         # examples injected per question
+style_pool_size: 256        # rolling buffer capacity
+style_collect_per_step: 32  # max examples added to the pool per step

@@ -14,6 +14,7 @@
 
 from omegaconf import ListConfig
 import os
+import json
 from typing import List, Union
 
 import pandas as pd
@@ -90,6 +91,8 @@ class RLHFDatasetWithTarget(RLHFDataset):
                  summarize_prompt_key='summarize_prompt',
                  max_summarize_prompts=8,           # K, 与训练时 n_prefix 对齐
                  max_summarize_length=8192,         # rollout-time 长 prompt 容量
+                 keep_summarize_raw=False,          # 额外保留 K 对齐后的原始 summarize messages（供 teacher-API 拼 prompt 的兜底）
+                 teacher_prompt_key=None,           # teacher-API 专用的预渲染 prompt 列名（独立于 summarize_prompts）
         ):
         super().__init__(parquet_files, tokenizer, config=config)
 
@@ -110,6 +113,8 @@ class RLHFDatasetWithTarget(RLHFDataset):
         self.summarize_prompt_key = summarize_prompt_key
         self.max_summarize_prompts = max_summarize_prompts
         self.max_summarize_length = max_summarize_length
+        self.keep_summarize_raw = keep_summarize_raw
+        self.teacher_prompt_key = teacher_prompt_key
         if self.filter_targets:
             self._filter_targets()
     def _filter_targets(self):
@@ -357,6 +362,34 @@ class RLHFDatasetWithTarget(RLHFDataset):
             row_dict['summarize_input_ids'] = summarize_input_ids
             row_dict['summarize_attention_mask'] = summarize_attention_mask
             row_dict['summarize_position_ids'] = summarize_position_ids
+
+            # ---- teacher-API 用：独立的预渲染 prompt 列（与 summarize_prompts 区分开）----
+            # 优先用 teacher 专属列 self.teacher_prompt_key（每行一组 K 条 messages）；该列
+            # 缺失时才回退到 summarize_prompts（keep_summarize_raw）。两者都做同样的 K 对齐，
+            # 保证行序与 summarize_input_ids 一致。存 JSON 字符串，collate 走 object 数组。
+            def _align_and_dump(raw):
+                if isinstance(raw, np.ndarray):
+                    raw = raw.tolist()
+                if not raw:
+                    return "[]"
+                if len(raw) >= K:
+                    raw = raw[:K]
+                elif len(raw) == 1:
+                    raw = raw * K
+                else:
+                    raw = [raw[int(i / (K - 1) * (len(raw) - 1))] for i in range(K)]
+                try:
+                    return json.dumps(raw, ensure_ascii=False)
+                except (TypeError, ValueError):
+                    return "[]"
+
+            if self.teacher_prompt_key:
+                # 总是写入该 key（缺列/空 -> "[]"），保证 collate_fn 跨行 key 一致。
+                row_dict['teacher_prompts_raw'] = _align_and_dump(
+                    original_row.get(self.teacher_prompt_key)
+                )
+            if self.keep_summarize_raw:
+                row_dict['summarize_prompts_raw'] = _align_and_dump(sp_list if sp_list else [])
 
             # ---- 单条 summarize_prompt（给 extra-step / recycle 用）----
             # 物理隔离于上面的 K 条列表：extra-step 所有 off rollout 共用这一条。

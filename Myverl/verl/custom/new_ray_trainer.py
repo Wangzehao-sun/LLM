@@ -433,7 +433,39 @@ class NewRayPPOTrainer(RayPPOTrainer):
             raise NotImplementedError
 
         self._validate_config()
+
+        # ---- teacher-API rephraser（可选：在线用强模型改写，drop-in 替代本地生成）----
+        # 配置来自独立文件 verl/custom/config/teacher_api.yaml（不与 trainer 配置混合），
+        # 路径可用环境变量 TEACHER_API_CONFIG 覆盖。off_old_log_probs / target_probs 恒为
+        # 零占位（不对 teacher 内容算 behavior logprob），故 loss 只能走不依赖它们的模式
+        # （vanilla / SFT 蒸馏）。style_pool 缓存 R 近期正确 on-policy rollout 作示例。
+        from collections import deque
+        from verl.custom.teacher_api_client import load_teacher_config
+        self._teacher_api_cfg = load_teacher_config()
+        self._use_teacher_api = bool(self._teacher_api_cfg.get('enable', False))
+        _pool_size = (
+            int(self._teacher_api_cfg.get('style_pool_size', 256))
+            if self._use_teacher_api else 1
+        )
+        self._style_pool = deque(maxlen=max(1, _pool_size))
+        if self._use_teacher_api:
+            reshape = OmegaConf.select(
+                self.config, "actor_rollout_ref.actor.policy_loss.off_policy_reshape",
+                default="vanilla",
+            )
+            assert reshape != 'luffy', (
+                "teacher_api.enable=True 时 API 内容无 behavior logprob，target_probs 恒为零，"
+                "不能用 off_policy_reshape='luffy'（会 exp(logp)/1e-6 爆炸）。"
+                "请用 'vanilla' 或 SFT 蒸馏（rl-sft）。"
+            )
+            print(
+                f"[teacher_api] enabled: model={self._teacher_api_cfg.get('model')}, "
+                f"style_examples_k={self._teacher_api_cfg.get('style_examples_k', 2)}, "
+                f"pool_size={_pool_size}, off_policy_reshape={reshape}"
+            )
+
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler):
         """
         Creates the train and validation dataloaders.
@@ -459,7 +491,11 @@ class NewRayPPOTrainer(RayPPOTrainer):
                                          summarize_prompts_key=self.config.data.get('summarize_prompts_key', 'summarize_prompts'),
                                          summarize_prompt_key=self.config.data.get('summarize_prompt_key', 'summarize_prompt'),
                                          max_summarize_prompts=self.config.data.get('max_summarize_prompts', 8),
-                                         max_summarize_length=self.config.data.get('max_summarize_length', 8192),)
+                                         max_summarize_length=self.config.data.get('max_summarize_length', 8192),
+                                         # teacher-API 开启时保留 summarize messages 作兜底，并读 teacher 专属 prompt 列
+                                         keep_summarize_raw=self.config.data.get('keep_summarize_raw', False) or getattr(self, '_use_teacher_api', False),
+                                         teacher_prompt_key=(self._teacher_api_cfg.get('prompt_key', 'teacher_prompts')
+                                                             if getattr(self, '_use_teacher_api', False) else None),)
 
         # use sampler for better ckpt resume
         if train_sampler is None:
@@ -1155,6 +1191,189 @@ class NewRayPPOTrainer(RayPPOTrainer):
 
         return on_policy_batch
 
+    def _teacher_api_rollout(self, cand_gen: DataProto, messages_list: list) -> DataProto:
+        """Drop-in replacement for ``actor_rollout_wg.generate_sequences`` backed by an
+        external teacher chat API.
+
+        Returns a DataProto with the SAME contract as generate_sequences
+        (prompts / responses / input_ids / attention_mask / position_ids), so all
+        downstream code (compute_reward, trajectory filter, _build_hybrid_off_policy_output)
+        is untouched. The teacher only returns text, which we re-tokenize with the
+        policy's tokenizer. No behavior logprob is available -> callers must NOT
+        populate off_old_log_probs / target_probs for these rows.
+        """
+        from verl.custom.teacher_api_client import batch_chat
+
+        pad_token_id = self.tokenizer.pad_token_id
+        eos_token_id = self.tokenizer.eos_token_id
+        prompts = cand_gen.batch['input_ids']                 # [N, L_long], left-padded
+        device, dtype = prompts.device, prompts.dtype
+        N = prompts.size(0)
+        assert len(messages_list) == N, f"messages {len(messages_list)} != prompts {N}"
+
+        results = batch_chat(messages_list, self._teacher_api_cfg)   # [(ok, text)] aligned
+        max_resp = self.config.data.max_response_length
+
+        responses = torch.full((N, max_resp), pad_token_id, dtype=dtype, device=device)
+        n_ok = 0
+        for i, (ok, text) in enumerate(results):
+            if not ok or not isinstance(text, str) or not text.strip():
+                continue                                      # empty row -> scored wrong -> filtered out
+            n_ok += 1
+            ids = self.tokenizer(text, add_special_tokens=False)['input_ids']
+            if eos_token_id is not None:
+                ids = ids + [eos_token_id]
+            ids = ids[:max_resp]
+            if ids:
+                responses[i, :len(ids)] = torch.tensor(ids, dtype=dtype, device=device)
+
+        input_ids = torch.cat([prompts, responses], dim=-1)
+        attention_mask, position_ids = generate_masks_from_input_ids(
+            input_ids, pad_token_id, cand_gen.batch['attention_mask'].dtype
+        )
+        cand_out = DataProto(
+            batch=TensorDict(
+                {
+                    "prompts": prompts,
+                    "responses": responses,
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "position_ids": position_ids,
+                },
+                batch_size=N,
+            )
+        )
+        cand_out.meta_info = deepcopy(cand_gen.meta_info)
+        cand_out.meta_info['teacher_api_ok'] = n_ok
+        cand_out.meta_info['teacher_api_total'] = N
+        print(f"[teacher_api] rollout ok={n_ok}/{N}")
+        return cand_out
+
+    def _sample_style_examples(self, k: int) -> list:
+        """Sample up to k of R's recent correct on-policy rollouts from the style pool.
+        Returns a list of strings (may be shorter than k, or empty until the pool fills)."""
+        import random
+        pool = getattr(self, "_style_pool", None)
+        if not pool:
+            return []
+        n = min(int(k), len(pool))
+        if n <= 0:
+            return []
+        return random.sample(list(pool), n)
+
+    def _fill_style_placeholders(self, messages: list) -> list:
+        """Substitute {style_example_1..N} placeholders in the teacher messages with
+        the policy's own recent correct rollouts (style pool). The teacher template
+        (prepare_summarize_prompts.py::TEACHER_TEMPLATE_DEFAULT) embeds these
+        placeholders IN-PLACE (between the requirements and the problem), so we fill
+        them here rather than appending a block. Placeholders with no available example
+        (empty pool / fewer than N) are replaced with '' so no literal {..} leaks to
+        the teacher. If a message contains no placeholder, it is returned unchanged.
+        """
+        import re
+        # discover which style_example_i placeholders actually appear
+        needed = set()
+        pat = re.compile(r"\{style_example_(\d+)\}")
+        for m in messages:
+            if isinstance(m, dict):
+                needed.update(int(i) for i in pat.findall(m.get('content', '') or ''))
+        if not needed:
+            return messages
+        examples = self._sample_style_examples(max(needed))
+        out = []
+        for m in messages:
+            if not isinstance(m, dict) or '{style_example_' not in (m.get('content', '') or ''):
+                out.append(m)
+                continue
+            content = m['content']
+            for i in sorted(needed):
+                ex = examples[i - 1] if i - 1 < len(examples) else ""
+                content = content.replace(f"{{style_example_{i}}}", ex)
+            nm = dict(m)
+            nm['content'] = content
+            out.append(nm)
+        return out
+
+    def _build_teacher_messages(self, batch: DataProto, all_q: list, K: int, K_data: int) -> list:
+        """Build W*K teacher messages arrays mirroring long_prompt's row order
+        (row r = w_idx*K + k -> question all_q[w_idx], candidate k). Each = the
+        teacher's OWN pre-rendered prompt with its {style_example_*} placeholders
+        substituted by the policy's recent correct rollouts (style pool).
+
+        Prompt source priority:
+          1. ``teacher_prompts_raw`` — the teacher's dedicated pre-rendered column
+             (config teacher_api.prompt_key), kept SEPARATE from summarize_prompts.
+          2. ``summarize_prompts_raw`` — fallback if the teacher column is absent/empty.
+          3. decode the tokenized summarize prompt — last-resort fallback.
+        """
+        teacher_col = batch.non_tensor_batch.get('teacher_prompts_raw', None)
+        summ_col = batch.non_tensor_batch.get('summarize_prompts_raw', None)
+        pad_token_id = self.tokenizer.pad_token_id
+
+        def _load_raw(col, w_idx):
+            if col is None:
+                return None
+            try:
+                raw = json.loads(col[w_idx])
+                return raw if raw else None
+            except Exception:
+                return None
+
+        messages_list = []
+        for w_idx in all_q:
+            raw_all = _load_raw(teacher_col, w_idx)    # 1) teacher 专属列
+            if raw_all is None:
+                raw_all = _load_raw(summ_col, w_idx)   # 2) 回退到 summarize 原始 messages
+            for k in range(K):
+                if raw_all:
+                    msgs = deepcopy(raw_all[min(k, len(raw_all) - 1)])
+                else:
+                    # 3) 最后兜底：decode tokenized summarize prompt
+                    ids = batch.batch['summarize_input_ids'][w_idx, min(k, K_data - 1)]
+                    text = self.tokenizer.decode(
+                        ids[ids != pad_token_id], skip_special_tokens=True
+                    )
+                    msgs = [{"role": "user", "content": text}]
+                # 用 R 近期正确 rollout 替换模板里的 {style_example_*} 占位（就地填充，
+                # 而非追加块）。每条候选独立重采样一次，增加多样性。无占位则原样返回。
+                msgs = self._fill_style_placeholders(msgs)
+                messages_list.append(msgs)
+        return messages_list
+
+    def _collect_style_examples(self, batch: DataProto, reward_tensor: torch.Tensor,
+                                off_policy_mask_np) -> None:
+        """Harvest R's correct + format-clean on-policy rollouts into the style pool,
+        to seed the teacher's Target Style Examples on the next step."""
+        pool = getattr(self, "_style_pool", None)
+        if pool is None:
+            return
+        try:
+            success_value = 1
+            row_reward = reward_tensor.sum(-1).cpu().numpy()          # [B]
+            on_policy = ~np.asarray(off_policy_mask_np)
+            cand_idx = np.nonzero(on_policy & (row_reward == success_value))[0]
+            if len(cand_idx) == 0:
+                return
+            tf_cfg = self.config.algorithm.get('trajectory_filter', {})
+            max_add = int(self._teacher_api_cfg.get('style_collect_per_step', 32))
+            added = 0
+            for i in cand_idx.tolist():
+                if added >= max_add:
+                    break
+                resp_ids = batch.batch['responses'][i]
+                text = self.tokenizer.decode(
+                    resp_ids[resp_ids != self.tokenizer.pad_token_id], skip_special_tokens=True
+                ).strip()
+                if not text:
+                    continue
+                rej, _reason = _trajectory_filter_reject(text, tf_cfg)
+                if rej:
+                    continue
+                pool.append(text)
+                added += 1
+        except Exception as e:  # never let style collection break a training step
+            print(f"[teacher_api] style collect skipped: {e}")
+
     def _summarize_replace_normal_step(
         self,
         gen_batch: DataProto,
@@ -1291,19 +1510,31 @@ class NewRayPPOTrainer(RayPPOTrainer):
         cand_gen.meta_info = deepcopy(gen_batch.meta_info)
         cand_gen.meta_info['is_se'] = False
         cand_gen.meta_info['is_extra'] = False
+        use_teacher = getattr(self, "_use_teacher_api", False)
         with marked_timer("sr_gen", timing_raw, color="cyan"):
-            cand_out = self.actor_rollout_wg.generate_sequences(cand_gen)
-            timing_raw.update(cand_out.meta_info.get("timing", {}))
-            cand_out.meta_info.pop("timing", None)
+            if use_teacher:
+                # teacher-API rephraser: 用外部强模型的 HTTP 调用替换本地生成，返回与
+                # generate_sequences 同契约的 cand_out（下游打分/过滤/拼接均不变）。
+                teacher_messages = self._build_teacher_messages(batch, all_q, K, K_data)
+                cand_out = self._teacher_api_rollout(cand_gen, teacher_messages)
+            else:
+                cand_out = self.actor_rollout_wg.generate_sequences(cand_gen)
+                timing_raw.update(cand_out.meta_info.get("timing", {}))
+                cand_out.meta_info.pop("timing", None)
         cand_resp = cand_out.batch['responses']               # [W*K, w]
 
         # --- 4. 候选在长 prompt 下的 logprob（off_old_log_probs / target_probs 来源）---
-        with marked_timer("sr_logprob", timing_raw, color="cyan"):
-            _lp = self.actor_rollout_wg.compute_log_prob(cand_out)
-            long_log_prob = _lp.batch.pop('old_log_probs')    # [W*K, w]
-            if 'entropys' in _lp.batch.keys():
-                _lp.batch.pop('entropys')
-            del _lp
+        #     teacher-API 模式：不对 teacher 内容算 behavior logprob（API 无可用 logprob），
+        #     off_old_log_probs / target_probs 保持零占位（见上方），loss 端只能走不依赖
+        #     它们的模式（vanilla / SFT 蒸馏）。long_log_prob=None 作为下游的开关。
+        long_log_prob = None
+        if not use_teacher:
+            with marked_timer("sr_logprob", timing_raw, color="cyan"):
+                _lp = self.actor_rollout_wg.compute_log_prob(cand_out)
+                long_log_prob = _lp.batch.pop('old_log_probs')    # [W*K, w]
+                if 'entropys' in _lp.batch.keys():
+                    _lp.batch.pop('entropys')
+                del _lp
 
         # --- 5. 候选打分 + 轨迹过滤（按 W*K 展平，每行一条候选）---
         # ground-truth 展平到 W*K：每题 GT 重复 K 次（与候选行一一对应）。
@@ -1335,8 +1566,11 @@ class NewRayPPOTrainer(RayPPOTrainer):
         )
         # 宽度一致性：generate 把 response 右填充到 max_response_length，
         # _build_hybrid 也 pad 到 max(max_response_length, w)，与 on 批 resp_width 相同。
-        off_batch.batch['target_probs'] = torch.exp(long_log_prob)
-        off_batch.batch['off_old_log_probs'] = long_log_prob
+        if long_log_prob is not None:
+            off_batch.batch['target_probs'] = torch.exp(long_log_prob)
+            off_batch.batch['off_old_log_probs'] = long_log_prob
+        # teacher-API 模式（long_log_prob is None）：不写 target_probs/off_old_log_probs，
+        # splice 时不会覆盖 gen_batch_output 的零占位 -> off 行无 behavior logprob。
 
         # 候选选择打分（近似 no-prefix 亲和度）：用已算好的 long_log_prob（候选在长
         # summarize prompt 下的 per-token logprob）做「序列平均 log_prob」——在候选
@@ -1345,8 +1579,14 @@ class NewRayPPOTrainer(RayPPOTrainer):
         # （不额外 forward）。select='logp' 时用它选合格里分数最高的；默认 'shortest'
         # 保持旧行为（按 k 升序取第一条＝prefix 最短）。
         cand_valid = (cand_resp != pad_token_id).float()            # [W*K, w]
-        cand_logp_mean = (long_log_prob * cand_valid).sum(-1) / (cand_valid.sum(-1) + 1e-8)  # [W*K]
+        cand_logp_mean = None
         sr_select = self.config.actor_rollout_ref.rollout.get('summarize_replace_select', 'shortest')
+        if long_log_prob is not None:
+            cand_logp_mean = (long_log_prob * cand_valid).sum(-1) / (cand_valid.sum(-1) + 1e-8)  # [W*K]
+        elif sr_select == 'logp':
+            # teacher-API 模式没有 long_log_prob，无法按 logp 选；回退到 shortest。
+            print("[teacher_api] summarize_replace_select='logp' 不可用（无 long_log_prob），回退 'shortest'")
+            sr_select = 'shortest'
 
         # --- 7. 每题挑一条合格候选，替换其最后一条 rollout（固定第 n-1 槽）---
         #     select='shortest'（默认）：按 k 升序取第一条合格＝prefix 最短。
@@ -2522,6 +2762,12 @@ class NewRayPPOTrainer(RayPPOTrainer):
                     metrics['batch/traj_filter_rejected'] = n_rej
                     for r, c in reason_counts.items():
                         metrics[f'batch/traj_filter_{r}'] = c
+
+                # teacher-API：把 R 本步的正确+格式干净 on-policy rollout 收进 style pool，
+                # 供下一步作 teacher 的 Target Style Examples（首步池空则 teacher 无示例）。
+                if getattr(self, "_use_teacher_api", False):
+                    self._collect_style_examples(batch, reward_tensor, off_policy_mask_np)
+                    metrics['batch/style_pool_size'] = len(self._style_pool)
 
                 for uid in unique_uids:
                     uid_mask = uids == uid
