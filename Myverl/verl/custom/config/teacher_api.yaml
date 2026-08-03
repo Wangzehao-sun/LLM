@@ -15,7 +15,7 @@
 # / target_probs stay zero -> the off-row loss must be a behavior-logprob-free
 # mode (off_policy_reshape in {vanilla, rl-sft}); 'luffy' is rejected at startup.
 
-enable: False
+enable: False           # master switch; OVERRIDDEN by env TEACHER_API_ENABLE when set (from the train script)
 
 # --- endpoint (OpenAI-compatible /v1/chat/completions) ---
 url: ""                 # single endpoint; empty -> use api_list

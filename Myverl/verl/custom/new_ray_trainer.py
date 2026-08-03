@@ -1383,6 +1383,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
         # --- 1. 确保 explain-style 所需的 key 在整批存在（on 行用零占位，masked 掉）---
         #     use_off_policy_probs=True 时 update_actor 会 select 'target_probs'，
         #     这里给全批补零，避免 select 失败；on 行 prefix_mask=0 -> off_ratio 被 mask。
+        use_teacher = getattr(self, "_use_teacher_api", False)
         if 'prefix_mask' not in gen_batch_output.batch.keys():
             gen_batch_output.batch['prefix_mask'] = torch.zeros(
                 (bn, resp_width), dtype=torch.bool, device=device
@@ -1390,9 +1391,14 @@ class NewRayPPOTrainer(RayPPOTrainer):
         gen_batch_output.batch['target_probs'] = torch.zeros(
             (bn, resp_width), dtype=torch.float32, device=device
         )
-        gen_batch_output.batch['off_old_log_probs'] = torch.zeros(
-            (bn, resp_width), dtype=torch.float32, device=device
-        )
+        # teacher 模式：**不建** off_old_log_probs 零占位。teacher 内容没有有效的行为分布，
+        # 若 off_old_log_probs=0 会被 :3016 的 swap 塞进 off 行的 old_log_probs、把 IS ratio
+        # 弄歪。不建它 -> swap 跳过 -> off 行直接沿用模型自身的 old_log_probs（PPO 常规比值，
+        # 与 off_policy_reshape 无关，clip 也不受影响）。
+        if not use_teacher:
+            gen_batch_output.batch['off_old_log_probs'] = torch.zeros(
+                (bn, resp_width), dtype=torch.float32, device=device
+            )
 
         # --- 2. 决定候选题集合：全部题 或 只全错题（由 summarize_replace 控制）---
         #     'all'：每题都生成候选并尝试替换最后一槽（省一次 compute_reward）。
@@ -1408,7 +1414,6 @@ class NewRayPPOTrainer(RayPPOTrainer):
             )
         # on-policy 每题每条 rollout 的 reward 和 [B, n]。wrong_only 用它筛"全错"题；
         # teacher 模式用它挑一条错误 rollout 作 {style_example_1}。两种情形都需要它。
-        use_teacher = getattr(self, "_use_teacher_api", False)
         on_reward_sum = None
         need_on_reward = (sr_target == 'wrong_only') or use_teacher
         if need_on_reward:

@@ -39,15 +39,26 @@ def load_teacher_config(path: str | None = None):
     ``TEACHER_API_CONFIG`` -> the bundled ``config/teacher_api.yaml``. Returns an
     OmegaConf DictConfig. Missing file -> a config with ``enable=False`` so the
     caller cleanly no-ops instead of crashing.
+
+    MASTER SWITCH: the env var ``TEACHER_API_ENABLE`` (set from the training
+    script) OVERRIDES the file's ``enable`` when present (1/true/yes/on ->
+    enabled, else disabled). This lets the shell script toggle teacher on/off
+    while url/model/... stay in the standalone yaml.
     """
     from omegaconf import OmegaConf
 
     cfg_path = path or os.environ.get("TEACHER_API_CONFIG") or _DEFAULT_CONFIG_PATH
-    if not os.path.isfile(cfg_path):
-        print(f"[teacher_api] config not found at {cfg_path}; treating as disabled.")
-        return OmegaConf.create({"enable": False})
-    cfg = OmegaConf.load(cfg_path)
-    print(f"[teacher_api] loaded config from {cfg_path}")
+    if os.path.isfile(cfg_path):
+        cfg = OmegaConf.load(cfg_path)
+        print(f"[teacher_api] loaded config from {cfg_path}")
+    else:
+        print(f"[teacher_api] config not found at {cfg_path}; enable defaults to False.")
+        cfg = OmegaConf.create({"enable": False})
+
+    env_enable = os.environ.get("TEACHER_API_ENABLE")
+    if env_enable is not None:
+        cfg.enable = str(env_enable).strip().lower() in ("1", "true", "yes", "on", "y", "t")
+        print(f"[teacher_api] enable overridden by TEACHER_API_ENABLE -> {bool(cfg.enable)}")
     return cfg
 
 
