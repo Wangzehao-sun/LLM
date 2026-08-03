@@ -50,13 +50,15 @@ Schema add:
     summarize_prompt  : np.ndarray[object] of length 1
     summarize_prompts : np.ndarray[object] of length K (prefix ascending)
                         each element being a list[{role, content}] (system + user).
-    teacher_prompts   : (OPTIONAL, with --teacher-prompts) np.ndarray[object] of
-                        length 1, the online teacher-API's OWN single pre-rendered
-                        prompt, built with a SEPARATE template (--teacher-template) and
-                        a single prefix (--teacher-ratio), kept physically apart from
-                        summarize_prompts. Column name is --teacher-col and must match
-                        teacher_api.prompt_key at train time. The K summarize-replace
-                        candidates all reuse this one prompt.
+    teacher_prompts   : (OPTIONAL, with --teacher-prompts) the online teacher-API's OWN
+                        pre-rendered prompt in DIRECT format -- a single [system?, user]
+                        messages list stored as list[struct] (same layout as the original
+                        ``prompt`` column, directly callable by a Chat API). Built with a
+                        SEPARATE template (--teacher-template) and a single prefix
+                        (--teacher-ratio). {question}/{prefix} are filled offline; the
+                        {style_example_1} placeholder is PRESERVED for the trainer to fill
+                        online with the target model's own incorrect same-question rollout.
+                        Column name is --teacher-col and must match teacher_api.prompt_key.
 
 Usage:
 
@@ -223,35 +225,59 @@ NO_TOKENIZER = "__no_tokenizer__"
 # the policy's summarize_prompts so the two prompt designs never mix. Same prefix
 # machinery (split points / ratios, ascending), but its own template below.
 TEACHER_TEMPLATE_DEFAULT = (
-    "You are given a mathematical problem, a detailed expert reasoning draft, and several "
-    "outputs that illustrate the target model's natural reasoning style.\n\n"
-    "Write one complete solution to the problem.\n\n"
-    "Use the expert draft for mathematical guidance: reconstruct its valid reasoning path, "
-    "preserve its useful intermediate steps, equations, checks, and corrections, and fill in "
-    "any implicit transitions needed for a self-contained solution.\n\n"
-    "Use the style examples only to learn the target model's reasoning tone, pacing, and way "
-    "of connecting steps. Do not reuse their mathematical content, conclusions, or "
-    "problem-specific wording.\n\n"
-    "Requirements:\n"
-    "1. Solve the problem directly without mentioning the expert draft or the style examples.\n"
-    "2. Preserve the useful detail of the expert reasoning rather than summarizing it.\n"
-    "3. Express the reasoning naturally in the target style, without artificial headings or "
-    "deliberately imitated mistakes.\n"
-    "4. Silently correct any clear error in the draft, while keeping its valid reasoning path "
-    "whenever possible.\n"
-    "5. Output only the solution and place the final answer in \\boxed{}.\n\n"
-    "## Target Style Examples\n\n"
-    "### Example 1\n{style_example_1}\n\n"
-    "### Example 2\n{style_example_2}\n\n"
-    "## Problem\n{question}\n\n"
-    "## Expert Reasoning Draft\n{prefix}\n\n"
-    "## Solution"
+    "You are given a mathematical problem, an incorrect solution attempt produced "
+    "by the target model for the same problem, and an expert reasoning guidance.\n\n"
+
+    "Write one complete, education-level, and mathematically correct solution. Use the target "
+    "model's attempt as the main trajectory and style reference, and use the expert guidance to "
+    "verify and correct its mathematical reasoning. The result should read as if the target "
+    "model had solved the problem correctly in a single pass.\n\n"
+
+    "## Requirements:\n"
+    "1. Internally locate the earliest mathematical error, corrupted content, unsupported "
+    "transition, or missing explanation that prevents the attempt from being a correct, "
+    "self-contained solution. Everything before that point that is mathematically valid "
+    "forms the preserved prefix.\n"
+    "2. The corrected solution must begin with the longest valid initial prefix of the target "
+    "model's attempt copied verbatim, character for character. Do not paraphrase, shorten, "
+    "reorder, polish, or reformat this prefix. Preserve its conversational opening, narrative "
+    "person, Markdown headings, paragraph breaks, notation, equations, and wording. If the "
+    "first problem occurs inside a sentence, preserve through the last complete valid sentence "
+    "before it. Do not add any new introduction before the preserved prefix.\n"
+    "3. Starting exactly where the preserved prefix ends, make the minimum necessary repair "
+    "to the first problematic step and all later reasoning that depends on it. Do not merely "
+    "replace the final answer, and do not rewrite valid earlier material just to make it sound "
+    "cleaner or more concise.\n"
+    "4. After the first correction, continue in the same local style as the target attempt. "
+    "Keep the same narrative person, conversational markers, Markdown organization, notation, "
+    "pacing, and approximate explanatory density.\n"
+    "5. Use the expert guidance for mathematical correctness, while expressing repaired or "
+    "new reasoning in the target model's natural language and reasoning granularity rather than "
+    "rewriting the whole solution in the expert's style.\n"
+    "6. Preserve the attempt's level of detail when it is sufficient. If it is too brief, skips "
+    "a non-obvious argument, or invokes an unfamiliar result without enough explanation, expand "
+    "the reasoning from that point onward to produce a self-contained education-level solution. "
+    "Do not shorten valid detailed reasoning merely for concision.\n"
+    "7. If the original approach cannot be repaired coherently, preserve only its longest valid "
+    "initial prefix and reconstruct the remaining solution correctly, while still matching the "
+    "target model's general style and level of detail.\n"
+    "8. Output only one clean corrected solution. Do not mention the attempt, the expert guidance, "
+    "the error, or the correction process. Place the final answer in exactly one \\boxed{}.\n\n"
+
+    "<problem>\n{question}\n</problem>\n\n"
+    "<expert_reasoning_guidance>\n"
+    "{prefix}\n"
+    "</expert_reasoning_guidance>\n\n"
+    "<target_model_attempt>\n"
+    "{style_example_1}\n"
+    "</target_model_attempt>\n\n"
+    "## Corrected Solution:"
 )
 
-# Style-example placeholders left UNFILLED at offline render time and substituted at
-# training time by the trainer with the policy's own recent correct rollouts. Offline we
-# only fill {question} and {prefix}; these tokens pass through verbatim.
-TEACHER_STYLE_PLACEHOLDERS = ("{style_example_1}", "{style_example_2}")
+# The single style-example placeholder is left UNFILLED at offline render time and
+# substituted at TRAINING time by the trainer with the target model's own incorrect
+# on-policy rollout for the SAME question. Offline we only fill {question} and {prefix}.
+TEACHER_STYLE_PLACEHOLDERS = ("{style_example_1}",)
 
 
 def _render_teacher_template(template: str, question: str, prefix_text: str) -> str:
@@ -553,6 +579,43 @@ def _build_prompt_array(
     return arr
 
 
+def _build_teacher_prompt_direct(
+    system_msg: Dict[str, str] | None,
+    question: str,
+    template: str,
+    tgt_tokens: Any,
+    n_tgt: int,
+    ratio: float,
+) -> np.ndarray:
+    """Build the teacher prompt in DIRECT format: a single [system?, user] messages
+    list stored as a 1D object array of dicts (one dict per element), same layout as
+    the original ``prompt`` column (pyarrow serializes it as ``list[struct]``, directly
+    callable by an OpenAI-compatible Chat API).
+
+    Only ``{question}``/``{prefix}`` are filled; the ``{style_example_1}`` placeholder
+    is preserved for the trainer to fill online with the target model's own incorrect
+    same-question rollout. The prefix is a single ``ratio`` cut of the answer-truncated
+    reasoning (backed up to a sentence boundary when ratio < 1.0).
+    """
+    no_tok = (worker_tokenizer == NO_TOKENIZER)
+    sp = max(0, min(int(round(ratio * n_tgt)), n_tgt))
+    if sp == 0:
+        prefix_text = ""
+    else:
+        prefix_text = tgt_tokens[:sp] if no_tok else worker_tokenizer.decode(
+            tgt_tokens[:sp], skip_special_tokens=True
+        )
+        if ratio < 1.0:
+            prefix_text = _backup_to_sentence_boundary(prefix_text)
+    messages = _build_summarize_prompt(
+        system_msg, question, prefix_text, template, is_teacher=True
+    )
+    arr = np.empty(len(messages), dtype=object)  # 1D array of {role,content} dicts
+    for i, m in enumerate(messages):
+        arr[i] = m
+    return arr
+
+
 def process_single_item(
     item: Dict[str, Any],
     template: str,
@@ -628,12 +691,10 @@ def process_single_item(
         )["input_ids"]
         n_tgt = len(tgt_tokens)
 
-    # --- teacher-only: render just the teacher column, skip summarize entirely ---
+    # --- teacher-only: render just the teacher column (DIRECT format), skip summarize ---
     if teacher_only:
-        sp_teacher = int(round(teacher_ratio * n_tgt))
-        item[teacher_col] = _build_prompt_array(
-            system_msg, question, teacher_template, tgt_tokens, n_tgt,
-            [(sp_teacher, teacher_ratio < 1.0)], is_teacher=True,
+        item[teacher_col] = _build_teacher_prompt_direct(
+            system_msg, question, teacher_template, tgt_tokens, n_tgt, teacher_ratio,
         )
         return item
 
@@ -654,12 +715,10 @@ def process_single_item(
         system_msg, question, template, tgt_tokens, n_tgt, list_pairs,
     )
 
-    # --- teacher column (online teacher-API): its own template + a SINGLE prefix ---
+    # --- teacher column (online teacher-API): DIRECT format, single prefix ---
     if teacher_template is not None:
-        sp_teacher = int(round(teacher_ratio * n_tgt))
-        item[teacher_col] = _build_prompt_array(
-            system_msg, question, teacher_template, tgt_tokens, n_tgt,
-            [(sp_teacher, teacher_ratio < 1.0)], is_teacher=True,
+        item[teacher_col] = _build_teacher_prompt_direct(
+            system_msg, question, teacher_template, tgt_tokens, n_tgt, teacher_ratio,
         )
     return item
 
@@ -1053,33 +1112,39 @@ def main() -> None:
     if sample is not None:
         sample_points = sample.get("token_split_points")
         sample_cols = list(emitted_cols)
+
+        def _print_messages(msgs, header):
+            print(header)
+            for msg in msgs:
+                if not isinstance(msg, dict):
+                    continue
+                content = msg.get("content", "")
+                head = content[:300].replace("\n", " ")
+                tail = content[-200:].replace("\n", " ") if len(content) > 500 else ""
+                print(f"  [{msg.get('role')}] {head}{' ... ' + tail if tail else ''}")
+
         for col in sample_cols:
             arr = sample[col]
             if not (isinstance(arr, np.ndarray) and len(arr) >= 1):
                 continue
+            # teacher 列是 DIRECT 格式：arr 本身就是一条 messages list（元素是 dict）。
+            if col == args.teacher_col and teacher_template is not None:
+                _print_messages(
+                    arr, f"\n--- sample {col} (teacher DIRECT, ratio={args.teacher_ratio}) ---"
+                )
+                continue
+            # summarize 列：arr 是「按 split/ratio 排列的多条 messages list」。
             idxs = sorted({0, len(arr) // 2, len(arr) - 1})
             for idx in idxs:
-                # 标注每条 prompt 的 prefix 来源，各列情形不同：
-                #   - summarize_prompt（单条）：来自 single_ratio，与 split_points 无关。
-                #   - summarize_prompts + list-mode multi：一条对一个 token_split_points。
-                #   - summarize_prompts + list-mode custom：来自 list_ratios[idx]。
-                #   - teacher 列：单条，prefix 来自 teacher_ratio。
                 if col == "summarize_prompt":
                     tag = f" (single, mode={args.single_mode})"
-                elif col == args.teacher_col and teacher_template is not None:
-                    tag = f" (teacher, single, ratio={args.teacher_ratio})"
                 elif args.list_mode == "multi":
                     tag = ""
                     if isinstance(sample_points, (list, np.ndarray)) and idx < len(sample_points):
                         tag = f" (split_point={sample_points[idx]})"
                 else:  # custom
                     tag = f" (ratio={list_ratios[idx]})" if idx < len(list_ratios) else ""
-                print(f"\n--- sample {col}[{idx}]{tag} ---")
-                for msg in arr[idx]:
-                    content = msg.get("content", "")
-                    head = content[:300].replace("\n", " ")
-                    tail = content[-200:].replace("\n", " ") if len(content) > 500 else ""
-                    print(f"  [{msg.get('role')}] {head}{' ... ' + tail if tail else ''}")
+                _print_messages(arr[idx], f"\n--- sample {col}[{idx}]{tag} ---")
 
     out_df.to_parquet(args.output, index=False)
     size_mb = pd.Series([0]).memory_usage()  # placeholder, real size below
