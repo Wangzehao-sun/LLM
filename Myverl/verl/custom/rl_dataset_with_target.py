@@ -364,9 +364,9 @@ class RLHFDatasetWithTarget(RLHFDataset):
             row_dict['summarize_position_ids'] = summarize_position_ids
 
             # ---- teacher-API 用：独立的预渲染 prompt 列（与 summarize_prompts 区分开）----
-            # 优先用 teacher 专属列 self.teacher_prompt_key（每行一组 K 条 messages）；该列
-            # 缺失时才回退到 summarize_prompts（keep_summarize_raw）。两者都做同样的 K 对齐，
-            # 保证行序与 summarize_input_ids 一致。存 JSON 字符串，collate 走 object 数组。
+            # summarize_prompts_raw：K 条 messages 列表（list[list[struct]]），做 K 对齐。
+            # teacher 列是 DIRECT 格式：一条 messages 列表（list[struct]），整条原样 JSON 存，
+            # 不做 K 对齐（trainer 端把它复用给该题的全部 K 个候选）。
             def _align_and_dump(raw):
                 if isinstance(raw, np.ndarray):
                     raw = raw.tolist()
@@ -383,9 +383,20 @@ class RLHFDatasetWithTarget(RLHFDataset):
                 except (TypeError, ValueError):
                     return "[]"
 
+            def _dump_direct(raw):
+                # 一条 messages 列表（元素为 {role,content} dict）原样 JSON 存；缺列/空 -> "[]"。
+                if isinstance(raw, np.ndarray):
+                    raw = raw.tolist()
+                if not raw:
+                    return "[]"
+                try:
+                    return json.dumps(raw, ensure_ascii=False)
+                except (TypeError, ValueError):
+                    return "[]"
+
             if self.teacher_prompt_key:
                 # 总是写入该 key（缺列/空 -> "[]"），保证 collate_fn 跨行 key 一致。
-                row_dict['teacher_prompts_raw'] = _align_and_dump(
+                row_dict['teacher_prompts_raw'] = _dump_direct(
                     original_row.get(self.teacher_prompt_key)
                 )
             if self.keep_summarize_raw:

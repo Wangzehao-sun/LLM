@@ -40,7 +40,6 @@ top_p: 0.95
 max_tokens: 16384
 enable_thinking: False  # chat_template_kwargs.enable_thinking
 
-# --- Target Style Examples (sampled from the policy's own recent correct rollouts) ---
-style_examples_k: 2         # examples injected per question
-style_pool_size: 256        # rolling buffer capacity
-style_collect_per_step: 32  # max examples added to the pool per step
+# The teacher template's {style_example_1} is filled at TRAINING time with the target
+# model's own incorrect on-policy rollout for the SAME question (picked from the current
+# batch), so there is no style-pool config here.

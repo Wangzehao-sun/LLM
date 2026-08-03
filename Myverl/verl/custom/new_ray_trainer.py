@@ -438,16 +438,11 @@ class NewRayPPOTrainer(RayPPOTrainer):
         # 配置来自独立文件 verl/custom/config/teacher_api.yaml（不与 trainer 配置混合），
         # 路径可用环境变量 TEACHER_API_CONFIG 覆盖。off_old_log_probs / target_probs 恒为
         # 零占位（不对 teacher 内容算 behavior logprob），故 loss 只能走不依赖它们的模式
-        # （vanilla / SFT 蒸馏）。style_pool 缓存 R 近期正确 on-policy rollout 作示例。
-        from collections import deque
+        # （vanilla / SFT 蒸馏）。teacher 模板的 {style_example_1} 在训练时用 R 本步对该题
+        # 的错误 on-policy rollout 就地填入（不再用全局风格池）。
         from verl.custom.teacher_api_client import load_teacher_config
         self._teacher_api_cfg = load_teacher_config()
         self._use_teacher_api = bool(self._teacher_api_cfg.get('enable', False))
-        _pool_size = (
-            int(self._teacher_api_cfg.get('style_pool_size', 256))
-            if self._use_teacher_api else 1
-        )
-        self._style_pool = deque(maxlen=max(1, _pool_size))
         if self._use_teacher_api:
             reshape = OmegaConf.select(
                 self.config, "actor_rollout_ref.actor.policy_loss.off_policy_reshape",
@@ -460,8 +455,8 @@ class NewRayPPOTrainer(RayPPOTrainer):
             )
             print(
                 f"[teacher_api] enabled: model={self._teacher_api_cfg.get('model')}, "
-                f"style_examples_k={self._teacher_api_cfg.get('style_examples_k', 2)}, "
-                f"pool_size={_pool_size}, off_policy_reshape={reshape}"
+                f"style_example=incorrect on-policy rollout (same question), "
+                f"off_policy_reshape={reshape}"
             )
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
@@ -1249,130 +1244,94 @@ class NewRayPPOTrainer(RayPPOTrainer):
         print(f"[teacher_api] rollout ok={n_ok}/{N}")
         return cand_out
 
-    def _sample_style_examples(self, k: int) -> list:
-        """Sample up to k of R's recent correct on-policy rollouts from the style pool.
-        Returns a list of strings (may be shorter than k, or empty until the pool fills)."""
-        import random
-        pool = getattr(self, "_style_pool", None)
-        if not pool:
-            return []
-        n = min(int(k), len(pool))
-        if n <= 0:
-            return []
-        return random.sample(list(pool), n)
+    def _pick_incorrect_rollout_text(self, gen_batch_output, on_reward_sum, p, n, success_value=1):
+        """Return the text of R's own INCORRECT on-policy rollout for question ``p``.
 
-    def _fill_style_placeholders(self, messages: list) -> list:
-        """Substitute {style_example_1..N} placeholders in the teacher messages with
-        the policy's own recent correct rollouts (style pool). The teacher template
-        (prepare_summarize_prompts.py::TEACHER_TEMPLATE_DEFAULT) embeds these
-        placeholders IN-PLACE (between the requirements and the problem), so we fill
-        them here rather than appending a block. Placeholders with no available example
-        (empty pool / fewer than N) are replaced with '' so no literal {..} leaks to
-        the teacher. If a message contains no placeholder, it is returned unchanged.
+        gen_batch_output.responses is [B*n, resp] interleaved (question p, slot j ->
+        row p*n + j). Prefer a slot whose on-policy reward != success; if none is
+        incorrect (or on_reward_sum is unavailable) fall back to slot 0. Returns '' if
+        the picked response is empty. This is the online analog of the offline
+        ``_extract_incorrect_response`` in Inferapi/prepare_summarize_prompts.py.
         """
+        pad = self.tokenizer.pad_token_id
+        responses = gen_batch_output.batch['responses']
+        slot = 0
+        if on_reward_sum is not None:
+            wrong = (on_reward_sum[p] != success_value).nonzero().squeeze(-1)
+            if wrong.numel() > 0:
+                slot = int(wrong[0].item())
+        row = p * n + slot
+        ids = responses[row]
+        text = self.tokenizer.decode(ids[ids != pad], skip_special_tokens=True).strip()
+        return text
+
+    def _fill_style_example(self, messages: list, attempt_text: str) -> list:
+        """Substitute the {style_example_1} placeholder (the target model's incorrect
+        same-question attempt) into the teacher messages. Any other {style_example_N}
+        placeholder is replaced with '' so no literal {..} leaks to the teacher. Messages
+        with no placeholder are returned unchanged."""
         import re
-        # discover which style_example_i placeholders actually appear
-        needed = set()
-        pat = re.compile(r"\{style_example_(\d+)\}")
-        for m in messages:
-            if isinstance(m, dict):
-                needed.update(int(i) for i in pat.findall(m.get('content', '') or ''))
-        if not needed:
-            return messages
-        examples = self._sample_style_examples(max(needed))
         out = []
         for m in messages:
             if not isinstance(m, dict) or '{style_example_' not in (m.get('content', '') or ''):
                 out.append(m)
                 continue
-            content = m['content']
-            for i in sorted(needed):
-                ex = examples[i - 1] if i - 1 < len(examples) else ""
-                content = content.replace(f"{{style_example_{i}}}", ex)
+            content = m['content'].replace('{style_example_1}', attempt_text or '')
+            content = re.sub(r'\{style_example_\d+\}', '', content)  # blank any others
             nm = dict(m)
             nm['content'] = content
             out.append(nm)
         return out
 
-    def _build_teacher_messages(self, batch: DataProto, all_q: list, K: int, K_data: int) -> list:
+    def _build_teacher_messages(self, batch: DataProto, all_q: list, K: int,
+                                gen_batch_output: DataProto, on_reward_sum, n: int) -> list:
         """Build W*K teacher messages arrays mirroring long_prompt's row order
-        (row r = w_idx*K + k -> question all_q[w_idx], candidate k). Each = the
-        teacher's OWN pre-rendered prompt with its {style_example_*} placeholders
-        substituted by the policy's recent correct rollouts (style pool).
+        (row r = w_idx*K + k -> question all_q[w_idx], candidate k).
 
-        Prompt source priority:
-          1. ``teacher_prompts_raw`` — the teacher's dedicated pre-rendered column
-             (config teacher_api.prompt_key), kept SEPARATE from summarize_prompts.
-          2. ``summarize_prompts_raw`` — fallback if the teacher column is absent/empty.
-          3. decode the tokenized summarize prompt — last-resort fallback.
+        The teacher prompt is the DIRECT-format column ``teacher_prompts_raw`` (a single
+        messages list per question); its {style_example_1} placeholder is filled with R's
+        OWN incorrect on-policy rollout for that same question. All K candidates of a
+        question reuse the same filled prompt (K stochastic teacher samples).
+
+        Source priority: teacher_prompts_raw (direct) -> summarize_prompts_raw[0] ->
+        decode the tokenized summarize prompt.
         """
         teacher_col = batch.non_tensor_batch.get('teacher_prompts_raw', None)
         summ_col = batch.non_tensor_batch.get('summarize_prompts_raw', None)
         pad_token_id = self.tokenizer.pad_token_id
 
-        def _load_raw(col, w_idx):
+        def _load_direct(col, w_idx):
+            # teacher_prompts_raw is a single messages list (list[dict]) per row.
             if col is None:
                 return None
             try:
                 raw = json.loads(col[w_idx])
-                return raw if raw else None
+            except Exception:
+                return None
+            return raw if raw else None
+
+        def _load_summ_fallback(w_idx):
+            if summ_col is None:
+                return None
+            try:
+                raw = json.loads(summ_col[w_idx])   # list of K messages-arrays
+                return raw[0] if raw else None
             except Exception:
                 return None
 
         messages_list = []
-        for w_idx in all_q:
-            raw_all = _load_raw(teacher_col, w_idx)    # 1) teacher 专属列
-            if raw_all is None:
-                raw_all = _load_raw(summ_col, w_idx)   # 2) 回退到 summarize 原始 messages
-            for k in range(K):
-                if raw_all:
-                    msgs = deepcopy(raw_all[min(k, len(raw_all) - 1)])
-                else:
-                    # 3) 最后兜底：decode tokenized summarize prompt
-                    ids = batch.batch['summarize_input_ids'][w_idx, min(k, K_data - 1)]
-                    text = self.tokenizer.decode(
-                        ids[ids != pad_token_id], skip_special_tokens=True
-                    )
-                    msgs = [{"role": "user", "content": text}]
-                # 用 R 近期正确 rollout 替换模板里的 {style_example_*} 占位（就地填充，
-                # 而非追加块）。每条候选独立重采样一次，增加多样性。无占位则原样返回。
-                msgs = self._fill_style_placeholders(msgs)
-                messages_list.append(msgs)
+        for w_idx, p in enumerate(all_q):
+            base = _load_direct(teacher_col, w_idx) or _load_summ_fallback(w_idx)
+            if not base:
+                # last-resort fallback: decode the tokenized summarize prompt
+                ids = batch.batch['summarize_input_ids'][w_idx, 0]
+                text = self.tokenizer.decode(ids[ids != pad_token_id], skip_special_tokens=True)
+                base = [{"role": "user", "content": text}]
+            attempt = self._pick_incorrect_rollout_text(gen_batch_output, on_reward_sum, p, n)
+            filled = self._fill_style_example(base, attempt)
+            for _k in range(K):
+                messages_list.append(deepcopy(filled))
         return messages_list
-
-    def _collect_style_examples(self, batch: DataProto, reward_tensor: torch.Tensor,
-                                off_policy_mask_np) -> None:
-        """Harvest R's correct + format-clean on-policy rollouts into the style pool,
-        to seed the teacher's Target Style Examples on the next step."""
-        pool = getattr(self, "_style_pool", None)
-        if pool is None:
-            return
-        try:
-            success_value = 1
-            row_reward = reward_tensor.sum(-1).cpu().numpy()          # [B]
-            on_policy = ~np.asarray(off_policy_mask_np)
-            cand_idx = np.nonzero(on_policy & (row_reward == success_value))[0]
-            if len(cand_idx) == 0:
-                return
-            tf_cfg = self.config.algorithm.get('trajectory_filter', {})
-            max_add = int(self._teacher_api_cfg.get('style_collect_per_step', 32))
-            added = 0
-            for i in cand_idx.tolist():
-                if added >= max_add:
-                    break
-                resp_ids = batch.batch['responses'][i]
-                text = self.tokenizer.decode(
-                    resp_ids[resp_ids != self.tokenizer.pad_token_id], skip_special_tokens=True
-                ).strip()
-                if not text:
-                    continue
-                rej, _reason = _trajectory_filter_reject(text, tf_cfg)
-                if rej:
-                    continue
-                pool.append(text)
-                added += 1
-        except Exception as e:  # never let style collection break a training step
-            print(f"[teacher_api] style collect skipped: {e}")
 
     def _summarize_replace_normal_step(
         self,
@@ -1447,10 +1406,12 @@ class NewRayPPOTrainer(RayPPOTrainer):
             raise ValueError(
                 f"summarize_replace must be 'all' or 'wrong_only' when replacing, got {sr_target!r}"
             )
-        # on-policy 每题每条 rollout 的 reward 和 [B, n]（仅 wrong_only 分支会算；
-        # 'all' 模式为 None）。替换阶段用它优先替换一条"错误"rollout 而非固定末槽。
+        # on-policy 每题每条 rollout 的 reward 和 [B, n]。wrong_only 用它筛"全错"题；
+        # teacher 模式用它挑一条错误 rollout 作 {style_example_1}。两种情形都需要它。
+        use_teacher = getattr(self, "_use_teacher_api", False)
         on_reward_sum = None
-        if sr_target == 'wrong_only':
+        need_on_reward = (sr_target == 'wrong_only') or use_teacher
+        if need_on_reward:
             def _repeat_nt(nt: dict, times: int) -> dict:
                 out = {}
                 for k, v in nt.items():
@@ -1468,6 +1429,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
             gen_batch_output.non_tensor_batch = saved_nt  # 还原，避免污染下游 union
             on_reward_sum = on_reward.sum(-1).to(device).view(train_batch_size, n)
 
+        if sr_target == 'wrong_only':
             acc_thr = self.config.actor_rollout_ref.rollout.get('accuracy_threshold', 0.0)
             if acc_thr and acc_thr > 0:
                 acc = (on_reward_sum == success_value).float().mean(-1)
@@ -1510,12 +1472,14 @@ class NewRayPPOTrainer(RayPPOTrainer):
         cand_gen.meta_info = deepcopy(gen_batch.meta_info)
         cand_gen.meta_info['is_se'] = False
         cand_gen.meta_info['is_extra'] = False
-        use_teacher = getattr(self, "_use_teacher_api", False)
         with marked_timer("sr_gen", timing_raw, color="cyan"):
             if use_teacher:
                 # teacher-API rephraser: 用外部强模型的 HTTP 调用替换本地生成，返回与
                 # generate_sequences 同契约的 cand_out（下游打分/过滤/拼接均不变）。
-                teacher_messages = self._build_teacher_messages(batch, all_q, K, K_data)
+                # {style_example_1} 用 R 本步对该题的错误 on-policy rollout 就地填入。
+                teacher_messages = self._build_teacher_messages(
+                    batch, all_q, K, gen_batch_output, on_reward_sum, n
+                )
                 cand_out = self._teacher_api_rollout(cand_gen, teacher_messages)
             else:
                 cand_out = self.actor_rollout_wg.generate_sequences(cand_gen)
@@ -2762,12 +2726,6 @@ class NewRayPPOTrainer(RayPPOTrainer):
                     metrics['batch/traj_filter_rejected'] = n_rej
                     for r, c in reason_counts.items():
                         metrics[f'batch/traj_filter_{r}'] = c
-
-                # teacher-API：把 R 本步的正确+格式干净 on-policy rollout 收进 style pool，
-                # 供下一步作 teacher 的 Target Style Examples（首步池空则 teacher 无示例）。
-                if getattr(self, "_use_teacher_api", False):
-                    self._collect_style_examples(batch, reward_tensor, off_policy_mask_np)
-                    metrics['batch/style_pool_size'] = len(self._style_pool)
 
                 for uid in unique_uids:
                     uid_mask = uids == uid
