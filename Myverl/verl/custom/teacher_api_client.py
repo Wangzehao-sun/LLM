@@ -20,7 +20,8 @@ from __future__ import annotations
 
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from typing import Any, List, Tuple
 
 import requests
@@ -134,6 +135,20 @@ def batch_chat(messages_list: List[List[dict]], cfg: Any) -> List[Tuple[bool, st
     Returns a list of ``(ok, text)`` aligned to ``messages_list``. Empty input
     returns ``[]``. Never raises on per-item failure — a failed item comes back
     as ``(False, reason)`` so the caller can drop/score it.
+
+    OBSERVABILITY: results are consumed as they complete (not in submit order), so
+    progress is reported while requests are still in flight. Every ``log_every``
+    completions (and at least every ``log_interval_s`` seconds) one line is printed
+    with completed/total, ok/failed counts and elapsed time. This makes a slow-but-
+    working teacher distinguishable from a hung one — previously the call was fully
+    silent until the last request returned, so "server is queueing" and "server is
+    dead" looked identical.
+
+    BOUNDED WAIT: ``wall_clock_budget`` (seconds, 0/None = unlimited) caps the total
+    time spent here. When it expires, in-flight requests are abandoned and their rows
+    come back as ``(False, 'wall_clock_budget exceeded')``. Callers already treat a
+    failed row as "no candidate" (-> that question simply isn't replaced), so giving
+    up is safe and keeps training moving instead of blocking the step forever.
     """
     if not messages_list:
         return []
@@ -146,11 +161,67 @@ def batch_chat(messages_list: List[List[dict]], cfg: Any) -> List[Tuple[bool, st
     n = len(messages_list)
     results: List[Tuple[bool, str]] = [(False, "not run")] * n
 
+    budget = float(_cfg_get(cfg, "wall_clock_budget", 0) or 0)
+    log_every = max(1, int(_cfg_get(cfg, "log_every", 0) or max(1, n // 10)))
+    log_interval_s = float(_cfg_get(cfg, "log_interval_s", 30) or 0)
+    workers = max(1, min(threads, n))
+    print(
+        f"[teacher_api] dispatching {n} request(s), {workers} concurrent, "
+        f"timeout={_cfg_get(cfg, 'timeout', 1500)}s retry={_cfg_get(cfg, 'retry', 3)}"
+        + (f", wall_clock_budget={budget:g}s" if budget > 0 else "")
+    )
+
     def _task(i: int) -> Tuple[int, Tuple[bool, str]]:
         url = endpoints[i % len(endpoints)]
         return i, _single_chat(messages_list[i], cfg, url, headers)
 
-    with ThreadPoolExecutor(max_workers=max(1, min(threads, n))) as ex:
-        for i, res in ex.map(_task, range(n)):
-            results[i] = res
+    t0 = time.time()
+    done = n_ok = 0
+    last_log = t0
+    timed_out = False
+    ex = ThreadPoolExecutor(max_workers=workers)
+    try:
+        futures = [ex.submit(_task, i) for i in range(n)]
+        try:
+            for fut in as_completed(futures, timeout=budget if budget > 0 else None):
+                i, res = fut.result()
+                results[i] = res
+                done += 1
+                n_ok += bool(res[0])
+                now = time.time()
+                if done % log_every == 0 or done == n or (
+                    log_interval_s > 0 and now - last_log >= log_interval_s
+                ):
+                    last_log = now
+                    print(
+                        f"[teacher_api]   {done}/{n} done "
+                        f"(ok={n_ok}, failed={done - n_ok}) {now - t0:.0f}s elapsed",
+                        flush=True,
+                    )
+        except FuturesTimeoutError:
+            timed_out = True
+            for fut in futures:
+                fut.cancel()
+            for i in range(n):
+                if results[i][1] == "not run":
+                    results[i] = (False, "wall_clock_budget exceeded")
+    finally:
+        # Don't block on abandoned in-flight requests when the budget blew.
+        ex.shutdown(wait=not timed_out, cancel_futures=timed_out)
+
+    elapsed = time.time() - t0
+    if timed_out:
+        print(
+            f"[teacher_api] WALL-CLOCK BUDGET ({budget:g}s) EXCEEDED: only {done}/{n} "
+            f"completed (ok={n_ok}); abandoning the rest. Those questions keep their "
+            f"original rollouts. Raise teacher_api.wall_clock_budget or lower max_tokens/"
+            f"threads if this repeats.",
+            flush=True,
+        )
+    else:
+        print(
+            f"[teacher_api] all {n} request(s) returned in {elapsed:.0f}s "
+            f"(ok={n_ok}, failed={n - n_ok})",
+            flush=True,
+        )
     return results

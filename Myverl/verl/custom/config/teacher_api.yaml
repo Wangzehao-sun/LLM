@@ -40,6 +40,20 @@ top_p: 0.95
 max_tokens: 16384
 enable_thinking: False  # chat_template_kwargs.enable_thinking
 
+# --- observability / bounded wait ---
+# batch_chat prints progress as requests COMPLETE (not in submit order), so a slow
+# teacher looks different from a hung one. Without these the call is fully silent
+# until the last request returns: worst case retry=3 x timeout=1500 = 100 min per
+# wave with zero output, which is indistinguishable from a deadlock.
+log_every: 0            # print every N completions; 0 -> auto (每 10%)
+log_interval_s: 30      # also print if this many seconds passed since the last line
+
+# Hard cap on the TOTAL time batch_chat may spend. On expiry, in-flight requests are
+# abandoned and their rows return (False, ...) -> those questions simply keep their
+# original rollouts (summarize-replace already supports "no candidate"), so training
+# proceeds instead of blocking. 0 = unlimited (the old, unbounded behavior).
+wall_clock_budget: 900  # seconds
+
 # The teacher template's {style_example_1} is filled at TRAINING time with the target
 # model's own incorrect on-policy rollout for the SAME question (picked from the current
 # batch), so there is no style-pool config here.

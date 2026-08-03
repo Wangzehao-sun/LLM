@@ -458,6 +458,25 @@ class NewRayPPOTrainer(RayPPOTrainer):
                 f"style_example=incorrect on-policy rollout (same question), "
                 f"off_policy_reshape={reshape}"
             )
+            # FAIL FAST: 端点必须在启动时就解析成功。否则 _resolve_endpoints 要等到第一个
+            # normal step（前面还有 warmup_steps 个 recycle 步 + 每步一次完整 rollout）才抛，
+            # 中间是漫长的「正常但缓慢」，看起来像卡死而不是配置错误。
+            from verl.custom.teacher_api_client import _resolve_endpoints
+            try:
+                _eps = _resolve_endpoints(self._teacher_api_cfg)
+            except ValueError as e:
+                raise ValueError(
+                    f"{e}\n[teacher_api] TEACHER_API_ENABLE=true 但没有配置端点。"
+                    f"请在 {os.environ.get('TEACHER_API_CONFIG', 'verl/custom/config/teacher_api.yaml')} "
+                    f"里设置 url（或 api_list），或用 TEACHER_API_ENABLE=false 回退本地生成。"
+                ) from e
+            print(
+                f"[teacher_api] endpoint(s)={_eps}, threads={self._teacher_api_cfg.get('threads')}, "
+                f"timeout={self._teacher_api_cfg.get('timeout')}s, "
+                f"retry={self._teacher_api_cfg.get('retry')}, "
+                f"max_tokens={self._teacher_api_cfg.get('max_tokens')}, "
+                f"wall_clock_budget={self._teacher_api_cfg.get('wall_clock_budget', 0)}s"
+            )
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
@@ -1477,6 +1496,9 @@ class NewRayPPOTrainer(RayPPOTrainer):
         cand_gen.meta_info = deepcopy(gen_batch.meta_info)
         cand_gen.meta_info['is_se'] = False
         cand_gen.meta_info['is_extra'] = False
+        # teacher 模式下保留 messages（含填好的 {style_example_1}）供候选 dump 使用；
+        # 本地生成模式为 None，dump 时回退到解码 long_prompt。
+        teacher_messages = None
         with marked_timer("sr_gen", timing_raw, color="cyan"):
             if use_teacher:
                 # teacher-API rephraser: 用外部强模型的 HTTP 调用替换本地生成，返回与
@@ -1486,6 +1508,14 @@ class NewRayPPOTrainer(RayPPOTrainer):
                     batch, all_q, K, gen_batch_output, on_reward_sum, n
                 )
                 cand_out = self._teacher_api_rollout(cand_gen, teacher_messages)
+                # API 成功率此前只留在 cand_out.meta_info 里、随 cand_out 一起被丢弃，
+                # tensorboard / training_metrics.jsonl 都看不到。这里提到 metrics。
+                _t_ok = cand_out.meta_info.get('teacher_api_ok')
+                _t_tot = cand_out.meta_info.get('teacher_api_total')
+                if _t_ok is not None and _t_tot:
+                    metrics['batch/teacher_api_ok'] = _t_ok
+                    metrics['batch/teacher_api_total'] = _t_tot
+                    metrics['batch/teacher_api_ok_rate'] = _t_ok / max(1, _t_tot)
             else:
                 cand_out = self.actor_rollout_wg.generate_sequences(cand_gen)
                 timing_raw.update(cand_out.meta_info.get("timing", {}))
@@ -1513,10 +1543,22 @@ class NewRayPPOTrainer(RayPPOTrainer):
         cand_reward_sum = cand_reward.sum(-1)                 # [W*K]
         tf_cfg = self.config.algorithm.get('trajectory_filter', {})
         tf_enable = tf_cfg.get('enable', False)
+        # 候选 dump（trainer.sr_dump_candidates，默认开）：把 W*K 条候选全量落盘，
+        # 包含落选/不合格的那些——它们平时只汇总成计数就被丢弃，无法事后审计 teacher
+        # 质量或复用做 SFT。开启时需要全部候选文本，故解码条件放宽到「过滤开 or dump 开」。
+        _rd_dir = self.config.trainer.get("rollout_data_dir", None)
+        sr_dump = bool(_rd_dir) and self.config.trainer.get("sr_dump_candidates", True)
         cand_texts = (
             self.tokenizer.batch_decode(cand_resp, skip_special_tokens=True)
-            if tf_enable else None
+            if (tf_enable or sr_dump) else None
         )
+        # dump 时预先对每条候选算一次过滤判定：选择循环在 'shortest' 模式下会提前 break，
+        # 只算部分行，拿不到全量拒绝原因。此处一次算全，循环里复用（纯正则，开销可忽略）。
+        cand_rej, cand_reason = None, None
+        if tf_enable and sr_dump:
+            _res = [_trajectory_filter_reject(t, tf_cfg) for t in cand_texts]
+            cand_rej = [r for r, _ in _res]
+            cand_reason = [s for _, s in _res]
 
         # --- 6. 构建 explain-style off 行（短 prompt + 候选 response），展平到 W*K ---
         short_prompts = gen_batch.batch['input_ids'][::n]     # [B, L_short]
@@ -1563,6 +1605,8 @@ class NewRayPPOTrainer(RayPPOTrainer):
         #     select='logp'：合格候选里取 long_log_prob 序列平均最大的（最亲和当前策略）。
         #     合格判据：reward==success 且通过轨迹过滤；无合格候选则不替换。
         n_acc = n_rej_inc = n_rej_flt = n_no_cand = 0
+        # dump 用：记录每题最终被采纳的展平行号（-1 = 该题无合格候选、未替换）。
+        chosen_rows = {}
         for w_idx, p in enumerate(all_q):
             chosen = -1  # off_batch 内（W*K 展平）被选中的行
             best_score = float('-inf')
@@ -1572,7 +1616,10 @@ class NewRayPPOTrainer(RayPPOTrainer):
                     n_rej_inc += 1
                     continue
                 if tf_enable:
-                    rej, _reason = _trajectory_filter_reject(cand_texts[r], tf_cfg)
+                    if cand_rej is not None:
+                        rej = cand_rej[r]
+                    else:
+                        rej, _reason = _trajectory_filter_reject(cand_texts[r], tf_cfg)
                     if rej:
                         n_rej_flt += 1
                         continue
@@ -1590,6 +1637,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
             if chosen < 0:
                 n_no_cand += 1
                 continue
+            chosen_rows[w_idx] = chosen
             # 选择被替换的槽位（interleaved 下第 p*n + slot）：
             #   优先替换一条"错误"rollout（on_reward_sum 可用时，取该题第一条非 success
             #   的槽），避免覆盖掉组内仅有的正样本；无 reward 信息或该题全对时回退到末槽。
@@ -1631,7 +1679,87 @@ class NewRayPPOTrainer(RayPPOTrainer):
             f"rollout_acc={sr_n_correct}/{sr_n_total}={sr_n_correct / max(1, sr_n_total):.3f}, "
             f"question_solve_rate={sr_q_solved}/{W}"
         )
+
+        # --- 8. 候选全量 dump（含落选/不合格的）---
+        #     采纳的那条最终会随训练批进 <rollout_data_dir>/normal/，但那里的 input 是
+        #     被换过的**短 prompt**，且落选候选完全没有留痕。这里单独存一份完整记录：
+        #     teacher 实际收到的 prompt（含填好的 {style_example_1}）、每条候选原文、
+        #     打分、过滤判定、是否被采纳。路径 <rollout_data_dir>/teacher_candidates/。
+        if sr_dump:
+            try:
+                self._dump_sr_candidates(
+                    all_q=all_q,
+                    K=K,
+                    cand_texts=cand_texts,
+                    cand_reward_sum=cand_reward_sum,
+                    cand_rej=cand_rej,
+                    cand_reason=cand_reason,
+                    chosen_rows=chosen_rows,
+                    long_prompt=long_prompt,
+                    teacher_messages=teacher_messages,
+                    cand_out=cand_out,
+                    use_teacher=use_teacher,
+                    dump_root=_rd_dir,
+                )
+            except Exception as e:  # noqa: BLE001 - dump 是观测功能，绝不能打断训练
+                print(f"[sr_dump] skipped due to error: {e}")
         return gen_batch_output
+
+    def _dump_sr_candidates(self, all_q, K, cand_texts, cand_reward_sum, cand_rej,
+                            cand_reason, chosen_rows, long_prompt, teacher_messages,
+                            cand_out, use_teacher, dump_root):
+        """把 summarize-replace 的 W*K 条候选全量写成 JSONL（一行一条候选）。
+
+        与 <rollout_data_dir>/normal/ 的区别：那里只有被采纳的那条、且 input 已被换成
+        短 prompt；这里保留**所有**候选和 teacher 真正收到的 prompt，可用于审计 teacher
+        质量、统计 API 有效产出、或把 accepted=True 的行捞出来做 SFT。
+
+        每行字段：input(teacher/长 prompt 原文) / output(候选原文) / score /
+        question(题在本批的下标) / k / accepted / correct / filtered / filter_reason /
+        source('teacher'|'local') + 数据集元信息(uid/original_index/data_source/...)。
+        """
+        sr_dir = os.path.join(dump_root, "teacher_candidates")
+        n_rows = len(all_q) * K
+
+        # input：teacher 模式优先用真正发出去的 messages（含填好的 {style_example_1}），
+        # 拼成可读文本；本地模式/无 messages 时回退到解码 long_prompt。
+        if teacher_messages is not None and len(teacher_messages) == n_rows:
+            inputs = [
+                "\n\n".join(
+                    f"[{m.get('role', '?')}]\n{m.get('content', '')}"
+                    for m in msgs if isinstance(m, dict)
+                )
+                for msgs in teacher_messages
+            ]
+        else:
+            inputs = self.tokenizer.batch_decode(long_prompt, skip_special_tokens=True)
+
+        accepted_set = set(chosen_rows.values())
+        extra = defaultdict(list)
+        for w_idx in range(len(all_q)):
+            for k in range(K):
+                r = w_idx * K + k
+                extra["question"].append(int(all_q[w_idx]))
+                extra["k"].append(k)
+                extra["accepted"].append(r in accepted_set)
+                extra["correct"].append(int(cand_reward_sum[r].item()) == 1)
+                extra["filtered"].append(bool(cand_rej[r]) if cand_rej is not None else False)
+                extra["filter_reason"].append(cand_reason[r] if cand_reason is not None else "")
+                extra["source"].append("teacher" if use_teacher else "local")
+
+        # 数据集元信息：cand_out.non_tensor_batch 已按 flat_gt_idx 展平到 W*K，行序一致。
+        for key in ("reward_model", "data_source", "original_index", "uid", "extra_info"):
+            col = cand_out.non_tensor_batch.get(key)
+            if col is not None and len(col) == n_rows:
+                extra[key] = [_to_jsonable(v) for v in col]
+
+        self._dump_generations(
+            inputs=inputs,
+            outputs=cand_texts,
+            scores=cand_reward_sum.cpu().tolist(),
+            reward_extra_infos_dict=dict(extra),
+            dump_path=sr_dir,
+        )
 
     @torch.no_grad()
     def _validate_summarize(self) -> dict:
@@ -3221,22 +3349,6 @@ class NewRayPPOTrainer(RayPPOTrainer):
                     # trainer.rollout_dump_extra_keys 配置要保存哪些列；默认存常用几项。
                     # 经由 reward_extra_infos_dict 传入 _dump_generations（它会把任何
                     # 长度与样本数匹配的字段逐样本写进每行 JSON）。
-                    def _to_jsonable(v):
-                        # numpy 标量/数组、含 numpy 的 dict 都清洗成原生 python 类型，
-                        # 否则父类 _dump_generations 里的 json.dumps 可能报 not serializable。
-                        if hasattr(v, "item") and not isinstance(v, (dict, list)):
-                            try:
-                                return v.item()
-                            except (ValueError, AttributeError):
-                                pass
-                        if isinstance(v, np.ndarray):
-                            return [_to_jsonable(x) for x in v.tolist()]
-                        if isinstance(v, dict):
-                            return {k2: _to_jsonable(v2) for k2, v2 in v.items()}
-                        if isinstance(v, (list, tuple)):
-                            return [_to_jsonable(x) for x in v]
-                        return v
-
                     dump_infos = dict(reward_extra_infos_dict) if reward_extra_infos_dict else {}
                     extra_keys = self.config.trainer.get(
                         "rollout_dump_extra_keys",
