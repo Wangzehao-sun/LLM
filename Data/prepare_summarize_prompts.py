@@ -132,17 +132,17 @@ DEFAULT_TEMPLATE2 = (
 )
 
 DEFAULT_TEMPLATE = (
-    "You are given a [Problem] and a [Noisy Reasoning Draft].\n\n"
+    "You are given a [Problem] and a [Reference Reasoning Draft].\n\n"
     "Your task is to write one complete, self-contained solution. "
     "Use the [Reference Reasoning Draft] as private mathematical guidance: understand its reasoning process, "
     "extract the useful and valid reasoning steps, and reconstruct them in your own step-by-step problem-solving style. "
     "Then continue the derivation naturally until the problem is fully solved. "
     "The final output should be a standard, well-organized solution to the problem, not a commentary on the draft.\n"
     "## Strict requirements:\n" 
-    "1. Use the Reference Reasoning Draft as private mathematical guidance. " 
+    "1. Use the [Reference Reasoning Draft] as private mathematical guidance. " 
     "Understand its reasoning process, extract its useful and valid steps, and rewrite them in your own step-by-step problem-solving style, as if solving the problem directly.\n" 
     "Do not explicitly mention the draft, the prefix, or that any prior reasoning was provided. " 
-    "2. Reconstruct the reasoning rather than merely paraphrasing it. " 
+    "2. Reconstruct the reference reasoning rather than merely paraphrasing it. " 
     "In the reconstructed part, preserve as many valid reasoning steps from the draft as possible, including important equations, intermediate conclusions, and useful verification or correction steps. " 
     "For each reconstructed step, explain the reasoning in your own words rather than merely copying the draft's wording."
     "The reasoning should be reorganized into a clear, coherent, and natural solution.\n" 
@@ -156,6 +156,8 @@ DEFAULT_TEMPLATE = (
     "## Reference Reasoning Draft:\n{prefix}\n\n"
     "## Your solution:"
 )
+
+
 
 worker_tokenizer = None
 
