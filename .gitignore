@@ -15,3 +15,17 @@ Data/tmp.md
 
 # Misc
 *.log
+
+# Run artefacts: metrics/rollout dumps written by the trainer
+*.jsonl
+
+# Local-only working files, deliberately kept out of the repo.
+# NOTE: these are source/docs, not generated artefacts — they are ignored by
+# choice, so they live only on this machine. Copy them manually when moving to
+# another box; git will not restore them.
+CLAUDE.md
+METHOD_OVERVIEW.md
+Myverl/prompts.md
+Data/prepare_train.py
+Myverl/examples/train_hype_summarize_teacher.sh
+Myverl/examples/custom/train_hype_summarize.sh
