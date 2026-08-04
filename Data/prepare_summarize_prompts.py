@@ -228,7 +228,7 @@ TEACHER_TEMPLATE_DEFAULT = (
     "You are given a mathematical problem, an incorrect solution attempt produced "
     "by the target model for the same problem, and an expert reasoning guidance.\n\n"
 
-    "Write one complete, education-level, and mathematically correct solution. Use the target "
+    "Write one complete, education-level, and mathematically correct solution for the problem. Use the target "
     "model's attempt as the main trajectory and style reference, and use the expert guidance to "
     "verify and correct its mathematical reasoning. The result should read as if the target "
     "model had solved the problem correctly in a single pass.\n\n"
@@ -262,7 +262,7 @@ TEACHER_TEMPLATE_DEFAULT = (
     "initial prefix and reconstruct the remaining solution correctly, while still matching the "
     "target model's general style and level of detail.\n"
     "8. Output only one clean corrected solution. Do not mention the attempt, the expert guidance, "
-    "the error, or the correction process. Place the final answer in exactly one \\boxed{}.\n\n"
+    "the error, or the correction process. Place the final answer within \\boxed{}.\n\n"
 
     "<problem>\n{question}\n</problem>\n\n"
     "<expert_reasoning_guidance>\n"
