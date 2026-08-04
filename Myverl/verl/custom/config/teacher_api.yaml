@@ -57,3 +57,12 @@ wall_clock_budget: 900  # seconds
 # The teacher template's {style_example_1} is filled at TRAINING time with the target
 # model's own incorrect on-policy rollout for the SAME question (picked from the current
 # batch), so there is no style-pool config here.
+#
+# That rollout can be as long as data.max_response_length (10240), and the prompt already
+# carries the problem plus the full reference reasoning — a 10k-token attempt on top of
+# that bloats the request, can overflow the teacher's context / KV cache, and slows
+# prefill. Cap it here. Truncation keeps the HEAD of the attempt: the template asks for
+# "the longest valid initial prefix", and errors usually appear later in the rollout, so
+# the tail is the cheapest part to drop. Counted in TOKENS (cut on ids before decoding),
+# so the bound is exact. 0 or negative disables the cap.
+max_attempt_tokens: 4096

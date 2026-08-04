@@ -85,50 +85,33 @@ import re
 # Defaults derive from DEFAULT_TEMPLATE in Data/prepare_summarize_prompts.py.
 # ---------------------------------------------------------------------------
 _DEFAULT_TRAJ_KEYWORDS = [
-    "the draft",
-    "this draft",
-    "reasoning draft",
-    "let's summarize the reasoning",
-    "partial reasoning draft",
-    "[reasoning draft]",
-    "[partial reasoning draft]",
-    "the provided draft",
-    "the given draft",
-    "the reference reasoning",
-    "reference reasoning",
-    "provided reasoning",
-    "based on the reasoning above",
-    "given reasoning",
-    "based on the draft",
-    "according to the draft",
-    "as stated in the draft",
-    "as shown in the draft",
-    "from the draft",
-    "the experience",
-    "refer to experience",
-    "based on the experience",
-    "according to the experience",
+    "target model's attempt",
+    "target model",
+    "<expert_reasoning_guidance>",
+    "</expert_reasoning_guidance>",
+    "expert reasoning guidance",
+    "the expert guidance",
+    "provided expert guidance",
+    "given expert guidance",
+    "according to the expert guidance",
+    "based on the expert guidance",
+    "use the expert guidance",
+    
 ]
 _DEFAULT_TRAJ_INSTR_PHRASES = [
-    "gold standard",
-    "strict requirements",
-    "total de-reference",
-    "invisible integration",
-    "re-author",
-    "your task is",
-    "do not mention",
-    "do not quote",
-    "do not summarize",
-    "do not copy",
-    "output only",
-    "the reader must",
-    "the reader should",
-    "commentary on the draft",
-    "single coherent solution",
-    "self-contained solution",
-    "no meta-talk",
-    "conversational fillers",
-    "final output should read",
+     "natural completion of the target model's own attempt",
+    "longest usable initial prefix",
+    "copied verbatim",
+    "do not paraphrase",
+    "do not shorten",
+    "do not reorder",
+    "do not polish",
+    "do not reformat",
+    "small harmless mistakes",
+    "false starts, and redundancy",
+    "first substantive error",
+    "minimum necessary repair",
+    "reconstruct only the remaining part",
 ]
 
 
@@ -1263,7 +1246,8 @@ class NewRayPPOTrainer(RayPPOTrainer):
         print(f"[teacher_api] rollout ok={n_ok}/{N}")
         return cand_out
 
-    def _pick_incorrect_rollout_text(self, gen_batch_output, on_reward_sum, p, n, success_value=1):
+    def _pick_incorrect_rollout_text(self, gen_batch_output, on_reward_sum, p, n, success_value=1,
+                                     max_attempt_tokens=0):
         """Return the text of R's own INCORRECT on-policy rollout for question ``p``.
 
         gen_batch_output.responses is [B*n, resp] interleaved (question p, slot j ->
@@ -1271,6 +1255,12 @@ class NewRayPPOTrainer(RayPPOTrainer):
         incorrect (or on_reward_sum is unavailable) fall back to slot 0. Returns '' if
         the picked response is empty. This is the online analog of the offline
         ``_extract_incorrect_response`` in Inferapi/prepare_summarize_prompts.py.
+
+        ``max_attempt_tokens`` (0/negative = off) caps the attempt at that many tokens.
+        Truncation keeps the HEAD: the teacher template asks for "the longest valid
+        initial prefix of the attempt", and errors typically appear later in a rollout,
+        so dropping the tail costs the least. Cutting on token ids (before decode) makes
+        the bound exact w.r.t. the teacher's context budget.
         """
         pad = self.tokenizer.pad_token_id
         responses = gen_batch_output.batch['responses']
@@ -1281,7 +1271,11 @@ class NewRayPPOTrainer(RayPPOTrainer):
                 slot = int(wrong[0].item())
         row = p * n + slot
         ids = responses[row]
-        text = self.tokenizer.decode(ids[ids != pad], skip_special_tokens=True).strip()
+        ids = ids[ids != pad]
+        if max_attempt_tokens and ids.numel() > max_attempt_tokens:
+            ids = ids[:max_attempt_tokens]
+            self._attempt_trunc_n = getattr(self, '_attempt_trunc_n', 0) + 1
+        text = self.tokenizer.decode(ids, skip_special_tokens=True).strip()
         return text
 
     def _fill_style_example(self, messages: list, attempt_text: str) -> list:
@@ -1305,7 +1299,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
     def _build_teacher_messages(self, batch: DataProto, all_q: list, K: int,
                                 gen_batch_output: DataProto, on_reward_sum, n: int) -> list:
         """Build W*K teacher messages arrays mirroring long_prompt's row order
-        (row r = w_idx*K + k -> question all_q[w_idx], candidate k).
+        (row r = pos*K + k -> question all_q[pos], candidate k).
 
         The teacher prompt is the DIRECT-format column ``teacher_prompts_raw`` (a single
         messages list per question); its {style_example_1} placeholder is filled with R's
@@ -1314,42 +1308,71 @@ class NewRayPPOTrainer(RayPPOTrainer):
 
         Source priority: teacher_prompts_raw (direct) -> summarize_prompts_raw[0] ->
         decode the tokenized summarize prompt.
+
+        INDEXING: every per-question lookup here (teacher_col, summ_col,
+        summarize_input_ids, and the rollout pick) is indexed by the question's row in
+        the batch — i.e. the *element* of ``all_q`` — never by its position within
+        ``all_q``. Mixing the two silently pairs one question's prompt with another
+        question's wrong attempt whenever all_q is sparse (wrong_only).
         """
         teacher_col = batch.non_tensor_batch.get('teacher_prompts_raw', None)
         summ_col = batch.non_tensor_batch.get('summarize_prompts_raw', None)
         pad_token_id = self.tokenizer.pad_token_id
+        # 错误尝试的 token 上限（teacher_api.max_attempt_tokens，默认 4096，<=0 关闭）。
+        # 学生 rollout 最长可达 max_response_length(10240)，整条塞进
+        # <target_model_attempt> 会把 teacher 的 prompt 顶得很长：prompt 里已经有题面 +
+        # 完整参考推理，再加一条万 token 的尝试容易挤爆服务端上下文/KV cache，也拖慢
+        # prefill。截断保留开头（模板要的是"最长有效前缀"，错误通常出现在后段）。
+        max_attempt_tokens = int(self._teacher_api_cfg.get('max_attempt_tokens', 4096) or 0)
+        self._attempt_trunc_n = 0
 
-        def _load_direct(col, w_idx):
+        def _load_direct(col, q_idx):
             # teacher_prompts_raw is a single messages list (list[dict]) per row.
+            # q_idx is the question's row in the batch, NOT its position in all_q.
             if col is None:
                 return None
             try:
-                raw = json.loads(col[w_idx])
+                raw = json.loads(col[q_idx])
             except Exception:
                 return None
             return raw if raw else None
 
-        def _load_summ_fallback(w_idx):
+        def _load_summ_fallback(q_idx):
             if summ_col is None:
                 return None
             try:
-                raw = json.loads(summ_col[w_idx])   # list of K messages-arrays
+                raw = json.loads(summ_col[q_idx])   # list of K messages-arrays
                 return raw[0] if raw else None
             except Exception:
                 return None
 
         messages_list = []
-        for w_idx, p in enumerate(all_q):
-            base = _load_direct(teacher_col, w_idx) or _load_summ_fallback(w_idx)
+        # q_idx 是**题目在 batch 中的行号**（all_q 的元素），不是它在 all_q 里的位置。
+        # teacher_col / summ_col / summarize_input_ids 的第 0 维都是 B（每题一行），
+        # 必须用 q_idx 索引。用位置索引会取到「第 pos 题」的 prompt 而不是「第 q_idx
+        # 题」的：wrong_only 下 all_q 是稀疏子集，于是 teacher 拿到 A 题的题面配 B 题的
+        # 错误尝试，输出再用 B 题的 ground truth 打分 -> 候选必然判错、全被拒，
+        # 表现成「teacher 质量差」而不是索引错位。all=[0,1,2,...] 时两者恰好相等，
+        # 所以这个 bug 只在 wrong_only 路径上暴露。
+        for q_idx in all_q:
+            base = _load_direct(teacher_col, q_idx) or _load_summ_fallback(q_idx)
             if not base:
                 # last-resort fallback: decode the tokenized summarize prompt
-                ids = batch.batch['summarize_input_ids'][w_idx, 0]
+                ids = batch.batch['summarize_input_ids'][q_idx, 0]
                 text = self.tokenizer.decode(ids[ids != pad_token_id], skip_special_tokens=True)
                 base = [{"role": "user", "content": text}]
-            attempt = self._pick_incorrect_rollout_text(gen_batch_output, on_reward_sum, p, n)
+            attempt = self._pick_incorrect_rollout_text(
+                gen_batch_output, on_reward_sum, q_idx, n,
+                max_attempt_tokens=max_attempt_tokens,
+            )
             filled = self._fill_style_example(base, attempt)
             for _k in range(K):
                 messages_list.append(deepcopy(filled))
+        if max_attempt_tokens and self._attempt_trunc_n:
+            print(
+                f"[teacher_api] truncated {self._attempt_trunc_n}/{len(all_q)} attempt(s) "
+                f"to {max_attempt_tokens} tokens"
+            )
         return messages_list
 
     def _summarize_replace_normal_step(
@@ -1479,11 +1502,14 @@ class NewRayPPOTrainer(RayPPOTrainer):
         L_long = sum_ids.size(2)
         K = max(1, int(self.config.actor_rollout_ref.rollout.get('summarize_replace_k', 1)))
         W = len(all_q)
-        # 展平成 [W*K, L_long]：行 r = w_idx*K + k -> 第 all_q[w_idx] 题的第 k 条候选。
+        # 展平成 [W*K, L_long]：行 r = pos*K + k -> all_q[pos] 题的第 k 条候选。
+        # 注意 q_idx 是**题目在 batch 中的行号**（all_q 的元素），用于索引 sum_ids 的第 0 维；
+        # 而下面选择/dump 循环里的 pos 是**在 all_q 中的位置**，只用于算展平行号 r。
+        # 两者在 wrong_only 下不相等，混用即为 bug（见 _build_teacher_messages 的 INDEXING 说明）。
         long_rows = []
-        for w_idx in all_q:
+        for q_idx in all_q:
             for k in range(K):
-                long_rows.append(sum_ids[w_idx, min(k, K_data - 1), :])
+                long_rows.append(sum_ids[q_idx, min(k, K_data - 1), :])
         long_prompt = torch.stack(long_rows, dim=0).to(device)  # [W*K, L_long]
         long_attn, long_pos = generate_masks_from_input_ids(
             long_prompt, pad_token_id, gen_batch_output.batch['attention_mask'].dtype
@@ -1607,11 +1633,13 @@ class NewRayPPOTrainer(RayPPOTrainer):
         n_acc = n_rej_inc = n_rej_flt = n_no_cand = 0
         # dump 用：记录每题最终被采纳的展平行号（-1 = 该题无合格候选、未替换）。
         chosen_rows = {}
-        for w_idx, p in enumerate(all_q):
+        # pos = 在 all_q 中的位置（只用于算展平行号 r）；q_idx = 题目在 batch 中的行号
+        # （用于索引 on_reward_sum / gen_batch_output）。wrong_only 下二者不等，别混用。
+        for pos, q_idx in enumerate(all_q):
             chosen = -1  # off_batch 内（W*K 展平）被选中的行
             best_score = float('-inf')
             for k in range(K):
-                r = w_idx * K + k
+                r = pos * K + k
                 if cand_reward_sum[r].item() != success_value:
                     n_rej_inc += 1
                     continue
@@ -1637,16 +1665,16 @@ class NewRayPPOTrainer(RayPPOTrainer):
             if chosen < 0:
                 n_no_cand += 1
                 continue
-            chosen_rows[w_idx] = chosen
-            # 选择被替换的槽位（interleaved 下第 p*n + slot）：
+            chosen_rows[pos] = chosen
+            # 选择被替换的槽位（interleaved 下第 q_idx*n + slot）：
             #   优先替换一条"错误"rollout（on_reward_sum 可用时，取该题第一条非 success
             #   的槽），避免覆盖掉组内仅有的正样本；无 reward 信息或该题全对时回退到末槽。
             slot = n - 1
             if on_reward_sum is not None:
-                wrong_slots = (on_reward_sum[p] != success_value).nonzero().squeeze(-1)
+                wrong_slots = (on_reward_sum[q_idx] != success_value).nonzero().squeeze(-1)
                 if wrong_slots.numel() > 0:
                     slot = int(wrong_slots[0].item())
-            ti = p * n + slot
+            ti = q_idx * n + slot
             for key in off_batch.batch.keys():
                 if key in gen_batch_output.batch.keys():
                     dst = gen_batch_output.batch[key]
@@ -1736,10 +1764,10 @@ class NewRayPPOTrainer(RayPPOTrainer):
 
         accepted_set = set(chosen_rows.values())
         extra = defaultdict(list)
-        for w_idx in range(len(all_q)):
+        for pos, q_idx in enumerate(all_q):
             for k in range(K):
-                r = w_idx * K + k
-                extra["question"].append(int(all_q[w_idx]))
+                r = pos * K + k
+                extra["question"].append(int(q_idx))
                 extra["k"].append(k)
                 extra["accepted"].append(r in accepted_set)
                 extra["correct"].append(int(cand_reward_sum[r].item()) == 1)
