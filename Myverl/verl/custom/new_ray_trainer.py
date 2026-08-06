@@ -148,6 +148,25 @@ def _trajectory_filter_reject(text: str, cfg: dict):
     return False, ""
 
 
+def _backup_to_sentence_boundary(text: str) -> str:
+    """Back ``text`` up to its last sentence/newline boundary.
+
+    Mirrors ``_backup_to_sentence_boundary`` in Data/prepare_summarize_prompts.py so
+    the online student-prefix cut and the offline draft cut use the same notion of a
+    boundary. Used when slicing a student rollout at an arbitrary token ratio: handing
+    the teacher a prefix that stops mid-sentence makes a style-consistent continuation
+    much harder. Returns '' when no boundary exists (the caller then falls back to the
+    raw token cut) -- unlike the offline version, which returns the whole prefix,
+    because here an empty result is a meaningful "no sentence boundary found" signal.
+    """
+    if not text:
+        return ""
+    boundary = 0
+    for m in re.finditer(r"(?:[.!?]+[\)\]\"']?\s+|\n+)", text):
+        boundary = m.end()
+    return text[:boundary].rstrip() if boundary > 0 else ""
+
+
 def _index_nt(nt: dict, idx: list) -> dict:
     """Row-index a non_tensor_batch dict by a list of positions.
 
@@ -813,6 +832,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
         train_batch_size: int,
         mode: str = "concat",
         loss_prompts: torch.Tensor = None,
+        on_prefix_lens: list = None,
     ) -> DataProto:
         """
         根据离线目标(prefix_list)的前缀和模型生成的响应(off_responses)构建混合的off-policy输出。
@@ -828,6 +848,12 @@ class NewRayPPOTrainer(RayPPOTrainer):
             loss_prompts (torch.Tensor): 当 mode='summarize' 时必填，shape [B, max_prompt_length]，
                         原始 question prompt（不含 prefix、不含 reason_prompt）。
                         用作最终 input_ids 的 prompt 段，actor 据此重新 forward 算 log_prob。
+            on_prefix_lens (list): 仅 mode='summarize' 有效，长度 = off_len 的 per-row 前缀
+                        token 数。用于 teacher 的 continue 模式：response =
+                        [学生自采前缀, teacher 续写]，前 on_prefix_lens[i] 个 token 是策略
+                        自己在短 prompt 下采出来的，属 on-policy，置 prefix_mask=0；其后的
+                        续写段才是 teacher 的 off-policy 内容，置 1。None（默认）时整行有效
+                        token 全置 1，保持原有行为（teacher rewrite / 本地生成候选）。
 
         Returns:
             DataProto: 构建完成并经过repeat的off-policy输出。
@@ -890,7 +916,15 @@ class NewRayPPOTrainer(RayPPOTrainer):
                 # = exp(actor_under_short - actor_under_long) 的 prompt-shift 修正项。
                 final_responses.append(torch.tensor(off_responses_list[i], dtype=dtype))
                 response_len = min(len(off_responses_list[i]), max_response_len)
-                prefix_mask[i, :response_len] = 1
+                # continue 模式（on_prefix_lens 给定）：response 是
+                # [学生自采前缀, teacher 续写] 的拼接，两段的策略归属不同，mask 也必须分段：
+                # 前缀段 = 策略自己在短 prompt 下采的 -> on-policy(0)；续写段 = teacher 内容
+                # -> off-policy(1)。不分段（整行置 1）会把学生自己的 token 也按 off-policy
+                # 公式算，IS ratio 失去意义。
+                p_len = 0
+                if on_prefix_lens is not None:
+                    p_len = min(int(on_prefix_lens[i]), response_len)
+                prefix_mask[i, p_len:response_len] = 1
             else:
                 # 'concat' —— 现有 prefix 续写逻辑
                 # If it is the last element in the group, only use the prefix
@@ -1188,7 +1222,8 @@ class NewRayPPOTrainer(RayPPOTrainer):
 
         return on_policy_batch
 
-    def _teacher_api_rollout(self, cand_gen: DataProto, messages_list: list) -> DataProto:
+    def _teacher_api_rollout(self, cand_gen: DataProto, messages_list: list,
+                             prefix_ids_list: list = None) -> DataProto:
         """Drop-in replacement for ``actor_rollout_wg.generate_sequences`` backed by an
         external teacher chat API.
 
@@ -1198,6 +1233,21 @@ class NewRayPPOTrainer(RayPPOTrainer):
         is untouched. The teacher only returns text, which we re-tokenize with the
         policy's tokenizer. No behavior logprob is available -> callers must NOT
         populate off_old_log_probs / target_probs for these rows.
+
+        ``prefix_ids_list`` (continue mode, from _build_teacher_messages) holds the
+        student prefix token ids per row. When a row's list is non-empty the response
+        becomes ``student_prefix + teacher_continuation``: the teacher was only asked to
+        continue, so the prefix must be spliced back here -- BEFORE scoring, since
+        compute_reward reads cand_out.responses and the \\boxed{} answer lives in the
+        continuation. The prefix ids are used VERBATIM (they are what the policy actually
+        sampled); only the continuation is tokenized.
+
+        ``meta_info['teacher_prefix_lens']`` reports the per-row prefix length so the
+        caller can build a segmented prefix_mask (student part = on-policy,
+        continuation = off-policy). Rows whose splice overflowed max_response_length are
+        counted in ``teacher_api_overflow``: the tail carrying \\boxed{} gets cut, so they
+        score wrong and are rejected -- worth a metric of its own, otherwise the drop
+        looks like poor teacher quality.
         """
         from verl.custom.teacher_api_client import batch_chat
 
@@ -1207,20 +1257,34 @@ class NewRayPPOTrainer(RayPPOTrainer):
         device, dtype = prompts.device, prompts.dtype
         N = prompts.size(0)
         assert len(messages_list) == N, f"messages {len(messages_list)} != prompts {N}"
+        if prefix_ids_list is not None:
+            assert len(prefix_ids_list) == N, \
+                f"prefix_ids {len(prefix_ids_list)} != prompts {N}"
 
         results = batch_chat(messages_list, self._teacher_api_cfg)   # [(ok, text)] aligned
         max_resp = self.config.data.max_response_length
 
         responses = torch.full((N, max_resp), pad_token_id, dtype=dtype, device=device)
+        # 每行学生前缀的**实际写入**长度（溢出截断后），供上层切分 prefix_mask。
+        prefix_lens = [0] * N
         n_ok = 0
+        n_overflow = 0
         for i, (ok, text) in enumerate(results):
             if not ok or not isinstance(text, str) or not text.strip():
                 continue                                      # empty row -> scored wrong -> filtered out
             n_ok += 1
             ids = self.tokenizer(text, add_special_tokens=False)['input_ids']
+            p_ids = list(prefix_ids_list[i]) if prefix_ids_list is not None else []
+            if p_ids:
+                # continue 模式：学生前缀原样在前，teacher 续写在后，拼成一条完整 response。
+                ids = p_ids + ids
             if eos_token_id is not None:
                 ids = ids + [eos_token_id]
-            ids = ids[:max_resp]
+            if len(ids) > max_resp:
+                n_overflow += 1
+                ids = ids[:max_resp]
+            # 前缀本身若已超出 max_resp，写入长度也随之截断（后续 mask 才不会越界）。
+            prefix_lens[i] = min(len(p_ids), max_resp)
             if ids:
                 responses[i, :len(ids)] = torch.tensor(ids, dtype=dtype, device=device)
 
@@ -1243,24 +1307,36 @@ class NewRayPPOTrainer(RayPPOTrainer):
         cand_out.meta_info = deepcopy(cand_gen.meta_info)
         cand_out.meta_info['teacher_api_ok'] = n_ok
         cand_out.meta_info['teacher_api_total'] = N
-        print(f"[teacher_api] rollout ok={n_ok}/{N}")
+        cand_out.meta_info['teacher_api_overflow'] = n_overflow
+        cand_out.meta_info['teacher_prefix_lens'] = prefix_lens
+        print(f"[teacher_api] rollout ok={n_ok}/{N}, overflow={n_overflow}")
         return cand_out
 
     def _pick_incorrect_rollout_text(self, gen_batch_output, on_reward_sum, p, n, success_value=1,
-                                     max_attempt_tokens=0):
-        """Return the text of R's own INCORRECT on-policy rollout for question ``p``.
+                                     max_attempt_tokens=0, prefix_ratio=None):
+        """Return R's own INCORRECT on-policy rollout for question ``p`` as
+        ``(prefix_ids, prefix_text)``.
 
         gen_batch_output.responses is [B*n, resp] interleaved (question p, slot j ->
         row p*n + j). Prefer a slot whose on-policy reward != success; if none is
-        incorrect (or on_reward_sum is unavailable) fall back to slot 0. Returns '' if
-        the picked response is empty. This is the online analog of the offline
-        ``_extract_incorrect_response`` in Inferapi/prepare_summarize_prompts.py.
+        incorrect (or on_reward_sum is unavailable) fall back to slot 0. Returns
+        ``([], '')`` if the picked response is empty.
 
-        ``max_attempt_tokens`` (0/negative = off) caps the attempt at that many tokens.
-        Truncation keeps the HEAD: the teacher template asks for "the longest valid
-        initial prefix of the attempt", and errors typically appear later in a rollout,
-        so dropping the tail costs the least. Cutting on token ids (before decode) makes
-        the bound exact w.r.t. the teacher's context budget.
+        ``prefix_ratio`` (None = off) switches to CONTINUE mode: keep only the leading
+        ``prefix_ratio`` fraction of the rollout, so the teacher continues the student's
+        partial reasoning instead of rewriting a whole attempt. The cut is then backed up
+        to the last sentence boundary -- a prefix ending mid-sentence makes a
+        style-consistent continuation much harder. The boundary is located in TEXT space
+        (decode -> back up -> re-tokenize to measure), but the returned ``prefix_ids`` are
+        always a SLICE OF THE ORIGINAL ids, never the re-tokenized text: these tokens get
+        spliced into the training response, so they must be exactly what the policy
+        sampled or the loss-time log-probs won't line up. Re-tokenization only measures
+        where to cut. Falls back to the raw token cut when no boundary exists.
+
+        ``max_attempt_tokens`` (0/negative = off) caps the result at that many tokens.
+        In continue mode the ratio cut usually binds first, leaving this as a backstop.
+        Truncation keeps the HEAD (errors typically appear later in a rollout). Cutting on
+        token ids (before decode) makes the bound exact w.r.t. the teacher's context.
         """
         pad = self.tokenizer.pad_token_id
         responses = gen_batch_output.batch['responses']
@@ -1272,11 +1348,23 @@ class NewRayPPOTrainer(RayPPOTrainer):
         row = p * n + slot
         ids = responses[row]
         ids = ids[ids != pad]
+        if prefix_ratio is not None and ids.numel() > 0:
+            n_keep = max(1, int(round(float(prefix_ratio) * ids.numel())))
+            ids = ids[:n_keep]
+            # Back the cut up to a sentence boundary. Measure the boundary in text space,
+            # then map that length back onto the ORIGINAL ids (never use the re-tokenized
+            # ids themselves -- see the docstring).
+            cut_text = self.tokenizer.decode(ids, skip_special_tokens=True)
+            backed = _backup_to_sentence_boundary(cut_text)
+            if backed:
+                n_backed = len(self.tokenizer(backed, add_special_tokens=False)['input_ids'])
+                if 0 < n_backed <= ids.numel():
+                    ids = ids[:n_backed]
         if max_attempt_tokens and ids.numel() > max_attempt_tokens:
             ids = ids[:max_attempt_tokens]
             self._attempt_trunc_n = getattr(self, '_attempt_trunc_n', 0) + 1
         text = self.tokenizer.decode(ids, skip_special_tokens=True).strip()
-        return text
+        return ids.tolist(), text
 
     def _fill_style_example(self, messages: list, attempt_text: str) -> list:
         """Substitute the {style_example_1} placeholder (the target model's incorrect
@@ -1297,14 +1385,25 @@ class NewRayPPOTrainer(RayPPOTrainer):
         return out
 
     def _build_teacher_messages(self, batch: DataProto, all_q: list, K: int,
-                                gen_batch_output: DataProto, on_reward_sum, n: int) -> list:
+                                gen_batch_output: DataProto, on_reward_sum, n: int):
         """Build W*K teacher messages arrays mirroring long_prompt's row order
         (row r = pos*K + k -> question all_q[pos], candidate k).
 
+        Returns ``(messages_list, prefix_ids_list)``, both length W*K and row-aligned.
+
         The teacher prompt is the DIRECT-format column ``teacher_prompts_raw`` (a single
         messages list per question); its {style_example_1} placeholder is filled with R's
-        OWN incorrect on-policy rollout for that same question. All K candidates of a
-        question reuse the same filled prompt (K stochastic teacher samples).
+        OWN incorrect on-policy rollout for that same question.
+
+        Two modes, per ``teacher_api.teacher_mode``:
+          * 'rewrite' (default, legacy): the placeholder gets the WHOLE attempt and the
+            teacher returns a full corrected solution. ``prefix_ids_list`` is all-empty.
+          * 'continue': the placeholder gets only the leading
+            ``attempt_prefix_ratio_min..max`` fraction of the attempt (cut at a sentence
+            boundary) and the teacher returns just a CONTINUATION. The corresponding
+            prefix token ids come back in ``prefix_ids_list`` so the caller can splice
+            ``student_prefix + teacher_continuation`` into one response. Each candidate
+            row samples its own ratio, so K>1 yields K different cut points.
 
         Source priority: teacher_prompts_raw (direct) -> summarize_prompts_raw[0] ->
         decode the tokenized summarize prompt.
@@ -1323,8 +1422,20 @@ class NewRayPPOTrainer(RayPPOTrainer):
         # <target_model_attempt> 会把 teacher 的 prompt 顶得很长：prompt 里已经有题面 +
         # 完整参考推理，再加一条万 token 的尝试容易挤爆服务端上下文/KV cache，也拖慢
         # prefill。截断保留开头（模板要的是"最长有效前缀"，错误通常出现在后段）。
+        # continue 模式下 ratio 切分通常先生效，本上限退化为兜底。
         max_attempt_tokens = int(self._teacher_api_cfg.get('max_attempt_tokens', 4096) or 0)
         self._attempt_trunc_n = 0
+        # continue 模式：只给 teacher 前 ratio 段，让它续写（见 docstring）。
+        continue_mode = str(
+            self._teacher_api_cfg.get('teacher_mode', 'rewrite')
+        ).strip().lower() == 'continue'
+        ratio_lo = float(self._teacher_api_cfg.get('attempt_prefix_ratio_min', 0.2))
+        ratio_hi = float(self._teacher_api_cfg.get('attempt_prefix_ratio_max', 0.3))
+        if continue_mode and not (0.0 < ratio_lo <= ratio_hi <= 1.0):
+            raise ValueError(
+                f"teacher_api.attempt_prefix_ratio_min/max must satisfy "
+                f"0 < min <= max <= 1, got {ratio_lo}/{ratio_hi}"
+            )
 
         def _load_direct(col, q_idx):
             # teacher_prompts_raw is a single messages list (list[dict]) per row.
@@ -1347,6 +1458,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
                 return None
 
         messages_list = []
+        prefix_ids_list = []
         # q_idx 是**题目在 batch 中的行号**（all_q 的元素），不是它在 all_q 里的位置。
         # teacher_col / summ_col / summarize_input_ids 的第 0 维都是 B（每题一行），
         # 必须用 q_idx 索引。用位置索引会取到「第 pos 题」的 prompt 而不是「第 q_idx
@@ -1361,19 +1473,43 @@ class NewRayPPOTrainer(RayPPOTrainer):
                 ids = batch.batch['summarize_input_ids'][q_idx, 0]
                 text = self.tokenizer.decode(ids[ids != pad_token_id], skip_special_tokens=True)
                 base = [{"role": "user", "content": text}]
-            attempt = self._pick_incorrect_rollout_text(
-                gen_batch_output, on_reward_sum, q_idx, n,
-                max_attempt_tokens=max_attempt_tokens,
-            )
-            filled = self._fill_style_example(base, attempt)
+            # rewrite 模式下 K 条候选共用同一份填好的 prompt（靠 teacher 采样随机性区分）；
+            # continue 模式下每条候选各自采一个切分比例，故必须逐 k 重新填充。
+            if not continue_mode:
+                _p_ids, attempt = self._pick_incorrect_rollout_text(
+                    gen_batch_output, on_reward_sum, q_idx, n,
+                    max_attempt_tokens=max_attempt_tokens,
+                )
+                filled = self._fill_style_example(base, attempt)
+                for _k in range(K):
+                    messages_list.append(deepcopy(filled))
+                    prefix_ids_list.append([])   # rewrite: teacher returns the whole solution
+                continue
             for _k in range(K):
-                messages_list.append(deepcopy(filled))
+                ratio = (
+                    ratio_lo if ratio_hi <= ratio_lo
+                    else float(np.random.uniform(ratio_lo, ratio_hi))
+                )
+                p_ids, attempt = self._pick_incorrect_rollout_text(
+                    gen_batch_output, on_reward_sum, q_idx, n,
+                    max_attempt_tokens=max_attempt_tokens, prefix_ratio=ratio,
+                )
+                messages_list.append(self._fill_style_example(base, attempt))
+                prefix_ids_list.append(p_ids)
         if max_attempt_tokens and self._attempt_trunc_n:
             print(
                 f"[teacher_api] truncated {self._attempt_trunc_n}/{len(all_q)} attempt(s) "
                 f"to {max_attempt_tokens} tokens"
             )
-        return messages_list
+        if continue_mode:
+            _plens = [len(p) for p in prefix_ids_list]
+            print(
+                f"[teacher_api] continue mode: student prefix ratio "
+                f"[{ratio_lo:g},{ratio_hi:g}], prefix tokens "
+                f"min/mean/max={min(_plens) if _plens else 0}/"
+                f"{(sum(_plens) / max(1, len(_plens))):.0f}/{max(_plens) if _plens else 0}"
+            )
+        return messages_list, prefix_ids_list
 
     def _summarize_replace_normal_step(
         self,
@@ -1525,15 +1661,21 @@ class NewRayPPOTrainer(RayPPOTrainer):
         # teacher 模式下保留 messages（含填好的 {style_example_1}）供候选 dump 使用；
         # 本地生成模式为 None，dump 时回退到解码 long_prompt。
         teacher_messages = None
+        # continue 模式下每行学生前缀的 token 数（rewrite/本地模式为 None），
+        # 用于把 off 行的 prefix_mask 切成 [前缀=on-policy, 续写=off-policy] 两段。
+        teacher_prefix_lens = None
         with marked_timer("sr_gen", timing_raw, color="cyan"):
             if use_teacher:
                 # teacher-API rephraser: 用外部强模型的 HTTP 调用替换本地生成，返回与
                 # generate_sequences 同契约的 cand_out（下游打分/过滤/拼接均不变）。
-                # {style_example_1} 用 R 本步对该题的错误 on-policy rollout 就地填入。
-                teacher_messages = self._build_teacher_messages(
+                # {style_example_1} 用 R 本步对该题的错误 on-policy rollout 就地填入
+                # （continue 模式只填其前 20~30% 并由 teacher 续写）。
+                teacher_messages, teacher_prefix_ids = self._build_teacher_messages(
                     batch, all_q, K, gen_batch_output, on_reward_sum, n
                 )
-                cand_out = self._teacher_api_rollout(cand_gen, teacher_messages)
+                cand_out = self._teacher_api_rollout(
+                    cand_gen, teacher_messages, prefix_ids_list=teacher_prefix_ids
+                )
                 # API 成功率此前只留在 cand_out.meta_info 里、随 cand_out 一起被丢弃，
                 # tensorboard / training_metrics.jsonl 都看不到。这里提到 metrics。
                 _t_ok = cand_out.meta_info.get('teacher_api_ok')
@@ -1542,6 +1684,19 @@ class NewRayPPOTrainer(RayPPOTrainer):
                     metrics['batch/teacher_api_ok'] = _t_ok
                     metrics['batch/teacher_api_total'] = _t_tot
                     metrics['batch/teacher_api_ok_rate'] = _t_ok / max(1, _t_tot)
+                # 拼接后超 max_response_length 的行：尾部（含 \boxed{}）被截 -> 必然判错。
+                # 单独出指标，否则它看起来跟「teacher 答错」无法区分。
+                _t_of = cand_out.meta_info.get('teacher_api_overflow')
+                if _t_of is not None and _t_tot:
+                    metrics['batch/teacher_api_overflow'] = _t_of
+                    metrics['batch/teacher_api_overflow_rate'] = _t_of / max(1, _t_tot)
+                # continue 模式才有非零前缀；全零（rewrite）时保持 None，下游走原逻辑。
+                _plens = cand_out.meta_info.get('teacher_prefix_lens')
+                if _plens and any(_plens):
+                    teacher_prefix_lens = _plens
+                    metrics['batch/teacher_prefix_tokens_mean'] = (
+                        sum(_plens) / max(1, len(_plens))
+                    )
             else:
                 cand_out = self.actor_rollout_wg.generate_sequences(cand_gen)
                 timing_raw.update(cand_out.meta_info.get("timing", {}))
@@ -1600,6 +1755,8 @@ class NewRayPPOTrainer(RayPPOTrainer):
             train_batch_size=W * K,
             mode="summarize",
             loss_prompts=short_wk,
+            # continue 模式：前缀段(学生自采)=on-policy(0)，续写段(teacher)=off-policy(1)。
+            on_prefix_lens=teacher_prefix_lens,
         )
         # 宽度一致性：generate 把 response 右填充到 max_response_length，
         # _build_hybrid 也 pad 到 max(max_response_length, w)，与 on 批 resp_width 相同。

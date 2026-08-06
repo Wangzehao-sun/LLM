@@ -66,3 +66,28 @@ wall_clock_budget: 900  # seconds
 # the tail is the cheapest part to drop. Counted in TOKENS (cut on ids before decoding),
 # so the bound is exact. 0 or negative disables the cap.
 max_attempt_tokens: 4096
+
+# --- what the teacher is asked to produce ---
+# rewrite  (legacy): {style_example_1} gets the WHOLE attempt and the teacher returns a
+#          complete corrected solution, which becomes the response verbatim.
+# continue         : {style_example_1} gets only the leading attempt_prefix_ratio_*
+#          fraction of the attempt (cut at a sentence boundary) and the teacher returns
+#          just a CONTINUATION. The trainer splices [student_prefix, continuation] into
+#          one response, so the prompt template must ask for a continuation only (see
+#          TEACHER_TEMPLATE_DEFAULT1 in Data/prepare_summarize_prompts.py) — pairing
+#          'continue' with a rewrite-style template makes the teacher restate the prefix
+#          and the spliced response ends up with it twice.
+#
+# LOSS SHAPE (continue only): the prefix tokens were sampled by the POLICY itself under
+# the short prompt, so they get prefix_mask=0 (on-policy branch); only the teacher's
+# continuation gets prefix_mask=1 (off-policy branch). The prefix rows' old_log_probs
+# therefore come from the post-splice forward pass rather than the sampling-time
+# distribution — the same-step drift is negligible (ratio ~= 1).
+teacher_mode: rewrite   # rewrite | continue
+
+# Fraction of the student's rollout kept as the prefix in 'continue' mode. Each candidate
+# row samples its own ratio uniformly from [min, max], so K>1 gives different cut points.
+# The cut is then backed up to the last sentence boundary: a prefix ending mid-sentence
+# makes a style-consistent continuation much harder. Ignored when teacher_mode=rewrite.
+attempt_prefix_ratio_min: 0.2
+attempt_prefix_ratio_max: 0.3
