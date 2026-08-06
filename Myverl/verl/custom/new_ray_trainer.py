@@ -2178,6 +2178,24 @@ class NewRayPPOTrainer(RayPPOTrainer):
         extra_step_interval = self.config.data.get('extra_step_interval', 1)  # at least K normal steps between extra_step triggers
         steps_since_last_extra = 0  # counter for cooldown
 
+        # SR 替换的 step 窗口：(summarize_replace_start_after, recycle_sr_disable_after)。
+        # 两者都设且 start >= disable 时窗口为空 —— SR 一步都不会跑，但训练看起来完全正常
+        # （日志里只有 "尚未开启"），很容易被当成 SR 不生效的 bug 查半天。启动时就说清楚。
+        _sr_start_cfg = self.config.data.get('summarize_replace_start_after', 0)
+        _sr_disable_cfg = self.config.data.get('recycle_sr_disable_after', 0)
+        if _sr_start_cfg > 0 and _sr_disable_cfg > 0 and _sr_start_cfg >= _sr_disable_cfg:
+            raise ValueError(
+                f"summarize_replace_start_after={_sr_start_cfg} >= "
+                f"recycle_sr_disable_after={_sr_disable_cfg}: SR 替换的开启窗口为空，"
+                f"一步都不会执行。请让 start_after < disable_after（或把其中一个设为 0）。"
+            )
+        if _sr_start_cfg > 0:
+            print(
+                f"[summarize_replace] start_after={_sr_start_cfg}: 前 {_sr_start_cfg} 个 "
+                f"normal step 为纯 on-policy GRPO，从 step {_sr_start_cfg + 1} 起开启 SR 替换"
+                + (f"，到 step {_sr_disable_cfg} 停用" if _sr_disable_cfg > 0 else "")
+            )
+
         # ---------------------------------------------------------------
         # Warmup: 正式训练前先跑几步 extra_step(recycle) warmup，提升模型的
         # summarize 能力。失败缓冲区此时为空，故直接从 dataloader 取 warmup_steps
@@ -2736,7 +2754,24 @@ class NewRayPPOTrainer(RayPPOTrainer):
                     # 超过该 step 后停用 SR 替换，回落到纯 on-policy。<=0/未配置 = 永不停用。
                     _sr_disable_after = self.config.data.get('recycle_sr_disable_after', 0)
                     _sr_disabled_now = (_sr_disable_after > 0) and (self.global_steps >= _sr_disable_after)
-                    if (not is_failure_recycle_step) and _sr_mode != 'off' and (not _sr_disabled_now):
+                    # start_after_step（可选，与 disable_after 对称）：前 X 个 step 先纯
+                    # on-policy GRPO 跑热，第 X+1 步起才开启 SR 替换。global_steps 从 1 计数，
+                    # 故 `<=` 恰好让 X 个 step 保持关闭。<=0/未配置 = 从第一步就开启（原行为）。
+                    _sr_start_after = self.config.data.get('summarize_replace_start_after', 0)
+                    _sr_not_started = (_sr_start_after > 0) and (self.global_steps <= _sr_start_after)
+                    if _sr_not_started and _sr_mode != 'off' and (not is_failure_recycle_step):
+                        metrics['batch/sr_skipped_warmup'] = 1
+                        print(
+                            f"[summarize_replace] step {self.global_steps} <= "
+                            f"summarize_replace_start_after={_sr_start_after}; "
+                            f"SR 替换尚未开启（纯 on-policy GRPO）"
+                        )
+                    if (
+                        (not is_failure_recycle_step)
+                        and _sr_mode != 'off'
+                        and (not _sr_disabled_now)
+                        and (not _sr_not_started)
+                    ):
                         gen_batch_output = self._summarize_replace_normal_step(
                             gen_batch=gen_batch,
                             gen_batch_output=gen_batch_output,
