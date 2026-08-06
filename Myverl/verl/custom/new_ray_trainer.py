@@ -1269,9 +1269,21 @@ class NewRayPPOTrainer(RayPPOTrainer):
         prefix_lens = [0] * N
         n_ok = 0
         n_overflow = 0
+        # 失败行的原因原文（batch_chat 的 text 位在 ok=False 时装的就是原因字符串：
+        # "api error: ..." / "wall_clock_budget exceeded" / "api response missing 'choices'"）。
+        # 此前这些行直接 continue 掉，原因随之丢弃：dump 里它们只剩一条空 output，
+        # 事后无法区分「teacher 超时」「端点连不上」「返回了空串」，而这三者的处置完全不同。
+        fail_reasons = [""] * N
         for i, (ok, text) in enumerate(results):
             if not ok or not isinstance(text, str) or not text.strip():
-                continue                                      # empty row -> scored wrong -> filtered out
+                # empty row -> scored wrong -> filtered out
+                if not ok:
+                    fail_reasons[i] = (
+                        text if isinstance(text, str) and text.strip() else "unknown api failure"
+                    )
+                else:
+                    fail_reasons[i] = "empty response text"   # ok=True 但内容空白
+                continue
             n_ok += 1
             ids = self.tokenizer(text, add_special_tokens=False)['input_ids']
             p_ids = list(prefix_ids_list[i]) if prefix_ids_list is not None else []
@@ -1309,7 +1321,17 @@ class NewRayPPOTrainer(RayPPOTrainer):
         cand_out.meta_info['teacher_api_total'] = N
         cand_out.meta_info['teacher_api_overflow'] = n_overflow
         cand_out.meta_info['teacher_prefix_lens'] = prefix_lens
+        # 失败原因逐行原文，供候选 dump 落盘（api_ok / api_fail_reason 两列）。
+        cand_out.meta_info['teacher_fail_reasons'] = fail_reasons
         print(f"[teacher_api] rollout ok={n_ok}/{N}, overflow={n_overflow}")
+        # 失败原因去重后按频次打印（最多 5 种），既看得到真实文本又不会被同一条
+        # exception 刷屏。要逐行定位就查 teacher_candidates/ 的 api_fail_reason。
+        _seen = {}
+        for r in fail_reasons:
+            if r:
+                _seen[r] = _seen.get(r, 0) + 1
+        for r, c in sorted(_seen.items(), key=lambda kv: -kv[1])[:5]:
+            print(f"[teacher_api]   fail x{c}: {r[:300]}")
         return cand_out
 
     def _pick_incorrect_rollout_text(self, gen_batch_output, on_reward_sum, p, n, success_value=1,
@@ -1664,6 +1686,8 @@ class NewRayPPOTrainer(RayPPOTrainer):
         # continue 模式下每行学生前缀的 token 数（rewrite/本地模式为 None），
         # 用于把 off 行的 prefix_mask 切成 [前缀=on-policy, 续写=off-policy] 两段。
         teacher_prefix_lens = None
+        # 每行 API 失败原因原文（成功行为 ''）；本地生成模式恒为 None。
+        teacher_fail_reasons = None
         with marked_timer("sr_gen", timing_raw, color="cyan"):
             if use_teacher:
                 # teacher-API rephraser: 用外部强模型的 HTTP 调用替换本地生成，返回与
@@ -1676,27 +1700,19 @@ class NewRayPPOTrainer(RayPPOTrainer):
                 cand_out = self._teacher_api_rollout(
                     cand_gen, teacher_messages, prefix_ids_list=teacher_prefix_ids
                 )
-                # API 成功率此前只留在 cand_out.meta_info 里、随 cand_out 一起被丢弃，
-                # tensorboard / training_metrics.jsonl 都看不到。这里提到 metrics。
+                # API 成功率：唯一上 tensorboard 的 teacher-API 指标。掉下来就去看
+                # <rollout_data_dir>/teacher_candidates/ 里的 api_fail_reason，或日志里的
+                # [teacher_api] 行——分类计数和原因原文都在那儿，没必要各占一条曲线。
                 _t_ok = cand_out.meta_info.get('teacher_api_ok')
                 _t_tot = cand_out.meta_info.get('teacher_api_total')
                 if _t_ok is not None and _t_tot:
-                    metrics['batch/teacher_api_ok'] = _t_ok
-                    metrics['batch/teacher_api_total'] = _t_tot
                     metrics['batch/teacher_api_ok_rate'] = _t_ok / max(1, _t_tot)
-                # 拼接后超 max_response_length 的行：尾部（含 \boxed{}）被截 -> 必然判错。
-                # 单独出指标，否则它看起来跟「teacher 答错」无法区分。
-                _t_of = cand_out.meta_info.get('teacher_api_overflow')
-                if _t_of is not None and _t_tot:
-                    metrics['batch/teacher_api_overflow'] = _t_of
-                    metrics['batch/teacher_api_overflow_rate'] = _t_of / max(1, _t_tot)
                 # continue 模式才有非零前缀；全零（rewrite）时保持 None，下游走原逻辑。
                 _plens = cand_out.meta_info.get('teacher_prefix_lens')
                 if _plens and any(_plens):
                     teacher_prefix_lens = _plens
-                    metrics['batch/teacher_prefix_tokens_mean'] = (
-                        sum(_plens) / max(1, len(_plens))
-                    )
+                # 逐行原文交给 dump（下方 sr_dump 落盘），让失败行在 JSONL 里可追溯。
+                teacher_fail_reasons = cand_out.meta_info.get('teacher_fail_reasons')
             else:
                 cand_out = self.actor_rollout_wg.generate_sequences(cand_gen)
                 timing_raw.update(cand_out.meta_info.get("timing", {}))
@@ -1882,6 +1898,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
                     chosen_rows=chosen_rows,
                     long_prompt=long_prompt,
                     teacher_messages=teacher_messages,
+                    teacher_fail_reasons=teacher_fail_reasons,
                     cand_out=cand_out,
                     use_teacher=use_teacher,
                     dump_root=_rd_dir,
@@ -1892,7 +1909,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
 
     def _dump_sr_candidates(self, all_q, K, cand_texts, cand_reward_sum, cand_rej,
                             cand_reason, chosen_rows, long_prompt, teacher_messages,
-                            cand_out, use_teacher, dump_root):
+                            cand_out, use_teacher, dump_root, teacher_fail_reasons=None):
         """把 summarize-replace 的 W*K 条候选全量写成 JSONL（一行一条候选）。
 
         与 <rollout_data_dir>/normal/ 的区别：那里只有被采纳的那条、且 input 已被换成
@@ -1902,6 +1919,8 @@ class NewRayPPOTrainer(RayPPOTrainer):
         每行字段：input(teacher/长 prompt 原文) / output(候选原文) / score /
         question(题在本批的下标) / k / accepted / correct / filtered / filter_reason /
         source('teacher'|'local') + 数据集元信息(uid/original_index/data_source/...)。
+        teacher 模式还带 api_ok / api_fail_reason：API 失败的行 output 必然是空串，
+        没有这两个字段就无法把「teacher 答错」和「请求根本没成功」区分开。
         """
         sr_dir = os.path.join(dump_root, "teacher_candidates")
         n_rows = len(all_q) * K
@@ -1931,6 +1950,11 @@ class NewRayPPOTrainer(RayPPOTrainer):
                 extra["filtered"].append(bool(cand_rej[r]) if cand_rej is not None else False)
                 extra["filter_reason"].append(cand_reason[r] if cand_reason is not None else "")
                 extra["source"].append("teacher" if use_teacher else "local")
+                # API 失败行：output 是空串，靠这两个字段才能和「teacher 答错」区分开。
+                if teacher_fail_reasons is not None and r < len(teacher_fail_reasons):
+                    _reason = teacher_fail_reasons[r]
+                    extra["api_ok"].append(not _reason)
+                    extra["api_fail_reason"].append(_reason)
 
         # 数据集元信息：cand_out.non_tensor_batch 已按 flat_gt_idx 展平到 W*K，行序一致。
         for key in ("reward_model", "data_source", "original_index", "uid", "extra_info"):
