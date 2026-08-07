@@ -72,7 +72,9 @@ from typing import Any, Dict, List, Tuple
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
-from transformers import AutoTokenizer
+# NOTE: transformers is imported lazily inside init_worker so that importers which
+# only need the prompt-rendering helpers (e.g. Data/prepare_rephraser_sft.py, which
+# cuts prefixes in character space) need neither the library nor a model download.
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -162,6 +164,8 @@ worker_tokenizer = None
 
 def init_worker(tokenizer_path: str) -> None:
     global worker_tokenizer
+    from transformers import AutoTokenizer
+
     worker_tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
 
 
