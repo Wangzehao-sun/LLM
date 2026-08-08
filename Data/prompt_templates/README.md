@@ -121,6 +121,25 @@ import prompt_templates as pt
 
 实测这条路径与 `str.format` **逐字相同**，且对已有 512 行 SFT parquet 逐行反解重渲染 **512/512 一致**。所以 `is_teacher` 那个开关被删掉了 —— 一条路径不会和自己不一致。
 
+## 谁在用
+
+| 消费方 | 怎么用 |
+|---|---|
+| `Data/prepare_summarize_prompts.py` | `--template <名字>`，离线渲染 `summarize_prompt(s)` 列，写 `prompt_id` |
+| `Data/prepare_rephraser_sft.py` | `--template <名字>`，构建 rephraser SFT 数据，写 `prompt_id` |
+| `Inferapi/rephrase_rollout/prepare_summarize_prompts.py` | vendor 了本目录（见其 `prompt_templates/SOURCE.md`），`--template` / `--teacher-template` 都收名字 |
+
+Inferapi 是**另一个 git 仓库**，跑在可能没有本仓库 checkout 的机器上（API 机器、容器），
+所以它 vendor 一份副本而不是 import。同步：
+
+```bash
+diff -r Data/prompt_templates ~/Desktop/Inferapi/rephrase_rollout/prompt_templates
+cp Data/prompt_templates/*.txt Data/prompt_templates/*.py \
+   ~/Desktop/Inferapi/rephrase_rollout/prompt_templates/
+```
+
+改模板只在本仓库改，然后重新 copy —— 否则两边对同一个名字的理解会再次分叉。
+
 ## 范围
 
 本包只管**模板文本**。
