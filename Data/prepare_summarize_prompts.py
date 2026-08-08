@@ -46,10 +46,16 @@ by the normal-step summarize_replace, ``summarize_prompt`` by the extra-step
 ``prefix_mode='summarize'`` branch. Rendering offline avoids any decode/
 re-tokenize work in the training loop.
 
+The template itself comes from ``Data/prompt_templates/`` (see that package's
+README): ``--template`` takes a registered NAME, and the name is written into the
+output as ``prompt_id`` so a downstream step can verify it is using the same
+prompt this data was built with.
+
 Schema add:
     summarize_prompt  : np.ndarray[object] of length 1
     summarize_prompts : np.ndarray[object] of length K (prefix ascending)
                         each element being a list[{role, content}] (system + user).
+    prompt_id         : str -- the template name these columns were rendered with.
 
 Usage:
 
@@ -57,6 +63,7 @@ Usage:
         --input  $HOME/LLM/Data/deepmath_dgt6_n10000_split.parquet \
         --output $HOME/LLM/Data/deepmath_dgt6_n10000_summarize.parquet \
         --tokenizer-path /home/shared/Qwen2.5-Math-7B-16k-think \
+        --template rephrase_main_v1 \
         --single-mode full --full-ratio 1.0 \
         --list-mode custom --list-ratios 0.2,0.4,0.6,0.8
 """
@@ -72,6 +79,10 @@ from typing import Any, Dict, List, Tuple
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+
+# Templates live in Data/prompt_templates/ so that offline rendering, SFT-data
+# construction and evaluation all read the same text. See that package's README.
+import prompt_templates as pt
 # NOTE: transformers is imported lazily inside init_worker so that importers which
 # only need the prompt-rendering helpers (e.g. Data/prepare_rephraser_sft.py, which
 # cuts prefixes in character space) need neither the library nor a model download.
@@ -79,85 +90,6 @@ from tqdm import tqdm
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-
-DEFAULT_TEMPLATE1 = (
-    "Please reason step by step, and put your final answer within \\boxed{{}}."
-    "You are given a [Problem] and a [Reasoning Draft] — an in-progress derivation for it that stops before "
-    "the final answer.\n\n"
-    "Your task is to re-author a single \"Gold Standard\" solution that is "
-    "entirely self-contained, as if you solved the problem using only your "
-    "own mathematical intuition.\n\n"
-    "Strict requirements:\n"
-    "1. Total De-Reference: Do NOT mention, quote, or even subtly refer to the "
-    "[Reasoning Draft]. The reader must have no idea that any draft was provided to you.\n"
-    "2. Invisible Integration: Re-derive the full content of the draft in your "
-    "own words — the overall approach, the conditions and formulas it relies "
-    "on, and every key step and intermediate result — completely and without "
-    "omission, woven into one seamless derivation rather than a labeled "
-    "summary. Do not copy the draft verbatim.\n"
-    "3. Consistency Check: As you re-derive, make sure each calculation and "
-    "logical step is correct and follows cleanly from the previous one, so the "
-    "final solution reads as one coherent, error-free argument with no "
-    "meta-talk or conversational fillers.\n"
-    "4. Continue & Conclude: After re-deriving that reasoning, carry it forward "
-    "and solve the problem step by step, and put your final answer within "
-    "\\boxed{{}}. The final answer must follow from your own reasoning.\n\n"
-    "[Problem]\n{question}\n\n"
-    "[Reasoning Draft]\n{prefix}\n\n"
-    "[Your solution]"
-)
-
-DEFAULT_TEMPLATE2 = (
-    "You are given a [Problem] and a [Partial Reasoning Draft].\n\n"
-    "Your task is to write one complete, self-contained solution. "
-    "Use the [Reference Reasoning Draft] as private mathematical guidance: understand its reasoning process, "
-    "extract the useful and valid reasoning steps, and reconstruct them in your own step-by-step problem-solving style. "
-    "Then continue the derivation naturally until the problem is fully solved. "
-    "The final output should be a standard, well-organized solution to the problem, not a commentary on the draft.\n"
-    "## Strict requirements:\n" 
-    "1. Use the Reference Reasoning Draft as private mathematical guidance. " 
-    "Understand its reasoning process, extract its useful and valid steps, and rewrite them in your own step-by-step problem-solving style, as if solving the problem directly.\n" 
-    "Do not explicitly mention the draft, the prefix, or that any prior reasoning was provided. " 
-    "2. Reconstruct the reasoning rather than merely paraphrasing it. " 
-    "In the reconstructed part, preserve as many valid reasoning steps from the draft as possible, including important equations, intermediate conclusions, and useful verification or correction steps. " 
-    "For each reconstructed step, explain the reasoning in your own words rather than merely copying the draft's wording."
-    "The reasoning should be reorganized into a clear, coherent, and natural solution.\n" 
-    "3. Do not summarize, compress, or skip the draft's valid reasoning steps. " 
-    "For each step of the derivation, explain the underlying mathematical reasoning in your own words rather than only stating the result.\n" 
-    "4. Continue naturally from the reconstructed reasoning. " 
-    "If the draft contains an obvious mathematical mistake, correct it silently and continue with a valid derivation. " 
-    "Add any necessary new valid steps to complete the derivation and reach the final answer.\n"
-    "5. Please reason step by step, and put your final answer within \\boxed{{}}."
-    "## Problem:\n{question}\n\n"
-    "## Reference Reasoning Draft:\n{prefix}\n\n"
-    "## Your solution:"
-)
-
-DEFAULT_TEMPLATE = (
-    "You are given a [Problem] and a [Noisy Reasoning Draft].\n\n"
-    "Your task is to write one complete, self-contained solution. "
-    "Use the [Reference Reasoning Draft] as private mathematical guidance: understand its reasoning process, "
-    "extract the useful and valid reasoning steps, and reconstruct them in your own step-by-step problem-solving style. "
-    "Then continue the derivation naturally until the problem is fully solved. "
-    "The final output should be a standard, well-organized solution to the problem, not a commentary on the draft.\n"
-    "## Strict requirements:\n" 
-    "1. Use the Reference Reasoning Draft as private mathematical guidance. " 
-    "Understand its reasoning process, extract its useful and valid steps, and rewrite them in your own step-by-step problem-solving style, as if solving the problem directly.\n" 
-    "Do not explicitly mention the draft, the prefix, or that any prior reasoning was provided. " 
-    "2. Reconstruct the reasoning rather than merely paraphrasing it. " 
-    "In the reconstructed part, preserve as many valid reasoning steps from the draft as possible, including important equations, intermediate conclusions, and useful verification or correction steps. " 
-    "For each reconstructed step, explain the reasoning in your own words rather than merely copying the draft's wording."
-    "The reasoning should be reorganized into a clear, coherent, and natural solution.\n" 
-    "3. Do not summarize, compress, or skip the draft's valid reasoning steps. " 
-    "For each step of the derivation, explain the underlying mathematical reasoning in your own words rather than only stating the result.\n" 
-    "4. Continue naturally from the reconstructed reasoning. " 
-    "Add any necessary new valid steps to complete the derivation and reach the final answer. "
-    "If the draft contains an obvious mathematical mistake, correct it silently and continue with a valid derivation.\n" 
-    "5. Please reason step by step, and put your final answer within \\boxed{{}}.\n"
-    "## Problem:\n{question}\n\n"
-    "## Reference Reasoning Draft:\n{prefix}\n\n"
-    "## Your solution:"
-)
 
 worker_tokenizer = None
 
@@ -374,13 +306,12 @@ def _build_summarize_prompt(
     question in the template (the user explicitly asked the model to summarize
     "what's been done so far"; with empty prefix the summary will just be
     trivial, training keeps working). The trainer / dataset can choose to
-    short-circuit step_i==0 separately if desired."""
-    user_content = template.format(question=question, prefix=prefix_text)
-    messages: List[Dict[str, str]] = []
-    if system_msg is not None:
-        messages.append(system_msg)
-    messages.append({"role": "user", "content": user_content})
-    return messages
+    short-circuit step_i==0 separately if desired.
+
+    Delegates to the shared renderer so this script, the offline API path and
+    evaluation cannot disagree on how a template is filled.
+    """
+    return pt.build_messages(system_msg, question, prefix_text, template)
 
 
 # ---------------------------------------------------------------------------
@@ -612,8 +543,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--template",
-        default=DEFAULT_TEMPLATE,
-        help="User-turn template, must include {question} and {prefix} placeholders.",
+        default="rephrase_main_v1",
+        help="Prompt template: a name registered in Data/prompt_templates/ "
+             f"({', '.join(pt.template_names())}), or a path to a .txt file containing "
+             "{question} and {prefix}. The default reproduces what this script rendered "
+             "before templates were centralised. Default: %(default)s",
     )
     parser.add_argument("--limit", type=int, default=None, help="Optional row limit for quick smoke tests.")
     parser.add_argument(
@@ -635,8 +569,11 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if "{question}" not in args.template or "{prefix}" not in args.template:
-        raise SystemExit("--template must contain both {question} and {prefix}")
+    # Resolve the template to text ONCE, here, rather than inside the workers: the
+    # value is handed to every worker process, and a name would have to be
+    # re-resolved (and re-read from disk) per row.
+    template_text, template_name = pt.resolve(args.template)
+    print(f"[template] {template_name} ({len(template_text)} chars)")
 
     # single-column validation
     if not (0.0 < args.full_ratio <= 1.0):
@@ -725,14 +662,14 @@ def main() -> None:
         init_worker(args.tokenizer_path)
         processed = [
             process_single_item(
-                item, args.template, args.single_mode, row_ratios[i],
+                item, template_text, args.single_mode, row_ratios[i],
                 args.list_mode, list_ratios,
             )
             for i, item in enumerate(tqdm(records, total=len(records), desc="rendering"))
         ]
     else:
         task_iter = (
-            (item, args.template, args.single_mode, row_ratios[i],
+            (item, template_text, args.single_mode, row_ratios[i],
              args.list_mode, list_ratios)
             for i, item in enumerate(records)
         )
@@ -819,6 +756,12 @@ def main() -> None:
                     head = content[:300].replace("\n", " ")
                     tail = content[-200:].replace("\n", " ") if len(content) > 500 else ""
                     print(f"  [{msg.get('role')}] {head}{' ... ' + tail if tail else ''}")
+
+    # Record WHICH template produced these columns. Downstream steps (SFT-data
+    # construction, evaluation) compare this against the template they are about to
+    # use and refuse to run on a mismatch, so a prompt disagreement surfaces as an
+    # error rather than as a puzzling accuracy number.
+    out_df["prompt_id"] = template_name
 
     out_df.to_parquet(args.output, index=False)
     size_mb = pd.Series([0]).memory_usage()  # placeholder, real size below
