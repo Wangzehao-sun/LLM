@@ -49,7 +49,6 @@ LINEAGE = {
     "rephrase_main_v2": (MAIN_PREPARE, "DEFAULT_TEMPLATE2"),
     "rephrase_inferapi_v1": (INFERAPI_PREPARE, "DEFAULT_TEMPLATE"),
     "teacher_continue_v1": (INFERAPI_PREPARE, "TEACHER_TEMPLATE_DEFAULT"),
-    "teacher_continue_v1_boxedbug": (INFERAPI_PREPARE, "TEACHER_TEMPLATE_DEFAULT"),
     "teacher_repair_v1": (INFERAPI_PREPARE, "TEACHER_TEMPLATE_DEFAULT1"),
 }
 
@@ -83,19 +82,19 @@ class TestFileConventions(unittest.TestCase):
     into every rendered prompt."""
 
     def test_template_files_have_exactly_one_trailing_newline(self):
-        for name in pt.template_names(include_deprecated=True):
+        for name in pt.template_names():
             with self.subTest(template=name):
                 raw = (TEMPLATE_DIR / pt.TEMPLATES[name].filename).read_text(encoding="utf-8")
                 self.assertTrue(raw.endswith("\n"), "template file should end with a newline")
                 self.assertFalse(raw.endswith("\n\n"), "template file should end with exactly one newline")
 
     def test_loaded_text_has_no_trailing_newline(self):
-        for name in pt.template_names(include_deprecated=True):
+        for name in pt.template_names():
             with self.subTest(template=name):
                 self.assertFalse(pt.load(name).endswith("\n"))
 
     def test_every_registered_file_exists(self):
-        for name in pt.template_names(include_deprecated=True):
+        for name in pt.template_names():
             with self.subTest(template=name):
                 self.assertTrue((TEMPLATE_DIR / pt.TEMPLATES[name].filename).exists())
 
@@ -105,7 +104,7 @@ class TestRegistryInvariants(unittest.TestCase):
 
     def test_no_two_names_share_text(self):
         seen: dict[str, str] = {}
-        for name in pt.template_names(include_deprecated=True):
+        for name in pt.template_names():
             text = pt.load(name)
             self.assertNotIn(text, seen, f"{name!r} and {seen.get(text)!r} have identical text")
             seen[text] = name
@@ -115,15 +114,9 @@ class TestRegistryInvariants(unittest.TestCase):
         self.assertNotIn("default", pt.TEMPLATES)
 
     def test_every_name_carries_lineage_and_version(self):
-        for name in pt.template_names(include_deprecated=True):
+        for name in pt.template_names():
             with self.subTest(template=name):
                 self.assertRegex(name, r"^[a-z]+(_[a-z0-9]+)+_v\d+(_[a-z]+)?$")
-
-    def test_deprecated_templates_are_hidden_by_default(self):
-        visible = pt.template_names()
-        everything = pt.template_names(include_deprecated=True)
-        self.assertIn("teacher_continue_v1_boxedbug", everything)
-        self.assertNotIn("teacher_continue_v1_boxedbug", visible)
 
     def test_unknown_name_raises(self):
         with self.assertRaises(KeyError):
@@ -156,8 +149,6 @@ class TestRenderEquivalence(unittest.TestCase):
     def test_stored_text_equals_brace_collapsed_original(self):
         checked = 0
         for name, (path, const) in LINEAGE.items():
-            if name.endswith("_boxedbug"):
-                continue  # deliberately preserves the doubled braces
             original = _string_constant(path, const)
             if original is None:
                 continue
@@ -198,28 +189,25 @@ class TestRenderEquivalence(unittest.TestCase):
 
 
 class TestBoxedBraceRegression(unittest.TestCase):
-    """Locks in both halves of the brace fix: the corrected template, and the
-    ability to reproduce the batch generated before it."""
+    """The bug this package was partly built to kill: a literal ``\\boxed{{}}`` in a
+    template rendered by replacement rather than str.format, so the doubled braces
+    went to the API verbatim."""
 
-    def test_fixed_template_has_literal_single_braces(self):
+    def test_teacher_template_has_literal_single_braces(self):
         text = pt.load("teacher_continue_v1")
         self.assertIn(r"\boxed{}", text)
         self.assertNotIn(r"\boxed{{}}", text)
 
-    def test_boxedbug_variant_preserves_the_shipped_bytes(self):
-        text = pt.load("teacher_continue_v1_boxedbug")
-        self.assertIn(r"\boxed{{}}", text)
-
-    def test_the_two_variants_differ_only_in_that(self):
-        fixed = pt.load("teacher_continue_v1")
-        buggy = pt.load("teacher_continue_v1_boxedbug")
-        self.assertNotEqual(fixed, buggy)
-        self.assertEqual(fixed, buggy.replace(r"\boxed{{}}", r"\boxed{}"))
-
-    def test_no_active_template_carries_doubled_braces(self):
-        for name in pt.template_names():  # deprecated excluded
+    def test_no_template_carries_doubled_braces(self):
+        for name in pt.template_names():
             with self.subTest(template=name):
                 self.assertNotIn(r"\boxed{{}}", pt.load(name))
+
+    def test_rendering_never_reintroduces_doubled_braces(self):
+        for name in pt.template_names():
+            with self.subTest(template=name):
+                rendered = pt.render(pt.load(name), "Q", "P")
+                self.assertNotIn(r"\boxed{{}}", rendered)
 
 
 class TestResolve(unittest.TestCase):
@@ -339,7 +327,7 @@ class TestPlaceholderContract(unittest.TestCase):
         # Any {foo} that is not a known placeholder and not a literal brace group
         # would silently survive into the prompt.
         known = {"question", "prefix"}
-        for name in pt.template_names(include_deprecated=True):
+        for name in pt.template_names():
             text = pt.load(name)
             for match in re.finditer(r"\{([a-z_][a-z0-9_]*)\}", text):
                 field = match.group(1)
@@ -350,7 +338,7 @@ class TestPlaceholderContract(unittest.TestCase):
                     )
 
     def test_every_template_has_question_and_prefix(self):
-        for name in pt.template_names(include_deprecated=True):
+        for name in pt.template_names():
             with self.subTest(template=name):
                 text = pt.load(name)
                 self.assertIn("{question}", text)

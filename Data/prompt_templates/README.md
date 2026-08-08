@@ -25,13 +25,11 @@ rephrase / teacher prompt 的模板全部存放在这里，一个模板一个 `.
 | `rephrase_shared_gold_v1` | 1386 | 否 |
 | `teacher_continue_v1` | 1657 | 是 |
 | `teacher_repair_v1` | 2962 | 是 |
-| `teacher_continue_v1_boxedbug` ⚠️ 已弃用 | 1659 | 是 |
 
 来源与区别写在 `registry.py` 每条的 `note` 里。几点值得知道：
 
 - **`rephrase_inferapi_v1`** 渲染了已有的 512 行 SFT 数据。
 - **`rephrase_main_v1` 和 `rephrase_inferapi_v1` 曾经同名**，就是它们的冲突促成了这个包。
-- **`teacher_continue_v1_boxedbug`** 保留了带 bug 的字节，仅用于复现修复前那 16 行批次，不要用于新数据。默认列表里不显示。
 
 ## 用法
 
@@ -66,7 +64,7 @@ meta = pt.provenance(name)     # {"prompt_id": ..., "rendered_at": ...}
 | `render(text, question, prefix, style_examples=None)` | 填充占位符。**唯一的渲染路径** |
 | `build_messages(system_msg, question, prefix, text, ...)` | 构造 `[system?, user]` |
 | `provenance(name)` | `{prompt_id, rendered_at}`，跟产出物一起存 |
-| `template_names(include_deprecated=False)` | 已注册模板名 |
+| `template_names()` | 已注册模板名 |
 
 ### 占位符
 
@@ -135,6 +133,6 @@ import prompt_templates as pt
 python3 -m pytest Myverl/tests/custom/test_prompt_templates_on_cpu.py -v
 ```
 
-31 个测试。核心几条：单一渲染路径与 `str.format` 逐字一致、512 行 parquet 重渲染一致、名字不重复、文件换行约定、花括号回归（修好的模板含 `\boxed{}`，`_boxedbug` 变体保留 `\boxed{{}}`）。
+29 个测试。核心几条：单一渲染路径与 `str.format` 逐字一致、512 行 parquet 重渲染一致、名字不重复、文件换行约定、花括号回归（任何模板都不含 `\boxed{{}}`，渲染后也不会重新引入）。
 
 涉及仓库外路径（Inferapi、桌面上的 parquet）的测试在文件缺失时 skip，裸 checkout 也能全绿。

@@ -82,10 +82,9 @@ TEMPLATE_DIR = Path(__file__).resolve().parent
 PLACEHOLDER_RE = re.compile(r"\{(question|prefix|style_example_(\d+))\}")
 
 
-def template_names(include_deprecated: bool = False) -> list[str]:
-    """Registered template names, sorted. Deprecated ones are hidden by default so
-    they never get picked up by accident -- they exist to reproduce old batches."""
-    return sorted(name for name, spec in TEMPLATES.items() if include_deprecated or not spec.deprecated)
+def template_names() -> list[str]:
+    """Registered template names, sorted."""
+    return sorted(TEMPLATES)
 
 
 def load(name: str) -> str:
@@ -98,7 +97,7 @@ def load(name: str) -> str:
     """
     spec = TEMPLATES.get(name)
     if spec is None:
-        raise KeyError(f"unknown template {name!r}; registered: {', '.join(template_names(True))}")
+        raise KeyError(f"unknown template {name!r}; registered: {', '.join(template_names())}")
     path = TEMPLATE_DIR / spec.filename
     if not path.exists():
         raise FileNotFoundError(f"template file missing for {name!r}: {path}")

@@ -20,14 +20,12 @@ class TemplateSpec(NamedTuple):
     """One registered template."""
 
     filename: str
-    deprecated: bool  # kept only to reproduce old artefacts; hidden from listings
     note: str  # where it came from and what distinguishes it
 
 
 TEMPLATES: dict[str, TemplateSpec] = {
     "rephrase_shared_gold_v1": TemplateSpec(
         filename="rephrase_shared_gold_v1.txt",
-        deprecated=False,
         note=(
             """Gold-standard re-authoring. Byte-identical in both forks (was DEFAULT_TEMPLATE1
         in each), hence lineage "shared"."""
@@ -35,7 +33,6 @@ TEMPLATES: dict[str, TemplateSpec] = {
     ),
     "rephrase_main_v1": TemplateSpec(
         filename="rephrase_main_v1.txt",
-        deprecated=False,
         note=(
             """Was Data/prepare_summarize_prompts.py:DEFAULT_TEMPLATE. Says "## Reference
         Reasoning Draft:" and treats the draft as noisy private guidance."""
@@ -43,7 +40,6 @@ TEMPLATES: dict[str, TemplateSpec] = {
     ),
     "rephrase_main_v2": TemplateSpec(
         filename="rephrase_main_v2.txt",
-        deprecated=False,
         note=(
             """Was Data/prepare_summarize_prompts.py:DEFAULT_TEMPLATE2. Near-duplicate of v1;
         kept because prepare_rephraser_sft.py defaulted to it (old key "template2")."""
@@ -51,7 +47,6 @@ TEMPLATES: dict[str, TemplateSpec] = {
     ),
     "rephrase_inferapi_v1": TemplateSpec(
         filename="rephrase_inferapi_v1.txt",
-        deprecated=False,
         note=(
             """Was Inferapi:DEFAULT_TEMPLATE -- the same NAME as rephrase_main_v1 but different
         text (similarity 0.199), which is the collision this package exists to prevent.
@@ -60,25 +55,14 @@ TEMPLATES: dict[str, TemplateSpec] = {
     ),
     "teacher_continue_v1": TemplateSpec(
         filename="teacher_continue_v1.txt",
-        deprecated=False,
         note=(
             """Continue a partial reasoning under expert guidance. Was
         Inferapi:TEACHER_TEMPLATE_DEFAULT with the doubled-brace bug FIXED
         (\\boxed{{}} -> \\boxed{}). Use this for all new runs."""
         ),
     ),
-    "teacher_continue_v1_boxedbug": TemplateSpec(
-        filename="teacher_continue_v1_boxedbug.txt",
-        deprecated=True,
-        note=(
-            """teacher_continue_v1 exactly as shipped, preserving the literal \\boxed{{}}. Kept
-        ONLY to reproduce the 16-row batch generated before the fix -- the doubled braces
-        really did reach the API. Do not use for new data."""
-        ),
-    ),
     "teacher_repair_v1": TemplateSpec(
         filename="teacher_repair_v1.txt",
-        deprecated=False,
         note=(
             """Repair the target model's incorrect attempt using expert guidance. Was
         Inferapi:TEACHER_TEMPLATE_DEFAULT1; its brace escaping was already correct."""
