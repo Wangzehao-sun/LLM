@@ -17,7 +17,6 @@ Run:
 from __future__ import annotations
 
 import ast
-import hashlib
 import re
 import sys
 import unittest
@@ -78,24 +77,12 @@ def _string_constant(path: Path, name: str) -> str | None:
     return None
 
 
-class TestPinnedHashes(unittest.TestCase):
-    """Every .txt must match the hash pinned in the registry.
-
-    This is the tripwire for silent mutation: an editor adding a trailing newline,
-    a formatter reflowing prose, an encoding change. Without it, "the template is
-    frozen" would be a comment rather than a guarantee.
-    """
-
-    def test_all_templates_match_pinned_hash(self):
-        for name in pt.template_names(include_deprecated=True):
-            with self.subTest(template=name):
-                text = pt.load(name)  # raises on mismatch
-                self.assertTrue(hashlib.sha256(text.encode()).hexdigest().startswith(pt.template_hash(name)))
+class TestFileConventions(unittest.TestCase):
+    """The on-disk convention: POSIX text files whose trailing newline is not part
+    of the prompt. load() strips exactly one, so a stray second newline would leak
+    into every rendered prompt."""
 
     def test_template_files_have_exactly_one_trailing_newline(self):
-        # load() strips exactly one newline; if a file ends with two, the loaded
-        # text keeps one and the hash check fails. Assert the on-disk convention
-        # directly so the failure names the real cause.
         for name in pt.template_names(include_deprecated=True):
             with self.subTest(template=name):
                 raw = (TEMPLATE_DIR / pt.TEMPLATES[name].filename).read_text(encoding="utf-8")
@@ -107,17 +94,21 @@ class TestPinnedHashes(unittest.TestCase):
             with self.subTest(template=name):
                 self.assertFalse(pt.load(name).endswith("\n"))
 
+    def test_every_registered_file_exists(self):
+        for name in pt.template_names(include_deprecated=True):
+            with self.subTest(template=name):
+                self.assertTrue((TEMPLATE_DIR / pt.TEMPLATES[name].filename).exists())
+
 
 class TestRegistryInvariants(unittest.TestCase):
-    """The registry's job is to make the original failure -- one name, two different
-    texts -- structurally impossible."""
+    """Names are the whole mechanism, so they have to be unambiguous."""
 
-    def test_no_two_names_share_bytes(self):
+    def test_no_two_names_share_text(self):
         seen: dict[str, str] = {}
         for name in pt.template_names(include_deprecated=True):
-            digest = hashlib.sha256(pt.load(name).encode()).hexdigest()
-            self.assertNotIn(digest, seen, f"{name!r} and {seen.get(digest)!r} have identical bytes")
-            seen[digest] = name
+            text = pt.load(name)
+            self.assertNotIn(text, seen, f"{name!r} and {seen.get(text)!r} have identical text")
+            seen[text] = name
 
     def test_default_name_is_banned(self):
         # "default" is what let two different templates hide behind one identifier.
@@ -137,20 +128,6 @@ class TestRegistryInvariants(unittest.TestCase):
     def test_unknown_name_raises(self):
         with self.assertRaises(KeyError):
             pt.load("no_such_template_v1")
-
-    def test_edited_template_fails_the_hash_check(self):
-        # Simulate an in-place edit of a frozen template: load() must refuse rather
-        # than quietly serve different prompt bytes to one stage of the pipeline.
-        name = "rephrase_main_v1"
-        path = TEMPLATE_DIR / pt.TEMPLATES[name].filename
-        original = path.read_text(encoding="utf-8")
-        try:
-            path.write_text(original.replace("[Problem]", "[Problem!]", 1), encoding="utf-8")
-            with self.assertRaises(ValueError):
-                pt.load(name)
-        finally:
-            path.write_text(original, encoding="utf-8")
-        self.assertEqual(path.read_text(encoding="utf-8"), original)
 
 
 class TestRenderEquivalence(unittest.TestCase):
@@ -247,22 +224,20 @@ class TestBoxedBraceRegression(unittest.TestCase):
 
 class TestResolve(unittest.TestCase):
     def test_registered_name_round_trips(self):
-        text, name, sha = pt.resolve("rephrase_main_v1")
+        text, name = pt.resolve("rephrase_main_v1")
         self.assertEqual(name, "rephrase_main_v1")
-        self.assertEqual(sha, pt.template_hash("rephrase_main_v1"))
         self.assertEqual(text, pt.load("rephrase_main_v1"))
 
-    def test_file_path_is_accepted_and_gets_its_own_hash(self):
+    def test_file_path_is_accepted_and_labelled(self):
         import tempfile
 
         body = "Solve it.\n\n## Problem\n{question}\n\n## Draft\n{prefix}\n\n## Answer:"
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "my_template.txt"
             path.write_text(body + "\n", encoding="utf-8")
-            text, name, sha = pt.resolve(str(path))
+            text, name = pt.resolve(str(path))
             self.assertEqual(text, body)
             self.assertEqual(name, "custom:my_template.txt")
-            self.assertTrue(hashlib.sha256(body.encode()).hexdigest().startswith(sha))
 
     def test_custom_template_missing_placeholders_is_rejected(self):
         import tempfile
@@ -317,37 +292,10 @@ class TestBuildMessages(unittest.TestCase):
 
 
 class TestProvenance(unittest.TestCase):
-    def test_records_id_and_hash(self):
+    def test_records_the_template_name(self):
         meta = pt.provenance("teacher_continue_v1")
         self.assertEqual(meta["prompt_id"], "teacher_continue_v1")
-        self.assertEqual(meta["prompt_sha256"], pt.template_hash("teacher_continue_v1"))
-        self.assertEqual(meta["loader_version"], pt.LOADER_VERSION)
         self.assertIn("rendered_at", meta)
-
-    def test_records_chat_template_hash_when_tokenizer_given(self):
-        # Identical text under a different chat template tokenizes differently, so
-        # this is what makes SFT/eval token-level misalignment detectable.
-        class FakeTokenizer:
-            name_or_path = "fake/Qwen3-4b-base"
-            chat_template = "{% for m in messages %}{{ m['content'] }}{% endfor %}"
-
-        meta = pt.provenance("rephrase_main_v1", tokenizer=FakeTokenizer())
-        self.assertEqual(meta["tokenizer_name"], "fake/Qwen3-4b-base")
-        self.assertTrue(hashlib.sha256(FakeTokenizer.chat_template.encode()).hexdigest().startswith(meta["chat_template_sha256"]))
-
-    def test_differing_chat_templates_produce_differing_hashes(self):
-        class A:
-            name_or_path = "a"
-            chat_template = "{{ 'A' }}"
-
-        class B:
-            name_or_path = "b"
-            chat_template = "{{ 'B' }}"
-
-        self.assertNotEqual(
-            pt.provenance("rephrase_main_v1", tokenizer=A())["chat_template_sha256"],
-            pt.provenance("rephrase_main_v1", tokenizer=B())["chat_template_sha256"],
-        )
 
 
 class TestReferenceParquetReRender(unittest.TestCase):

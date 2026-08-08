@@ -2,7 +2,7 @@
 
 ## 这是什么
 
-rephrase / teacher prompt 的模板全部存放在这里，一个模板一个 `.txt` 文件，用**名字**寻址，加载时按**钉死的 sha256 校验**。
+rephrase / teacher prompt 的模板全部存放在这里，一个模板一个 `.txt` 文件，用**名字**寻址。
 
 需要 prompt 的程序都从这里加载，不再各自持有副本。
 
@@ -13,19 +13,19 @@ rephrase / teacher prompt 的模板全部存放在这里，一个模板一个 `.
 - `DEFAULT_TEMPLATE` 在主仓库和 Inferapi 各有一份，**同名但内容完全不同**（相似度 0.199：一份写 `## Reference Reasoning Draft:`，另一份写 `## Partial Reasoning Draft:`）。已有的 512 行 SFT 数据用的是 Inferapi 那份，而它在主仓库根本不存在。
 - 一处模板把 `\boxed{}` 误写成 `\boxed{{}}`，而该模板走替换渲染、不像 `str.format` 会折叠双括号 —— 双括号原样发给了 API，16 条调用记录全部中招。
 
-现在这两类问题都无法静默发生：同名必同文（哈希校验），转义歧义消失（`.txt` 无转义层）。
+现在模板只有一个来源，每份有唯一名字，改动有 git diff 可查。
 
 ## 现有模板
 
-| 名字 | sha256[:12] | 字符数 | 含 `{style_example_1}` |
-|---|---|---|---|
-| `rephrase_main_v1` | `f8b9892ee505` | 1959 | 否 |
-| `rephrase_main_v2` | `443e9504e201` | 1960 | 否 |
-| `rephrase_inferapi_v1` | `943c8a0f88f9` | 1346 | 否 |
-| `rephrase_shared_gold_v1` | `5c010c95e990` | 1386 | 否 |
-| `teacher_continue_v1` | `e5292936fbf2` | 1657 | 是 |
-| `teacher_repair_v1` | `692dcdd25166` | 2962 | 是 |
-| `teacher_continue_v1_boxedbug` ⚠️ 已弃用 | `fb4c9efec18b` | 1659 | 是 |
+| 名字 | 字符数 | 含 `{style_example_1}` |
+|---|---|---|
+| `rephrase_main_v1` | 1959 | 否 |
+| `rephrase_main_v2` | 1960 | 否 |
+| `rephrase_inferapi_v1` | 1346 | 否 |
+| `rephrase_shared_gold_v1` | 1386 | 否 |
+| `teacher_continue_v1` | 1657 | 是 |
+| `teacher_repair_v1` | 2962 | 是 |
+| `teacher_continue_v1_boxedbug` ⚠️ 已弃用 | 1659 | 是 |
 
 来源与区别写在 `registry.py` 每条的 `note` 里。几点值得知道：
 
@@ -39,14 +39,14 @@ rephrase / teacher prompt 的模板全部存放在这里，一个模板一个 `.
 import prompt_templates as pt
 
 # 1) 解析模板：接受名字，也接受 .txt 文件路径
-text, name, sha = pt.resolve("teacher_continue_v1")
+text, name = pt.resolve("teacher_continue_v1")
 
 # 2) 构造 messages（三个消费方共同的起点）
 messages = pt.build_messages(system_msg, question, draft, text)
 #   -> [{"role": "system", ...}, {"role": "user", ...}]
 
-# 3) 记录溯源信息，跟产出物一起存
-meta = pt.provenance(name, sha, tokenizer=tokenizer)
+# 3) 把模板名记进产出物，供下游核对
+meta = pt.provenance(name)     # {"prompt_id": ..., "rendered_at": ...}
 ```
 
 三个消费方**只在 `build_messages` 之后**分叉：
@@ -61,13 +61,12 @@ meta = pt.provenance(name, sha, tokenizer=tokenizer)
 
 | 函数 | 作用 |
 |---|---|
-| `load(name)` | 返回模板文本，校验哈希；不匹配则报错 |
-| `resolve(spec)` | `spec` 为名字或文件路径 → `(text, name, sha)` |
+| `load(name)` | 返回模板文本 |
+| `resolve(spec)` | `spec` 为名字或文件路径 → `(text, name)` |
 | `render(text, question, prefix, style_examples=None)` | 填充占位符。**唯一的渲染路径** |
 | `build_messages(system_msg, question, prefix, text, ...)` | 构造 `[system?, user]` |
-| `provenance(name, sha=None, tokenizer=None)` | 溯源元数据 |
+| `provenance(name)` | `{prompt_id, rendered_at}`，跟产出物一起存 |
 | `template_names(include_deprecated=False)` | 已注册模板名 |
-| `template_hash(name)` | 钉死的短哈希（不读文件） |
 
 ### 占位符
 
@@ -97,34 +96,20 @@ sys.path.insert(0, "/path/to/LLM/Data")
 import prompt_templates as pt
 ```
 
-加载器是**纯 stdlib**（`pathlib`/`re`/`hashlib`），不依赖 pandas/numpy/yaml，所以可以被外部仓库 vendor 后独立使用。
+加载器是**纯 stdlib**（`pathlib`/`re`/`datetime`），不依赖 pandas/numpy/yaml，所以可以被外部仓库 vendor 后独立使用。
 
 ## 新增或修改模板
 
-**模板一旦用于生成数据就冻结，不再原地修改。** 要改就加新版本：
+**已经用于生成数据的模板，不要原地改。** 改了之后，同一个名字在不同时间指向不同内容，下游就无法判断某批数据到底用的是哪个 prompt。要改就加新版本：
 
 1. 写 `rephrase_main_v3.txt`（结尾恰好一个换行）
-2. 算哈希：
-   ```bash
-   python3 -c "
-   from pathlib import Path; import hashlib
-   t = Path('Data/prompt_templates/rephrase_main_v3.txt').read_text().removesuffix('\n')
-   print(hashlib.sha256(t.encode()).hexdigest()[:12])"
-   ```
-3. 在 `registry.py` 的 `TEMPLATES` 里加一条，填上哈希和 `note`（说明来源与区别）
-4. 跑测试：
+2. 在 `registry.py` 的 `TEMPLATES` 里加一条，填 `note` 说明来源与区别
+3. 跑测试：
    ```bash
    python3 -m pytest Myverl/tests/custom/test_prompt_templates_on_cpu.py -q
    ```
 
-命名规则 `<role>_<lineage>_<version>`。**`default` 这个名字被禁用** —— 正是它让两个不同模板藏在同一个标识符后面。
-
-### 两条强制不变式（import 时检查）
-
-1. 任意两个名字不得映射到相同字节
-2. 每个名字钉死 sha256，每次 `load` 都校验文件
-
-所以在原地改一个已冻结的模板会**报错**，而不是悄悄让某一环用上不同的 prompt。
+命名规则 `<role>_<lineage>_<version>`。**`default` 这个名字被禁用**（import 时检查）—— 正是它让两个不同模板藏在同一个标识符后面。
 
 ## 为什么是 `.txt` 而不是 YAML / Python 字符串
 
@@ -150,6 +135,6 @@ import prompt_templates as pt
 python3 -m pytest Myverl/tests/custom/test_prompt_templates_on_cpu.py -v
 ```
 
-34 个测试。核心几条：单一渲染路径与 `str.format` 逐字一致、512 行 parquet 重渲染一致、哈希钉死、registry 不变式、花括号回归（修好的模板含 `\boxed{}`，`_boxedbug` 变体保留 `\boxed{{}}`）。
+31 个测试。核心几条：单一渲染路径与 `str.format` 逐字一致、512 行 parquet 重渲染一致、名字不重复、文件换行约定、花括号回归（修好的模板含 `\boxed{}`，`_boxedbug` 变体保留 `\boxed{{}}`）。
 
 涉及仓库外路径（Inferapi、桌面上的 parquet）的测试在文件缺失时 skip，裸 checkout 也能全绿。
