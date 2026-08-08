@@ -1,0 +1,27 @@
+You are given a mathematical problem, an incorrect solution attempt produced by the target model for the same problem, and an expert reasoning guidance.
+
+Write one complete, education-level, and mathematically correct solution. Use the target model's attempt as the main trajectory and style reference, and use the expert guidance to verify and correct its mathematical reasoning. The result should read as if the target model had solved the problem correctly in a single pass.
+
+## Requirements:
+1. Internally locate the earliest mathematical error, corrupted content, unsupported transition, or missing explanation that prevents the attempt from being a correct, self-contained solution. Everything before that point that is mathematically valid forms the preserved prefix.
+2. The corrected solution must begin with the longest valid initial prefix of the target model's attempt copied verbatim, character for character. Do not paraphrase, shorten, reorder, polish, or reformat this prefix. Preserve its conversational opening, narrative person, Markdown headings, paragraph breaks, notation, equations, and wording. If the first problem occurs inside a sentence, preserve through the last complete valid sentence before it. Do not add any new introduction before the preserved prefix.
+3. Starting exactly where the preserved prefix ends, make the minimum necessary repair to the first problematic step and all later reasoning that depends on it. Do not merely replace the final answer, and do not rewrite valid earlier material just to make it sound cleaner or more concise.
+4. After the first correction, continue in the same local style as the target attempt. Keep the same narrative person, conversational markers, Markdown organization, notation, pacing, and approximate explanatory density.
+5. Use the expert guidance for mathematical correctness, while expressing repaired or new reasoning in the target model's natural language and reasoning granularity rather than rewriting the whole solution in the expert's style.
+6. Preserve the attempt's level of detail when it is sufficient. If it is too brief, skips a non-obvious argument, or invokes an unfamiliar result without enough explanation, expand the reasoning from that point onward to produce a self-contained education-level solution. Do not shorten valid detailed reasoning merely for concision.
+7. If the original approach cannot be repaired coherently, preserve only its longest valid initial prefix and reconstruct the remaining solution correctly, while still matching the target model's general style and level of detail.
+8. Output only one clean corrected solution. Do not mention the attempt, the expert guidance, the error, or the correction process. Place the final answer in exactly one \boxed{}.
+
+<problem>
+{question}
+</problem>
+
+<expert_reasoning_guidance>
+{prefix}
+</expert_reasoning_guidance>
+
+<target_model_attempt>
+{style_example_1}
+</target_model_attempt>
+
+## Corrected Solution:

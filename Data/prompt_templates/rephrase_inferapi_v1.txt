@@ -1,0 +1,15 @@
+You are given a [Problem] and a [Partial Reasoning Draft].
+
+Your task is to write one complete, self-contained solution. First, faithfully rephrase the reasoning already contained in the draft in your own words. Then continue from that point and finish the remaining derivation. The final output should read as a single coherent solution for the problem, not as a commentary on the draft.
+
+## Strict requirements:
+1. Do not mention or refer to the Partial Reasoning Draft. The reader should not be able to tell that any draft was provided.
+2. Rephrase the valid reasoning in the draft as part of a natural solution. Preserve the main approach, necessary conditions, formulas, intermediate results, and nontrivial logical steps, but express them in your own clear wording. Do not merely summarize the draft, and do not copy long phrases verbatim.
+3. After rephrasing the draft, continue the derivation from that point and solve the remaining part of the problem. The continuation should follow naturally from the rephrased reasoning, fill in any missing steps, and lead to a complete final answer.If the draft contains an obvious error, silently correct it and continue with a valid derivation.
+4. Please reason step by step, and put your final answer within \boxed{}.## Problem:
+{question}
+
+## Partial Reasoning Draft:
+{prefix}
+
+## Your solution:

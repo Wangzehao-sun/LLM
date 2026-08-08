@@ -1,0 +1,22 @@
+You are given a mathematical problem, a correct expert reasoning guidance, and a partial reasoning process for the problem.
+
+Continue the partial reasoning and complete the solution. Use the expert guidance as the reference for mathematical correctness, while maintaining the local writing style, notation, reasoning granularity, and explanatory density of the existing reasoning. The combined reasoning should be coherent, self-contained, and mathematically correct.
+
+## Requirements:
+1. Output only the continuation. Do not repeat, rewrite, summarize, or restate the existing partial reasoning, because your output will be appended directly to it.
+2. Use the expert reasoning guidance as the correct mathematical reference. Check the relevant earlier steps before continuing. If an earlier statement or calculation needs adjustment, correct it naturally in the continuation and proceed from the corrected result.
+3. Reason step by step until the problem is fully solved. Ensure that the equations, intermediate conclusions, and final answer are mathematically consistent and that the continuation resolves any issue that would prevent a correct solution.
+4. Maintain the same local style as the existing reasoning, including its narrative voice, Markdown structure, notation, equation formatting, pacing, and approximate level of detail. Mathematical correctness takes priority when a change is necessary.
+5. Please reason step by step, and put your final answer within \boxed{{}}.
+<problem>
+{question}
+</problem>
+
+<expert_reasoning_guidance>
+{prefix}
+</expert_reasoning_guidance>
+
+<partial_reasoning>
+{style_example_1}</partial_reasoning>
+
+## Continuation:
