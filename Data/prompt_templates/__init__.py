@@ -10,12 +10,17 @@ When each of those carried its own copy of the template text, they drifted:
   ``Inferapi/rephrase_rollout/prepare_summarize_prompts.py`` under the same name
   with COMPLETELY different text (similarity 0.199; one says
   ``## Reference Reasoning Draft:``, the other ``## Partial Reasoning Draft:``).
-* The leakage-filter phrase lists drifted alongside them (23+19 items in the RL
-  trainer vs 40+43 in the offline filter), so a template change could silently
-  stop being filtered.
+  The already-generated 512-row SFT parquet was rendered with the Inferapi
+  variant, which does not exist in this repo at all.
 * A literal ``\\boxed{{}}`` slipped into a template that is rendered by
   replacement rather than ``str.format``, so the doubled braces reached the API
   verbatim in a shipped batch.
+
+Scope: this package owns TEMPLATE TEXT only. The leakage-filter phrase lists in
+the RL trainer and in the offline post-processor are deliberately NOT here --
+they screen different things (on-policy rollouts under a rephrase prompt vs a
+strong model's output under a teacher prompt), so they are expected to differ and
+each stays with its consumer.
 
 Every template now lives in exactly one ``.txt`` file next to this module, is
 addressed by an explicit name, and is verified against a pinned sha256 on load.
@@ -58,14 +63,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
-from .registry import FILTER_PHRASES, TEMPLATES, TemplateSpec  # noqa: F401
+from .registry import TEMPLATES, TemplateSpec  # noqa: F401
 
 __all__ = [
     "LOADER_VERSION",
     "PLACEHOLDER_RE",
     "TEMPLATES",
     "build_messages",
-    "filter_phrases",
     "load",
     "provenance",
     "render",
@@ -207,33 +211,6 @@ def build_messages(
         messages.append(dict(system_msg))
     messages.append({"role": "user", "content": render(text, question, prefix, style_examples)})
     return messages
-
-
-def filter_phrases(families: Sequence[str]) -> tuple[list[str], list[str]]:
-    """Union of leakage-filter phrases for the given template families.
-
-    Returns ``(keywords, instruction_phrases)``. Keywords catch meta-narration
-    ("the draft", ``<problem>``); instruction phrases catch the model echoing the
-    template's own wording back at us.
-
-    These live in the registry rather than being derived from the template text:
-    17 of the offline filter's phrases match no template literally -- they are
-    paraphrase-robust guesses about model output, plus leftovers from template
-    revisions. Deriving them mechanically would silently drop those.
-    """
-    keywords: list[str] = []
-    instr: list[str] = []
-    for family in families:
-        if family not in FILTER_PHRASES:
-            raise KeyError(f"unknown filter family {family!r}; known: {', '.join(sorted(FILTER_PHRASES))}")
-        entry = FILTER_PHRASES[family]
-        for phrase in entry["keywords"]:
-            if phrase not in keywords:
-                keywords.append(phrase)
-        for phrase in entry["instruction_phrases"]:
-            if phrase not in instr:
-                instr.append(phrase)
-    return keywords, instr
 
 
 def provenance(

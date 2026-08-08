@@ -37,10 +37,8 @@ import prompt_templates as pt  # noqa: E402
 # Sources of the pre-refactor constants. These are the ground truth for the
 # byte-identity claims; once the constants are deleted, tests reading them skip.
 MAIN_PREPARE = DATA_DIR / "prepare_summarize_prompts.py"
-TRAINER = REPO_ROOT / "Myverl" / "verl" / "custom" / "new_ray_trainer.py"
 INFERAPI_ROOT = Path.home() / "Desktop" / "Inferapi" / "rephrase_rollout"
 INFERAPI_PREPARE = INFERAPI_ROOT / "prepare_summarize_prompts.py"
-INFERAPI_POSTPROCESS = INFERAPI_ROOT / "postprocess_outputs.py"
 # The 512-row SFT parquet generated with rephrase_inferapi_v1 before this refactor.
 REFERENCE_PARQUET = Path.home() / "Desktop" / "deepmath_hard_thinkonly1024_summarize0_5_sft.parquet"
 
@@ -77,20 +75,6 @@ def _string_constant(path: Path, name: str) -> str | None:
             except (ValueError, SyntaxError):
                 return None
             return value if isinstance(value, str) else None
-    return None
-
-
-def _list_constant(path: Path, name: str) -> list | None:
-    if not path.exists():
-        return None
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    for node in tree.body:
-        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == name for t in node.targets):
-            try:
-                value = ast.literal_eval(node.value)
-            except (ValueError, SyntaxError):
-                return None
-            return value if isinstance(value, list) else None
     return None
 
 
@@ -259,62 +243,6 @@ class TestBoxedBraceRegression(unittest.TestCase):
         for name in pt.template_names():  # deprecated excluded
             with self.subTest(template=name):
                 self.assertNotIn(r"\boxed{{}}", pt.load(name))
-
-
-class TestFilterPhrases(unittest.TestCase):
-    """Both consumers' phrase lists must be reproducible from the registry, so
-    migrating them cannot change filtering behaviour."""
-
-    def test_trainer_lists_are_reproduced_exactly(self):
-        want_kw = _list_constant(TRAINER, "_DEFAULT_TRAJ_KEYWORDS")
-        want_instr = _list_constant(TRAINER, "_DEFAULT_TRAJ_INSTR_PHRASES")
-        if want_kw is None or want_instr is None:
-            self.skipTest("trainer constants already migrated")
-        got_kw, got_instr = pt.filter_phrases(["rephrase_main", "experience"])
-        # Order is irrelevant: _trajectory_filter_reject tests each phrase
-        # independently by substring, so the set is the semantic content.
-        self.assertEqual(set(want_kw), set(got_kw))
-        self.assertEqual(set(want_instr), set(got_instr))
-        self.assertEqual(len(want_kw), len(got_kw))
-        self.assertEqual(len(want_instr), len(got_instr))
-
-    def test_offline_filter_lists_are_reproduced_exactly(self):
-        want_kw = _list_constant(INFERAPI_POSTPROCESS, "_DEFAULT_TRAJ_KEYWORDS")
-        want_instr = _list_constant(INFERAPI_POSTPROCESS, "_DEFAULT_TRAJ_INSTR_PHRASES")
-        if want_kw is None or want_instr is None:
-            self.skipTest(f"offline filter not available at {INFERAPI_POSTPROCESS}")
-        got_kw, got_instr = pt.filter_phrases(["rephrase_main", "teacher"])
-        self.assertEqual(set(want_kw), set(got_kw))
-        self.assertEqual(set(want_instr), set(got_instr))
-        self.assertEqual(len(want_kw), len(got_kw))
-        self.assertEqual(len(want_instr), len(got_instr))
-
-    def test_families_do_not_overlap(self):
-        # Overlapping families would make unions silently lossy on counts.
-        seen: dict[str, str] = {}
-        for family in ("rephrase_main", "experience", "teacher"):
-            kw, _ = pt.filter_phrases([family])
-            for phrase in kw:
-                self.assertNotIn(phrase, seen, f"{phrase!r} in both {family!r} and {seen.get(phrase)!r}")
-                seen[phrase] = family
-
-    def test_union_deduplicates(self):
-        kw_a, _ = pt.filter_phrases(["rephrase_main"])
-        kw_twice, _ = pt.filter_phrases(["rephrase_main", "rephrase_main"])
-        self.assertEqual(kw_a, kw_twice)
-
-    def test_unknown_family_raises(self):
-        with self.assertRaises(KeyError):
-            pt.filter_phrases(["no_such_family"])
-
-    def test_derivable_phrases_appear_in_their_family_templates(self):
-        # Many phrases are paraphrase-robust guesses about model output and appear in
-        # no template. The ones that DO appear should keep appearing -- otherwise a
-        # template revision has silently orphaned its own filter.
-        corpus = "\n".join(pt.load(n).lower() for n in pt.template_names(True))
-        kw, instr = pt.filter_phrases(["rephrase_main", "experience", "teacher"])
-        present = [p for p in kw + instr if p.lower() in corpus]
-        self.assertGreater(len(present), 0, "no filter phrase matches any template")
 
 
 class TestResolve(unittest.TestCase):
