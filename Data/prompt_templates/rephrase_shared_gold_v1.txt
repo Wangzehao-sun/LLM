@@ -1,0 +1,17 @@
+Please reason step by step, and put your final answer within \boxed{}.You are given a [Problem] and a [Reasoning Draft] — an in-progress derivation for it that stops before the final answer.
+
+Your task is to re-author a single "Gold Standard" solution that is entirely self-contained, as if you solved the problem using only your own mathematical intuition.
+
+Strict requirements:
+1. Total De-Reference: Do NOT mention, quote, or even subtly refer to the [Reasoning Draft]. The reader must have no idea that any draft was provided to you.
+2. Invisible Integration: Re-derive the full content of the draft in your own words — the overall approach, the conditions and formulas it relies on, and every key step and intermediate result — completely and without omission, woven into one seamless derivation rather than a labeled summary. Do not copy the draft verbatim.
+3. Consistency Check: As you re-derive, make sure each calculation and logical step is correct and follows cleanly from the previous one, so the final solution reads as one coherent, error-free argument with no meta-talk or conversational fillers.
+4. Continue & Conclude: After re-deriving that reasoning, carry it forward and solve the problem step by step, and put your final answer within \boxed{}. The final answer must follow from your own reasoning.
+
+[Problem]
+{question}
+
+[Reasoning Draft]
+{prefix}
+
+[Your solution]

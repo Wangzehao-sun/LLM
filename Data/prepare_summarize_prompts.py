@@ -46,10 +46,16 @@ by the normal-step summarize_replace, ``summarize_prompt`` by the extra-step
 ``prefix_mode='summarize'`` branch. Rendering offline avoids any decode/
 re-tokenize work in the training loop.
 
+The template itself comes from ``Data/prompt_templates/`` (see that package's
+README): ``--template`` takes a registered NAME, and the name is written into the
+output as ``prompt_id`` so a downstream step can verify it is using the same
+prompt this data was built with.
+
 Schema add:
     summarize_prompt  : np.ndarray[object] of length 1
     summarize_prompts : np.ndarray[object] of length K (prefix ascending)
                         each element being a list[{role, content}] (system + user).
+    prompt_id         : str -- the template name these columns were rendered with.
 
 Usage:
 
@@ -57,6 +63,7 @@ Usage:
         --input  $HOME/LLM/Data/deepmath_dgt6_n10000_split.parquet \
         --output $HOME/LLM/Data/deepmath_dgt6_n10000_summarize.parquet \
         --tokenizer-path /home/shared/Qwen2.5-Math-7B-16k-think \
+        --template rephrase_main_v1 \
         --single-mode full --full-ratio 1.0 \
         --list-mode custom --list-ratios 0.2,0.4,0.6,0.8
 """
@@ -72,6 +79,10 @@ from typing import Any, Dict, List, Tuple
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+
+# Templates live in Data/prompt_templates/ so that offline rendering, SFT-data
+# construction and evaluation all read the same text. See that package's README.
+import prompt_templates as pt
 # NOTE: transformers is imported lazily inside init_worker so that importers which
 # only need the prompt-rendering helpers (e.g. Data/prepare_rephraser_sft.py, which
 # cuts prefixes in character space) need neither the library nor a model download.
@@ -376,13 +387,12 @@ def _build_summarize_prompt(
     question in the template (the user explicitly asked the model to summarize
     "what's been done so far"; with empty prefix the summary will just be
     trivial, training keeps working). The trainer / dataset can choose to
-    short-circuit step_i==0 separately if desired."""
-    user_content = template.format(question=question, prefix=prefix_text)
-    messages: List[Dict[str, str]] = []
-    if system_msg is not None:
-        messages.append(system_msg)
-    messages.append({"role": "user", "content": user_content})
-    return messages
+    short-circuit step_i==0 separately if desired.
+
+    Delegates to the shared renderer so this script, the offline API path and
+    evaluation cannot disagree on how a template is filled.
+    """
+    return pt.build_messages(system_msg, question, prefix_text, template)
 
 
 # ---------------------------------------------------------------------------
@@ -614,8 +624,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--template",
-        default=DEFAULT_TEMPLATE,
-        help="User-turn template, must include {question} and {prefix} placeholders.",
+        default="rephrase_main_v1",
+        help="Prompt template: a name registered in Data/prompt_templates/ "
+             f"({', '.join(pt.template_names())}), or a path to a .txt file containing "
+             "{question} and {prefix}. The default reproduces what this script rendered "
+             "before templates were centralised. Default: %(default)s",
     )
     parser.add_argument("--limit", type=int, default=None, help="Optional row limit for quick smoke tests.")
     parser.add_argument(
@@ -637,8 +650,11 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if "{question}" not in args.template or "{prefix}" not in args.template:
-        raise SystemExit("--template must contain both {question} and {prefix}")
+    # Resolve the template to text ONCE, here, rather than inside the workers: the
+    # value is handed to every worker process, and a name would have to be
+    # re-resolved (and re-read from disk) per row.
+    template_text, template_name = pt.resolve(args.template)
+    print(f"[template] {template_name} ({len(template_text)} chars)")
 
     # single-column validation
     if not (0.0 < args.full_ratio <= 1.0):
@@ -727,14 +743,14 @@ def main() -> None:
         init_worker(args.tokenizer_path)
         processed = [
             process_single_item(
-                item, args.template, args.single_mode, row_ratios[i],
+                item, template_text, args.single_mode, row_ratios[i],
                 args.list_mode, list_ratios,
             )
             for i, item in enumerate(tqdm(records, total=len(records), desc="rendering"))
         ]
     else:
         task_iter = (
-            (item, args.template, args.single_mode, row_ratios[i],
+            (item, template_text, args.single_mode, row_ratios[i],
              args.list_mode, list_ratios)
             for i, item in enumerate(records)
         )
@@ -821,6 +837,12 @@ def main() -> None:
                     head = content[:300].replace("\n", " ")
                     tail = content[-200:].replace("\n", " ") if len(content) > 500 else ""
                     print(f"  [{msg.get('role')}] {head}{' ... ' + tail if tail else ''}")
+
+    # Record WHICH template produced these columns. Downstream steps (SFT-data
+    # construction, evaluation) compare this against the template they are about to
+    # use and refuse to run on a mismatch, so a prompt disagreement surfaces as an
+    # error rather than as a puzzling accuracy number.
+    out_df["prompt_id"] = template_name
 
     out_df.to_parquet(args.output, index=False)
     size_mb = pd.Series([0]).memory_usage()  # placeholder, real size below

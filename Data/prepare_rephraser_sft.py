@@ -40,6 +40,8 @@ The source parquet's columns, plus the three columns a rephraser-SFT parquet nee
     messages          : list[struct] -- summarize_prompts + [assistant: output],
                         i.e. [system, user, assistant], what MultiTurnSFTDataset
                         consumes (loss masked to the assistant turn).
+    prompt_id         : str          -- the template name the prompt was rendered
+                        with, so training and evaluation can verify they agree.
 
 One row per question by default (``--per-question 1``), like the reference file.
 With ``--per-question N > 1`` a question yields up to N rows that share the same
@@ -52,13 +54,13 @@ Usage
         --parquet  Data/deepmath_hard_solonly_split_summarize_teacher.parquet \
         --output   Data/deepmath_hard_rephraser_sft_step80.parquet
 
-    # --template takes a built-in name OR a path to a template text file (it must
-    # contain {question} and {prefix}), so the prompt design can be swapped freely
+    # --template takes a name registered in Data/prompt_templates/ (or a .txt path),
+    # so data construction, training and evaluation share one prompt source
     python Data/prepare_rephraser_sft.py \
         --rollout rollout_data/60.jsonl rollout_data/80.jsonl \
         --parquet Data/deepmath_hard_solonly_split_summarize_teacher.parquet \
         --output  Data/rephraser_sft.parquet \
-        --template my_rephraser_template.txt \
+        --template teacher_continue_v1 \
         --pick median --per-question 2 --draft-ratio 0.5
 
     # inspect what would be built without writing anything
@@ -68,7 +70,6 @@ Usage
 from __future__ import annotations
 
 import argparse
-import inspect
 import json
 import re
 from collections import defaultdict
@@ -78,47 +79,27 @@ from typing import Any, Dict, List, Sequence
 import numpy as np
 import pandas as pd
 
-# Reuse the offline prompt machinery so the input side stays byte-identical to
-# what prepare_summarize_prompts.py would render (same answer-truncation, same
-# sentence-boundary backup, same [system, user] assembly).
-import prepare_summarize_prompts as _psp  # noqa: E402
+# Reuse the offline prefix machinery so the input side stays identical to what
+# prepare_summarize_prompts.py renders (same answer-truncation, same
+# sentence-boundary backup).
 from prepare_summarize_prompts import (  # noqa: E402
     _backup_to_sentence_boundary,
-    _build_summarize_prompt,
     _extract_question,
     _extract_think_process,
     _system_message,
     _truncate_before_final_answer,
 )
 
-# Templates are discovered from prepare_summarize_prompts rather than imported by
-# name: which ones exist differs across branches of this repo (the teacher
-# templates in particular live only on the teacher-api line). Whatever is present
-# is exposed under a lowercase key -- DEFAULT_TEMPLATE2 -> "template2",
-# TEACHER_TEMPLATE_DEFAULT -> "teacher". Anything missing simply is not offered,
-# and ``--template`` also takes a file path, so a template that is not in this
-# module at all can still be used.
-TEMPLATES: Dict[str, str] = {}
-for _name in dir(_psp):
-    if "TEMPLATE" not in _name or not isinstance(getattr(_psp, _name), str):
-        continue
-    _key = (
-        _name.replace("DEFAULT_TEMPLATE", "template")
-        .replace("TEACHER_TEMPLATE_template", "teacher")
-        .replace("TEACHER_TEMPLATE", "teacher")
-        .strip("_")
-        .lower()
-    ) or "default"
-    TEMPLATES[_key] = getattr(_psp, _name)
-# DEFAULT_TEMPLATE (no numeric suffix) maps to the empty key -> call it "default".
-if "template" in TEMPLATES:
-    TEMPLATES["default"] = TEMPLATES.pop("template")
+# Templates come from Data/prompt_templates/ -- one registry shared with the
+# offline API path and evaluation, so all three render the same text.
+import prompt_templates as pt  # noqa: E402
 
-# ``_build_summarize_prompt`` grew an ``is_teacher`` parameter on the branches that
-# carry the teacher templates (it selects a str.replace render path that survives
-# literal \boxed{} and {style_example_N} braces, which str.format would reject).
-# Detect it so this script works against either version.
-_SUPPORTS_IS_TEACHER = "is_teacher" in inspect.signature(_build_summarize_prompt).parameters
+# Old --template keys, kept working so existing commands do not break.
+TEMPLATE_ALIASES = {
+    "default": "rephrase_main_v1",
+    "template1": "rephrase_shared_gold_v1",
+    "template2": "rephrase_main_v2",
+}
 
 # The boxed-answer instruction that prefixes every question. The dump carries it
 # once, the parquet sometimes twice (a known double-prefix in the source data), so
@@ -268,60 +249,28 @@ def build_draft(item: Dict[str, Any], ratio: float) -> str:
     return _backup_to_sentence_boundary(reasoning[:cut]).strip()
 
 
-def load_template(spec: str) -> tuple[str, bool]:
-    """Resolve ``--template`` to ``(template_text, is_teacher)``.
+def load_template(spec: str) -> tuple[str, str]:
+    """Resolve ``--template`` to ``(template_text, template_name)``.
 
-    ``spec`` is either a key of ``TEMPLATES`` or a path to a UTF-8 text file
-    holding a template. A file lets you use a template that does not live in this
-    repo (the reference SFT parquet's template, for instance, matches none of the
-    built-ins) without touching code.
-
-    A custom template must contain ``{question}`` and ``{prefix}``. It is rendered
-    through the teacher path (targeted str.replace) whenever it also contains a
-    ``{style_example_*}`` placeholder or a literal ``\\boxed{}``, because
-    str.format would raise on those; otherwise through str.format like the
-    built-in summarize templates.
+    ``spec`` is a name registered in ``Data/prompt_templates/``, one of the old
+    keys in ``TEMPLATE_ALIASES``, or a path to a ``.txt`` file. There is a single
+    render path, so no template can need special handling for literal
+    ``\\boxed{}`` braces.
     """
-    if spec in TEMPLATES:
-        return TEMPLATES[spec], spec.startswith("teacher")
-
-    path = Path(spec)
-    if not path.exists():
-        raise SystemExit(
-            f"--template {spec!r} is neither a built-in ({', '.join(sorted(TEMPLATES))}) "
-            f"nor an existing file"
-        )
-    text = path.read_text(encoding="utf-8")
-    missing = [p for p in ("{question}", "{prefix}") if p not in text]
-    if missing:
-        raise SystemExit(f"custom template {path} is missing required placeholder(s): {', '.join(missing)}")
-    # Literal \boxed{} / {style_example_N} braces are invalid str.format fields, so
-    # such templates must take the replace-based render path.
-    is_teacher = "{style_example_" in text or "\\boxed{}" in text
-    if is_teacher and not _SUPPORTS_IS_TEACHER:
-        raise SystemExit(
-            f"custom template {path} contains literal \\boxed{{}} or a {{style_example_N}} placeholder, "
-            "which needs the replace-based render path. The prepare_summarize_prompts.py on this branch "
-            "has no is_teacher support (str.format would raise on those braces). Either escape the braces "
-            "as \\boxed{{}} for str.format, or use a branch whose _build_summarize_prompt accepts is_teacher."
-        )
-    print(f"[template] loaded custom template from {path} ({len(text)} chars, render={'replace' if is_teacher else 'format'})")
-    return text, is_teacher
+    if spec in TEMPLATE_ALIASES:
+        resolved = TEMPLATE_ALIASES[spec]
+        print(f"[template] {spec!r} is a legacy key; using {resolved!r}")
+        spec = resolved
+    return pt.resolve(spec)
 
 
-def render_prompt(item: Dict[str, Any], draft: str, template: str, is_teacher: bool) -> List[Dict[str, str]]:
+def render_prompt(item: Dict[str, Any], draft: str, template: str) -> List[Dict[str, str]]:
     """Render one row's ``[system, user]`` rephraser prompt.
 
-    Delegates to ``prepare_summarize_prompts._build_summarize_prompt`` so the
-    result is byte-identical to the offline RL-time render. ``is_teacher`` is only
-    forwarded on the branches whose version accepts it; where it does not exist,
-    a template needing that render path is rejected up front (see load_template).
+    Delegates to the shared renderer, so this matches what the offline API path and
+    evaluation produce for the same template.
     """
-    system_msg = _system_message(item)
-    question = _extract_question(item)
-    if _SUPPORTS_IS_TEACHER:
-        return _build_summarize_prompt(system_msg, question, draft, template, is_teacher=is_teacher)
-    return _build_summarize_prompt(system_msg, question, draft, template)
+    return pt.build_messages(_system_message(item), _extract_question(item), draft, template)
 
 
 def _as_object_array(items: Sequence[Any]) -> np.ndarray:
@@ -352,10 +301,11 @@ def parse_args() -> argparse.Namespace:
                    help="Source parquet supplying the questions and the expert reasoning (`target`).")
     p.add_argument("--output", type=Path, default=None,
                    help="Destination parquet. Defaults to <parquet_stem>_rephraser_sft.parquet next to --parquet.")
-    p.add_argument("--template", default="template2",
-                   help="Rephraser prompt template: a built-in name (%s) or a path to a "
-                        "text file containing {question} and {prefix} (default: %%(default)s)."
-                        % ", ".join(sorted(TEMPLATES)))
+    p.add_argument("--template", default="rephrase_main_v2",
+                   help="Rephraser prompt template: a name registered in Data/prompt_templates/ "
+                        f"({', '.join(pt.template_names())}), a legacy key "
+                        f"({', '.join(sorted(TEMPLATE_ALIASES))}), or a path to a .txt file "
+                        "containing {question} and {prefix}. Default: %(default)s")
     p.add_argument("--draft-ratio", type=float, default=0.5,
                    help="Fraction of the answer-truncated expert reasoning to expose as the draft (default: %(default)s).")
     p.add_argument("--pick", choices=["median", "shortest", "longest", "all"], default="median",
@@ -387,7 +337,7 @@ def main() -> None:
         if not path.exists():
             raise FileNotFoundError(f"rollout dump not found: {path}")
 
-    template, is_teacher = load_template(args.template)
+    template, template_name = load_template(args.template)
     if "{style_example_" in template:
         # The teacher templates carry a {style_example_1} placeholder that the
         # trainer fills online with the student's own INCORRECT rollout. Offline we
@@ -451,7 +401,7 @@ def main() -> None:
             n_no_candidate += 1
             continue
 
-        messages = render_prompt(item, draft, template, is_teacher)
+        messages = render_prompt(item, draft, template)
         prompt_arr = _as_object_array(messages)
 
         for cand in picks:
@@ -459,6 +409,7 @@ def main() -> None:
             new_row = src.to_dict()
             new_row["summarize_prompts"] = prompt_arr
             new_row["output"] = out
+            new_row["prompt_id"] = template_name
             new_row["messages"] = _as_object_array(
                 list(messages) + [{"role": "assistant", "content": out}]
             )
@@ -483,8 +434,9 @@ def main() -> None:
     out_df = pd.DataFrame(rows)
     # Preserve the source column order, then append the three SFT columns, so the
     # schema lines up with the reference rephraser-SFT parquet.
-    ordered = [c for c in df.columns if c not in ("summarize_prompts", "output", "messages")]
-    out_df = out_df[ordered + ["summarize_prompts", "output", "messages"]]
+    new_cols = ("summarize_prompts", "output", "messages", "prompt_id")
+    ordered = [c for c in df.columns if c not in new_cols]
+    out_df = out_df[ordered + list(new_cols)]
 
     n_q = out_df["summarize_prompts"].map(lambda m: dict(m[-1])["content"]).nunique()
     out_len = out_df["output"].str.len()
