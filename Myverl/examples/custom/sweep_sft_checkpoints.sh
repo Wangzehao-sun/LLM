@@ -1,7 +1,7 @@
 set -x
 #!/usr/bin/env bash
 # GPU selection. Override with, for example: GPU_DEVICES=4,5,6,7
-GPU_DEVICES=${GPU_DEVICES:-${CUDA_VISIBLE_DEVICES:-0,1,2,3}}
+GPU_DEVICES=${GPU_DEVICES:-${CUDA_VISIBLE_DEVICES:-4,5,6,7}}
 export CUDA_VISIBLE_DEVICES=$GPU_DEVICES
 
 echo $HOME
@@ -83,8 +83,12 @@ if [ -n "$CKPT_DIR" ]; then
             continue
         fi
         # A checkpoint still being written has no weights yet; skip it rather than
-        # failing after the model-load attempt.
-        if ! ls "$path"/*.safetensors "$path"/pytorch_model*.bin >/dev/null 2>&1; then
+        # failing after the model-load attempt. Check each pattern separately: one
+        # `ls` with both patterns exits non-zero when EITHER finds nothing, so a
+        # complete safetensors checkpoint would look empty just because there is no
+        # pytorch_model*.bin.
+        if ! compgen -G "$path/*.safetensors" >/dev/null && \
+           ! compgen -G "$path/pytorch_model*.bin" >/dev/null; then
             echo "[skip] $path has no weight files yet"
             continue
         fi
