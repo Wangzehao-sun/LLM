@@ -17,10 +17,9 @@ export WANDB_MODE=offline
 # verl.trainer.main_generation on each, then prints a label -> accuracy table.
 #
 # The eval parquet must be built by Data/prepare_rephrase_eval.py: main_generation
-# hands data.prompt_key straight to apply_chat_template and needs a flat
-# [system, user] list, while the renderer nests it one level. That script writes
-# both the rephrase prompt and the bare question, so PROMPT_KEY below selects which
-# ability is being measured.
+# reads data.prompt_key and needs a flat [system, user] list, while the renderer
+# nests it one level. That script also refuses to run when the eval prompt differs
+# from the one training used.
 #
 # Usage:
 #   CKPT_DIR=/path/to/sft_run/ckpt \
@@ -73,27 +72,6 @@ if [ ! -f "$EVAL_PATH" ]; then
     echo "build it with: python3 Data/prepare_rephrase_eval.py --input <rendered>.parquet --output $EVAL_PATH" >&2
     exit 1
 fi
-
-# Check the prompt column before loading any model: main_generation would otherwise
-# fail deep inside apply_chat_template with an opaque error, minutes into the run.
-python - "$EVAL_PATH" "$PROMPT_KEY" <<'CHECKEOF' || exit 1
-import sys
-
-import pandas as pd
-
-path, key = sys.argv[1], sys.argv[2]
-df = pd.read_parquet(path)
-if key not in df.columns:
-    sys.exit(f"[check] '{key}' not in {path}; columns: {list(df.columns)}")
-cell = list(df.iloc[0][key])
-if not cell or not (isinstance(cell[0], dict) and "role" in cell[0]):
-    kind = type(cell[0]).__name__ if cell else "empty"
-    sys.exit(
-        f"[check] '{key}' is not a flat [system, user] messages list (first element: "
-        f"{kind}). Build the eval set with Data/prepare_rephrase_eval.py."
-    )
-print(f"[check] {len(df)} rows, '{key}' roles={[m['role'] for m in cell]}")
-CHECKEOF
 
 GPU_NUM=$(awk -F',' '{print NF}' <<< "$GPU_DEVICES")
 

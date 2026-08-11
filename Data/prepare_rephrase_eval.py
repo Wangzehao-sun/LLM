@@ -79,13 +79,6 @@ def main() -> None:
                     help="Column holding the rendered rephrase prompt (default: %(default)s).")
     ap.add_argument("--prompt-index", type=int, default=0,
                     help="Which entry to take from a length-K prompt column (default: %(default)s).")
-    ap.add_argument("--output-key", default="prompt",
-                    help="Column to write the flattened rephrase prompt into (default: %(default)s). "
-                         "Evaluation reads this one by default.")
-    ap.add_argument("--question-key", default="question_prompt",
-                    help="Column to preserve the bare question in, flattened and ready to "
-                         "evaluate (default: %(default)s). Use it to measure plain "
-                         "problem-solving on the same questions.")
     ap.add_argument("--train-parquet", type=Path, default=None,
                     help="SFT parquet used for training. Its prompt_id must match this eval set's.")
     ap.add_argument("--allow-template-mismatch", action="store_true",
@@ -137,23 +130,19 @@ def main() -> None:
     # PROMPT_KEY). The bare question is flattened too, so either column can be fed
     # to generation without further processing.
     if "prompt" in df.columns:
-        df[args.question_key] = [flatten_prompt(cell, 0) for cell in df["prompt"]]
-        print(f"[eval] kept the bare question as '{args.question_key}' (flattened)")
+        df["question_prompt"] = [flatten_prompt(cell, 0) for cell in df["prompt"]]
+        print("[eval] kept the bare question as 'question_prompt' (flattened)")
 
-    df[args.output_key] = [
-        flatten_prompt(cell, args.prompt_index) for cell in df[args.prompt_key]
-    ]
+    df["prompt"] = [flatten_prompt(cell, args.prompt_index) for cell in df[args.prompt_key]]
 
-    roles = [m["role"] for m in df.iloc[0][args.output_key]]
-    print(f"[eval] flattened '{args.prompt_key}'[{args.prompt_index}] -> '{args.output_key}', roles={roles}")
+    roles = [m["role"] for m in df.iloc[0]["prompt"]]
+    print(f"[eval] flattened '{args.prompt_key}'[{args.prompt_index}] -> 'prompt', roles={roles}")
     if roles and roles[-1] == "assistant":
         raise SystemExit(
             "the flattened prompt ends with an assistant turn; generation expects the "
             "conversation to stop after the user turn"
         )
-    chars = pd.Series(
-        [len(m["content"]) for p in df[args.output_key] for m in p if m["role"] == "user"]
-    )
+    chars = pd.Series([len(m["content"]) for p in df["prompt"] for m in p if m["role"] == "user"])
     print(f"[eval] user-turn chars: p50={int(chars.median()):,} max={int(chars.max()):,}")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
