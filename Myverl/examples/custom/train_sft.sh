@@ -2,7 +2,7 @@ set -x
 #!/usr/bin/env bash
 # GPU selection. The server has 8 GPUs; expose 4 by default.
 # Override with, for example: GPU_DEVICES=4,5,6,7 bash train_sft.sh
-GPU_DEVICES=${GPU_DEVICES:-${CUDA_VISIBLE_DEVICES:-0,1,2,3}}
+GPU_DEVICES=${GPU_DEVICES:-${CUDA_VISIBLE_DEVICES:-4,5,6,7}}
 export CUDA_VISIBLE_DEVICES=$GPU_DEVICES
 
 echo $HOME
@@ -49,10 +49,8 @@ name="sft"
 suffix="rephraser"
 
 # Data paths. train/val must both carry the `messages` column.
-train_path=${TRAIN_PATH:-$WORKER_DIR/LLM/Data/deepmath/deepmath_hard_rephraser_sft.parquet}
+train_path=${TRAIN_PATH:-$WORKER_DIR/LLM/Data/sft/self_rollouts_summarize_sft.parquet}
 val_path=${VAL_PATH:-$train_path}
-train_files="['$train_path']"
-val_files="['$val_path']"
 
 # Model path.
 MODEL_PATH=$MODEL_DIR/${1:-"Qwen3-4b-base"}
@@ -75,11 +73,11 @@ GPU_NUM=$(awk -F',' '{print NF}' <<< "$GPU_DEVICES")
 # TRAIN_BSZ=64 gives 1 step/epoch (3 steps total at EPOCHS=3), and any
 # TRAIN_BSZ > rows silently trains on NOTHING. Keep TRAIN_BSZ well below the row
 # count: 16 over 92 rows is 5 steps/epoch. The launcher prints both below.
-TRAIN_BSZ=${TRAIN_BSZ:-16}
+TRAIN_BSZ=${TRAIN_BSZ:-64}
 MICRO_BSZ=${MICRO_BSZ:-1}
 MAX_LENGTH=${MAX_LENGTH:-16384}
 EPOCHS=${EPOCHS:-3}
-LR=${LR:-1e-6}
+LR=${LR:-1e-5}
 SAVE_FREQ=${SAVE_FREQ:--1}       # -1 = rely on save_per_epoch below
 TEST_FREQ=${TEST_FREQ:-200}      # val/loss only; -1 disables
 
@@ -116,8 +114,8 @@ PYEOF
 # Train over a single node using the GPUs exposed by *_VISIBLE_DEVICES.
 torchrun --standalone --nnodes=1 --nproc_per_node=$GPU_NUM \
     -m verl.trainer.fsdp_sft_trainer \
-    data.train_files="$train_files" \
-    data.val_files="$val_files" \
+    data.train_files="$train_path" \
+    data.val_files="$val_path" \
     data.multiturn.enable=True \
     data.multiturn.messages_key=messages \
     data.max_length=$MAX_LENGTH \
