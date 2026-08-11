@@ -15,8 +15,10 @@ Two jobs, both about making the measurement mean something:
    two ``prompt_id`` values disagree.
 
 The original ``prompt`` column (the bare question) is preserved as
-``question_prompt`` so a baseline can still be evaluated without the rephrase
-framing.
+``question_prompt``, flattened the same way, so ONE file can measure two things:
+the rephrase task, and the model's plain problem-solving ability on the same
+questions. Choose which column to evaluate with ``sweep_sft_checkpoints.sh``'s
+``PROMPT_KEY``.
 
 Usage:
 
@@ -24,6 +26,10 @@ Usage:
         --input  Data/eval_rephrase.parquet \\
         --output Data/eval_rephrase_flat.parquet \\
         --train-parquet Data/rephraser_sft.parquet
+
+    # then, at evaluation time:
+    #   PROMPT_KEY=prompt          -> the rephrase task
+    #   PROMPT_KEY=question_prompt -> the bare question
 """
 
 from __future__ import annotations
@@ -73,6 +79,13 @@ def main() -> None:
                     help="Column holding the rendered rephrase prompt (default: %(default)s).")
     ap.add_argument("--prompt-index", type=int, default=0,
                     help="Which entry to take from a length-K prompt column (default: %(default)s).")
+    ap.add_argument("--output-key", default="prompt",
+                    help="Column to write the flattened rephrase prompt into (default: %(default)s). "
+                         "Evaluation reads this one by default.")
+    ap.add_argument("--question-key", default="question_prompt",
+                    help="Column to preserve the bare question in, flattened and ready to "
+                         "evaluate (default: %(default)s). Use it to measure plain "
+                         "problem-solving on the same questions.")
     ap.add_argument("--train-parquet", type=Path, default=None,
                     help="SFT parquet used for training. Its prompt_id must match this eval set's.")
     ap.add_argument("--allow-template-mismatch", action="store_true",
@@ -118,23 +131,29 @@ def main() -> None:
     else:
         df = df.copy()
 
-    # Keep the bare question around so an unrephrased baseline stays evaluable
-    # from the same file.
+    # Both prompts are kept side by side so one file can measure two things: the
+    # rephrase task, and the model's plain problem-solving ability on the same
+    # questions. Pick the column at evaluation time (sweep_sft_checkpoints.sh
+    # PROMPT_KEY). The bare question is flattened too, so either column can be fed
+    # to generation without further processing.
     if "prompt" in df.columns:
-        df["question_prompt"] = df["prompt"]
+        df[args.question_key] = [flatten_prompt(cell, 0) for cell in df["prompt"]]
+        print(f"[eval] kept the bare question as '{args.question_key}' (flattened)")
 
-    df["prompt"] = [
+    df[args.output_key] = [
         flatten_prompt(cell, args.prompt_index) for cell in df[args.prompt_key]
     ]
 
-    roles = [m["role"] for m in df.iloc[0]["prompt"]]
-    print(f"[eval] flattened '{args.prompt_key}'[{args.prompt_index}] -> prompt, roles={roles}")
+    roles = [m["role"] for m in df.iloc[0][args.output_key]]
+    print(f"[eval] flattened '{args.prompt_key}'[{args.prompt_index}] -> '{args.output_key}', roles={roles}")
     if roles and roles[-1] == "assistant":
         raise SystemExit(
             "the flattened prompt ends with an assistant turn; generation expects the "
             "conversation to stop after the user turn"
         )
-    chars = pd.Series([len(m["content"]) for p in df["prompt"] for m in p if m["role"] == "user"])
+    chars = pd.Series(
+        [len(m["content"]) for p in df[args.output_key] for m in p if m["role"] == "user"]
+    )
     print(f"[eval] user-turn chars: p50={int(chars.median()):,} max={int(chars.max()):,}")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)

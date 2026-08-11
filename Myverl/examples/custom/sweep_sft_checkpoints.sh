@@ -17,14 +17,18 @@ export WANDB_MODE=offline
 # verl.trainer.main_generation on each, then prints a label -> accuracy table.
 #
 # The eval parquet must be built by Data/prepare_rephrase_eval.py: main_generation
-# reads data.prompt_key=prompt and needs a flat [system, user] list, while the
-# renderer nests it one level. That script also refuses to run when the eval
-# prompt differs from the one training used.
+# hands data.prompt_key straight to apply_chat_template and needs a flat
+# [system, user] list, while the renderer nests it one level. That script writes
+# both the rephrase prompt and the bare question, so PROMPT_KEY below selects which
+# ability is being measured.
 #
 # Usage:
 #   CKPT_DIR=/path/to/sft_run/ckpt \
 #   EVAL_PATH=$HOME/LLM/Data/eval_rephrase_flat.parquet \
 #   bash sweep_sft_checkpoints.sh
+#
+#   # evaluate plain problem-solving instead of the rephrase task
+#   CKPT_DIR=... EVAL_PATH=... PROMPT_KEY=question_prompt bash sweep_sft_checkpoints.sh
 #
 #   # only some steps, or the untrained model as a baseline
 #   CKPT_DIR=... EVAL_PATH=... STEPS=15,30 bash sweep_sft_checkpoints.sh
@@ -40,6 +44,11 @@ EVAL_PATH=${EVAL_PATH:-$HOME/LLM/Data/eval_rephrase_flat.parquet}
 
 # Comma-separated global_step numbers to evaluate; empty = every checkpoint found.
 STEPS=${STEPS:-}
+
+# Which prompt column to evaluate. prepare_rephrase_eval.py writes both:
+#   prompt          -> the rephrase task (question + expert-reasoning draft)
+#   question_prompt -> the bare question, i.e. plain problem-solving ability
+PROMPT_KEY=${PROMPT_KEY:-prompt}
 
 N_SAMPLES=${N_SAMPLES:-4}          # samples per question; >1 to see sampling variance
 TEMPERATURE=${TEMPERATURE:-0.6}
@@ -64,6 +73,27 @@ if [ ! -f "$EVAL_PATH" ]; then
     echo "build it with: python3 Data/prepare_rephrase_eval.py --input <rendered>.parquet --output $EVAL_PATH" >&2
     exit 1
 fi
+
+# Check the prompt column before loading any model: main_generation would otherwise
+# fail deep inside apply_chat_template with an opaque error, minutes into the run.
+python - "$EVAL_PATH" "$PROMPT_KEY" <<'CHECKEOF' || exit 1
+import sys
+
+import pandas as pd
+
+path, key = sys.argv[1], sys.argv[2]
+df = pd.read_parquet(path)
+if key not in df.columns:
+    sys.exit(f"[check] '{key}' not in {path}; columns: {list(df.columns)}")
+cell = list(df.iloc[0][key])
+if not cell or not (isinstance(cell[0], dict) and "role" in cell[0]):
+    kind = type(cell[0]).__name__ if cell else "empty"
+    sys.exit(
+        f"[check] '{key}' is not a flat [system, user] messages list (first element: "
+        f"{kind}). Build the eval set with Data/prepare_rephrase_eval.py."
+    )
+print(f"[check] {len(df)} rows, '{key}' roles={[m['role'] for m in cell]}")
+CHECKEOF
 
 GPU_NUM=$(awk -F',' '{print NF}' <<< "$GPU_DEVICES")
 
@@ -106,7 +136,7 @@ mkdir -p "$SWEEP_DIR"
 SUMMARY="${SWEEP_DIR}/summary.tsv"
 printf 'label\tavg_score\toutput_dir\n' > "$SUMMARY"
 
-echo "=== sweeping ${#TARGETS[@]} model(s) on $(basename "$EVAL_PATH") ==="
+echo "=== sweeping ${#TARGETS[@]} model(s) on $(basename "$EVAL_PATH"), prompt_key=$PROMPT_KEY ==="
 for target in "${TARGETS[@]}"; do
     echo "  ${target%%:*}  <-  ${target#*:}"
 done
@@ -128,7 +158,7 @@ for target in "${TARGETS[@]}"; do
         trainer.nnodes=1 \
         trainer.n_gpus_per_node=$GPU_NUM \
         data.path="$EVAL_PATH" \
-        data.prompt_key=prompt \
+        data.prompt_key=$PROMPT_KEY \
         +data.reward_model_key=reward_model \
         +data.data_source_key=data_source \
         data.n_samples=$N_SAMPLES \
