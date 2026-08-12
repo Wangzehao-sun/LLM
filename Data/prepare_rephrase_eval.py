@@ -15,8 +15,10 @@ Two jobs, both about making the measurement mean something:
    two ``prompt_id`` values disagree.
 
 The original ``prompt`` column (the bare question) is preserved as
-``question_prompt`` so a baseline can still be evaluated without the rephrase
-framing.
+``question_prompt``, flattened the same way, so ONE file can measure two things:
+the rephrase task, and the model's plain problem-solving ability on the same
+questions. Choose which column to evaluate with ``sweep_sft_checkpoints.sh``'s
+``PROMPT_KEY``.
 
 Usage:
 
@@ -24,6 +26,10 @@ Usage:
         --input  Data/eval_rephrase.parquet \\
         --output Data/eval_rephrase_flat.parquet \\
         --train-parquet Data/rephraser_sft.parquet
+
+    # then, at evaluation time:
+    #   PROMPT_KEY=prompt          -> the rephrase task
+    #   PROMPT_KEY=question_prompt -> the bare question
 """
 
 from __future__ import annotations
@@ -118,17 +124,19 @@ def main() -> None:
     else:
         df = df.copy()
 
-    # Keep the bare question around so an unrephrased baseline stays evaluable
-    # from the same file.
+    # Both prompts are kept side by side so one file can measure two things: the
+    # rephrase task, and the model's plain problem-solving ability on the same
+    # questions. Pick the column at evaluation time (sweep_sft_checkpoints.sh
+    # PROMPT_KEY). The bare question is flattened too, so either column can be fed
+    # to generation without further processing.
     if "prompt" in df.columns:
-        df["question_prompt"] = df["prompt"]
+        df["question_prompt"] = [flatten_prompt(cell, 0) for cell in df["prompt"]]
+        print("[eval] kept the bare question as 'question_prompt' (flattened)")
 
-    df["prompt"] = [
-        flatten_prompt(cell, args.prompt_index) for cell in df[args.prompt_key]
-    ]
+    df["prompt"] = [flatten_prompt(cell, args.prompt_index) for cell in df[args.prompt_key]]
 
     roles = [m["role"] for m in df.iloc[0]["prompt"]]
-    print(f"[eval] flattened '{args.prompt_key}'[{args.prompt_index}] -> prompt, roles={roles}")
+    print(f"[eval] flattened '{args.prompt_key}'[{args.prompt_index}] -> 'prompt', roles={roles}")
     if roles and roles[-1] == "assistant":
         raise SystemExit(
             "the flattened prompt ends with an assistant turn; generation expects the "

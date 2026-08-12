@@ -2,6 +2,7 @@ set -x
 #!/usr/bin/env bash
 # GPU selection. Override with, for example: GPU_DEVICES=4,5,6,7
 GPU_DEVICES=${GPU_DEVICES:-${CUDA_VISIBLE_DEVICES:-4,5,6,7}}
+GPU_DEVICES=${GPU_DEVICES:-${CUDA_VISIBLE_DEVICES:-4,5,6,7}}
 export CUDA_VISIBLE_DEVICES=$GPU_DEVICES
 
 echo $HOME
@@ -17,14 +18,17 @@ export WANDB_MODE=offline
 # verl.trainer.main_generation on each, then prints a label -> accuracy table.
 #
 # The eval parquet must be built by Data/prepare_rephrase_eval.py: main_generation
-# reads data.prompt_key=prompt and needs a flat [system, user] list, while the
-# renderer nests it one level. That script also refuses to run when the eval
-# prompt differs from the one training used.
+# reads data.prompt_key and needs a flat [system, user] list, while the renderer
+# nests it one level. That script also refuses to run when the eval prompt differs
+# from the one training used.
 #
 # Usage:
 #   CKPT_DIR=/path/to/sft_run/ckpt \
 #   EVAL_PATH=$HOME/LLM/Data/eval_rephrase_flat.parquet \
 #   bash sweep_sft_checkpoints.sh
+#
+#   # evaluate plain problem-solving instead of the rephrase task
+#   CKPT_DIR=... EVAL_PATH=... PROMPT_KEY=question_prompt bash sweep_sft_checkpoints.sh
 #
 #   # only some steps, or the untrained model as a baseline
 #   CKPT_DIR=... EVAL_PATH=... STEPS=15,30 bash sweep_sft_checkpoints.sh
@@ -40,6 +44,11 @@ EVAL_PATH=${EVAL_PATH:-$HOME/LLM/Data/sft/rephrase_eval_flat.parquet}
 
 # Comma-separated global_step numbers to evaluate; empty = every checkpoint found.
 STEPS=${STEPS:-}
+
+# Which prompt column to evaluate. prepare_rephrase_eval.py writes both:
+#   prompt          -> the rephrase task (question + expert-reasoning draft)
+#   question_prompt -> the bare question, i.e. plain problem-solving ability
+PROMPT_KEY=${PROMPT_KEY:-prompt}
 
 N_SAMPLES=${N_SAMPLES:-2}          # samples per question; >1 to see sampling variance
 TEMPERATURE=${TEMPERATURE:-0.7}
@@ -103,7 +112,7 @@ mkdir -p "$SWEEP_DIR"
 SUMMARY="${SWEEP_DIR}/summary.tsv"
 printf 'label\tavg_score\toutput_dir\n' > "$SUMMARY"
 
-echo "=== sweeping ${#TARGETS[@]} model(s) on $(basename "$EVAL_PATH") ==="
+echo "=== sweeping ${#TARGETS[@]} model(s) on $(basename "$EVAL_PATH"), prompt_key=$PROMPT_KEY ==="
 for target in "${TARGETS[@]}"; do
     echo "  ${target%%:*}  <-  ${target#*:}"
 done
@@ -125,7 +134,7 @@ for target in "${TARGETS[@]}"; do
         trainer.nnodes=1 \
         trainer.n_gpus_per_node=$GPU_NUM \
         data.path="$EVAL_PATH" \
-        data.prompt_key=prompt \
+        data.prompt_key=$PROMPT_KEY \
         +data.reward_model_key=reward_model \
         +data.data_source_key=data_source \
         data.n_samples=$N_SAMPLES \

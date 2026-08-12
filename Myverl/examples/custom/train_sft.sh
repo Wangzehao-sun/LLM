@@ -81,20 +81,42 @@ LR=${LR:-1e-5}
 SAVE_FREQ=${SAVE_FREQ:--1}       # -1 = rely on save_per_epoch below
 TEST_FREQ=${TEST_FREQ:-200}      # val/loss only; -1 disables
 
+# Qwen3 thinking mode. MultiTurnSFTDataset takes this per row from an
+# `enable_thinking` column and forwards it to apply_chat_template; there is no
+# global config switch, so the preflight below writes the column. Leaving it unset
+# is NOT the same as false -- the dataset then passes None and Qwen3's template
+# falls back to thinking ON. Set empty to leave whatever the data already has.
+ENABLE_THINKING=${ENABLE_THINKING:-false}
+
 cd "$CODE_DIR" || exit 1
 echo "change to dir: $PWD"
 if [ -n "$1" ]; then
     shift
 fi
 
-# Preflight: report rows and the resulting step count. Both dataloaders use
-# drop_last=True, so floor(rows / TRAIN_BSZ) == 0 means the run would train on
-# nothing at all -- fail loudly here instead of after model load.
-python - "$train_path" "$val_path" "$TRAIN_BSZ" "$EPOCHS" <<'PYEOF' || exit 1
+# Preflight: report rows and the resulting step count, and enforce the thinking
+# mode. Both dataloaders use drop_last=True, so floor(rows / TRAIN_BSZ) == 0 means
+# the run would train on nothing at all -- fail loudly here instead of after model
+# load.
+python - "$train_path" "$val_path" "$TRAIN_BSZ" "$EPOCHS" "$ENABLE_THINKING" <<'PYEOF' || exit 1
 import sys
+
 import pandas as pd
 
-train_path, val_path, bsz, epochs = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+train_path, val_path, bsz, epochs, thinking = (
+    sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
+)
+
+# MultiTurnSFTDataset reads enable_thinking per ROW, from a column; there is no
+# global config switch. An absent column means it passes None to
+# apply_chat_template, and Qwen3's template then falls back to its own default of
+# thinking ON. Writing the column is therefore the only way to hard-disable it --
+# a "/no_think" line in the prompt is not equivalent, since the template still
+# emits the thinking block scaffolding.
+want = {"true": True, "false": False, "": None, "none": None}.get(thinking.lower())
+if want is None and thinking.lower() not in ("", "none"):
+    sys.exit(f"[preflight] ENABLE_THINKING must be true/false/empty, got {thinking!r}")
+
 for tag, path in (("train", train_path), ("val", val_path)):
     df = pd.read_parquet(path, columns=None)
     if "messages" not in df.columns:
@@ -102,6 +124,17 @@ for tag, path in (("train", train_path), ("val", val_path)):
                  f"(got {list(df.columns)}); build it with Data/prepare_rephraser_sft.py "
                  f"or Data/prepare_sft.py")
     print(f"[preflight] {tag}: {len(df)} rows  {path}")
+
+    if want is None:
+        have = df["enable_thinking"].unique().tolist() if "enable_thinking" in df.columns else None
+        print(f"[preflight] {tag}: enable_thinking left as-is (column: {have})")
+    elif "enable_thinking" not in df.columns or set(df["enable_thinking"].unique()) != {want}:
+        df["enable_thinking"] = want
+        df.to_parquet(path, index=False)
+        print(f"[preflight] {tag}: wrote enable_thinking={want} into {path}")
+    else:
+        print(f"[preflight] {tag}: enable_thinking={want} already set")
+
     if tag == "train":
         spe = len(df) // bsz
         print(f"[preflight] train_batch_size={bsz} -> {spe} steps/epoch, "
