@@ -112,7 +112,7 @@ fi
 SWEEP_DIR=${LOG_ROOT}/${EXP_NAME}
 mkdir -p "$SWEEP_DIR"
 SUMMARY="${SWEEP_DIR}/summary.tsv"
-printf 'label\tavg_score\toutput_dir\n' > "$SUMMARY"
+printf 'label\tavg_score\tmax_score\tavg_len\toutput_dir\n' > "$SUMMARY"
 
 echo "=== sweeping ${#TARGETS[@]} model(s) on $(basename "$EVAL_PATH"), prompt_key=$PROMPT_KEY ==="
 for target in "${TARGETS[@]}"; do
@@ -156,28 +156,38 @@ for target in "${TARGETS[@]}"; do
         +max_steps=$MAX_STEPS \
         +reward_model.reward_impl_version=4 2>&1 | tee "$log_path"
 
-    # Recompute the mean from the written parquets rather than scraping the log:
+    # Recompute the metrics from the written parquets rather than scraping the log:
     # main_generation averages over batches, so a short final batch would be
     # weighted the same as a full one.
-    score=$(python - "$out_dir" <<'PYEOF'
+    #   avg_score -- mean of per-question mean_score, i.e. overall pass rate
+    #   max_score -- mean of per-question max_score, i.e. pass@N
+    #   avg_len   -- mean response length in characters, to spot a model that
+    #                started rambling or truncating rather than answering
+    metrics=$(python - "$out_dir" <<'PYEOF'
 import glob
 import sys
 
 import pandas as pd
 
 files = sorted(glob.glob(f"{sys.argv[1]}/*.parquet"))
-if not files:
-    print("NA")
-    sys.exit()
-means = []
+means, maxes, lengths = [], [], []
 for path in files:
-    df = pd.read_parquet(path, columns=["test_score"])
-    means.extend(float(s["mean_score"]) for s in df["test_score"])
-print(f"{sum(means) / len(means):.4f}" if means else "NA")
+    df = pd.read_parquet(path, columns=["test_score", "responses"])
+    for score in df["test_score"]:
+        means.append(float(score["mean_score"]))
+        maxes.append(float(score["max_score"]))
+    for responses in df["responses"]:
+        lengths.extend(len(str(r)) for r in responses)
+
+if not means:
+    print("NA\tNA\tNA")
+else:
+    avg_len = sum(lengths) / len(lengths) if lengths else float("nan")
+    print(f"{sum(means) / len(means):.4f}\t{sum(maxes) / len(maxes):.4f}\t{avg_len:.0f}")
 PYEOF
 )
-    printf '%s\t%s\t%s\n' "$label" "$score" "$out_dir" >> "$SUMMARY"
-    echo "=== [$label] mean score: $score ==="
+    printf '%s\t%s\t%s\n' "$label" "$metrics" "$out_dir" >> "$SUMMARY"
+    echo "=== [$label] avg_score / max_score / avg_len: $metrics ==="
 done
 
 echo
