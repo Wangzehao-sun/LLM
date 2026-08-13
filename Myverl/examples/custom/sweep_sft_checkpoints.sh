@@ -29,6 +29,9 @@ export WANDB_MODE=offline
 #   # evaluate plain problem-solving instead of the rephrase task
 #   CKPT_DIR=... EVAL_PATH=... PROMPT_KEY=question_prompt bash sweep_sft_checkpoints.sh
 #
+#   # override the model name that prefixes every label
+#   CKPT_DIR=... EVAL_PATH=... MODEL_NAME=qwen3-4b-run2 bash sweep_sft_checkpoints.sh
+#
 #   # only some steps, or the untrained model as a baseline
 #   CKPT_DIR=... EVAL_PATH=... STEPS=15,30 bash sweep_sft_checkpoints.sh
 #   BASE_MODEL=/home/data/shared/Qwen3-4b-base EVAL_PATH=... bash sweep_sft_checkpoints.sh
@@ -43,6 +46,9 @@ EVAL_PATH=${EVAL_PATH:-$HOME/LLM/Data/eval_rephrase_flat.parquet}
 
 # Comma-separated global_step numbers to evaluate; empty = every checkpoint found.
 STEPS=${STEPS:-}
+
+# Name used in the result labels. Empty = derive it from CKPT_DIR / BASE_MODEL.
+MODEL_NAME=${MODEL_NAME:-}
 
 # Which prompt column to evaluate. prepare_rephrase_eval.py writes both:
 #   prompt          -> the rephrase task (question + expert-reasoning draft)
@@ -75,10 +81,28 @@ fi
 
 GPU_NUM=$(awk -F',' '{print NF}' <<< "$GPU_DEVICES")
 
-# Collect the models to evaluate as "<label>:<path>" pairs.
+# Model name for the labels. train_sft.sh names its run directory
+# train_sft_<suffix>_<model>_<dataset>, so the model is in there but so is
+# everything else; pull out the recognisable model part rather than using the whole
+# string, since the label also becomes a directory name. Set MODEL_NAME to override.
+if [ -z "$MODEL_NAME" ]; then
+    if [ -n "$CKPT_DIR" ]; then
+        run_name=$(basename "$(dirname "$(dirname "$CKPT_DIR")")")
+        # e.g. train_sft_rephraser_Qwen3-4b-base_self_rollouts... -> Qwen3-4b-base
+        MODEL_NAME=$(grep -oE '''[Qq]wen[A-Za-z0-9._-]*''' <<< "$run_name" | head -1)
+        MODEL_NAME=${MODEL_NAME:-$run_name}
+    else
+        MODEL_NAME=$(basename "$BASE_MODEL")
+    fi
+fi
+echo "model name for labels: $MODEL_NAME"
+
+# Collect the models to evaluate as "<label>:<path>" pairs. The label names the
+# model as well as the step, so summaries from different runs stay distinguishable
+# when compared side by side.
 TARGETS=()
 if [ -n "$BASE_MODEL" ]; then
-    TARGETS+=("base:$BASE_MODEL")
+    TARGETS+=("${MODEL_NAME}-base:$BASE_MODEL")
 fi
 if [ -n "$CKPT_DIR" ]; then
     if [ ! -d "$CKPT_DIR" ]; then
@@ -100,7 +124,7 @@ if [ -n "$CKPT_DIR" ]; then
             echo "[skip] $path has no weight files yet"
             continue
         fi
-        TARGETS+=("step$step:$path")
+        TARGETS+=("${MODEL_NAME}-step${step}:$path")
     done
 fi
 
