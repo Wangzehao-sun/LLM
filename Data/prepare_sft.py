@@ -119,6 +119,88 @@ def build_messages(row, prompt_key, target_key):
     return prompt_msgs + target_msgs
 
 
+def report_lengths(messages_list, tokenizer_path, max_length, prompt_length):
+    """Report prompt / response / total lengths and how many rows exceed the caps.
+
+    Two separate caps bite at two different stages, and both fail SILENTLY:
+
+    * ``data.max_length`` in training (16384 by default). With
+      ``data.truncation=right`` a longer row is cut from the right, which removes
+      the tail of the assistant turn -- including the ``<|im_end|>`` the model is
+      supposed to learn as its stop signal.
+    * ``rollout.prompt_length`` at evaluation (4096 by default). main_generation
+      calls apply_chat_template with truncation=True, so a longer prompt loses its
+      tail -- the end of the reasoning draft.
+
+    Token counts need the real tokenizer; without ``--tokenizer-path`` this falls
+    back to a chars/3.2 estimate, which is rough but enough to see whether a cap is
+    anywhere near.
+    """
+    encode = None
+    if tokenizer_path:
+        try:
+            from transformers import AutoTokenizer
+
+            tok = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
+            encode = lambda text: len(tok(text, add_special_tokens=False)["input_ids"])  # noqa: E731
+            print(f"[length] tokenizer: {tokenizer_path}")
+        except Exception as error:
+            print(f"[length] could not load {tokenizer_path} ({error}); falling back to chars/3.2")
+    if encode is None:
+        encode = lambda text: int(len(text) / 3.2)  # noqa: E731
+        print("[length] no tokenizer: counts are chars/3.2 ESTIMATES, not exact")
+
+    prompt_lens, response_lens = [], []
+    for messages in messages_list:
+        prompt_chars = "".join(m["content"] for m in messages if m["role"] != "assistant")
+        response_chars = "".join(m["content"] for m in messages if m["role"] == "assistant")
+        prompt_lens.append(encode(prompt_chars))
+        response_lens.append(encode(response_chars))
+
+    prompts = pd.Series(prompt_lens)
+    responses = pd.Series(response_lens)
+    totals = prompts + responses
+
+    def describe(name, series):
+        print(
+            f"[length] {name:8s} p50={int(series.median()):>6,}  p90={int(series.quantile(0.9)):>6,}  "
+            f"p99={int(series.quantile(0.99)):>6,}  max={int(series.max()):>6,}"
+        )
+
+    describe("prompt", prompts)
+    describe("response", responses)
+    describe("total", totals)
+
+    # The chat template adds per-message overhead (role markers, <|im_start|> etc.)
+    # that these raw content counts miss, so a row close to a cap may already cross
+    # it. Flag that instead of reporting a clean pass.
+    over_total = int((totals > max_length).sum())
+    near_total = int((totals > max_length * 0.95).sum()) - over_total
+    print(
+        f"[length] vs training data.max_length={max_length:,}: "
+        f"{over_total} row(s) over"
+        + (f", {near_total} within 5%" if near_total else "")
+    )
+    if over_total:
+        print(
+            "         -> those rows get right-truncated, cutting the assistant tail "
+            "(and its stop token) out of the loss. Raise MAX_LENGTH or drop them."
+        )
+
+    over_prompt = int((prompts > prompt_length).sum())
+    near_prompt = int((prompts > prompt_length * 0.95).sum()) - over_prompt
+    print(
+        f"[length] vs eval rollout.prompt_length={prompt_length:,}: "
+        f"{over_prompt} prompt(s) over"
+        + (f", {near_prompt} within 5%" if near_prompt else "")
+    )
+    if over_prompt:
+        print(
+            "         -> those prompts get truncated at evaluation, losing the end of "
+            "the reasoning draft. Raise PROMPT_LENGTH in sweep_sft_checkpoints.sh."
+        )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--in", dest="in_path", required=True)
@@ -128,6 +210,13 @@ def main():
     ap.add_argument("--messages-key", default="messages")
     ap.add_argument("--limit", type=int, default=None,
                     help="只保存前 N 条；默认 None 表示全部保存。")
+    ap.add_argument("--tokenizer-path", default=None,
+                    help="Tokenizer for exact token counts (needs transformers). "
+                         "Without it, lengths are chars/3.2 estimates.")
+    ap.add_argument("--max-length", type=int, default=16384,
+                    help="Training data.max_length to check against (default: %(default)s).")
+    ap.add_argument("--prompt-length", type=int, default=4096,
+                    help="Evaluation rollout.prompt_length to check against (default: %(default)s).")
     args = ap.parse_args()
 
     df = pd.read_parquet(args.in_path)
@@ -148,6 +237,13 @@ def main():
     assert roles and roles[-1] == "assistant", (
         "last message must be assistant for SFT loss masking; got "
         f"{roles}"
+    )
+
+    report_lengths(
+        df[args.messages_key].tolist(),
+        args.tokenizer_path,
+        args.max_length,
+        args.prompt_length,
     )
 
     df.to_parquet(args.out_path)
