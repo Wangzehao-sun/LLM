@@ -406,17 +406,34 @@ def _build_prompt_array(
     tgt_tokens: List[int],
     n_tgt: int,
     sp_backup_pairs: List[Tuple[int, bool]],
-) -> np.ndarray:
+    max_draft_tokens: int = 0,
+) -> Tuple[np.ndarray, int]:
     """Render a 1D object array of message-lists, one per (split_point, backup).
 
     ``sp_backup_pairs`` is a list of ``(sp, do_backup)`` where ``sp`` is a token
     count into the (answer-truncated) reasoning and ``do_backup`` says whether to
     back the decoded prefix up to a sentence boundary (used when the prefix is a
     fractional cut rather than a sentence-aligned split point).
+
+    ``max_draft_tokens`` (0 = off) caps the draft. A ratio alone cannot bound the
+    prompt: it is a fraction of a reasoning trace whose own length varies by an
+    order of magnitude, so ``--full-ratio 0.5`` still produces prompts that
+    overrun both the training ``data.max_length`` and the evaluation
+    ``rollout.prompt_length``, where they are silently truncated. Capping here
+    bounds it at the source and always backs up to a sentence boundary, so a
+    capped draft still ends mid-derivation rather than mid-word.
+
+    Returns ``(array, n_capped)`` so the caller can report how many prefixes the
+    cap actually shortened.
     """
     prompts_list: List[List[Dict[str, str]]] = []
+    n_capped = 0
     for sp, do_backup in sp_backup_pairs:
         sp = max(0, min(int(sp), n_tgt))  # clamp
+        if max_draft_tokens and sp > max_draft_tokens:
+            sp = max_draft_tokens
+            do_backup = True  # a cut at an arbitrary token offset needs the backup
+            n_capped += 1
         if sp == 0:
             prefix_text = ""
         else:
@@ -437,7 +454,7 @@ def _build_prompt_array(
     arr = np.empty(len(prompts_list), dtype=object)
     for i, p in enumerate(prompts_list):
         arr[i] = p
-    return arr
+    return arr, n_capped
 
 
 def process_single_item(
@@ -447,6 +464,7 @@ def process_single_item(
     single_ratio: float = 1.0,
     list_mode: str = "multi",
     list_ratios: List[float] | None = None,
+    max_draft_tokens: int = 0,
 ) -> Dict[str, Any]:
     """Render BOTH summarize columns for one row.
 
@@ -460,6 +478,10 @@ def process_single_item(
       shortest correct candidate by scanning in order. ``list_mode`` is "multi"
       (one prompt per ``token_split_points`` entry -- already ascending) or
       "custom" (one prompt per ratio in the sorted ``list_ratios``).
+
+    ``max_draft_tokens`` (0 = off) caps every draft, since a ratio of a
+    variable-length reasoning trace does not bound the rendered prompt. The number
+    of prefixes it shortened is recorded in ``item["n_draft_capped"]``.
     """
     global worker_tokenizer
 
@@ -482,6 +504,7 @@ def process_single_item(
     ):
         item["summarize_prompt"] = np.array([], dtype=object)
         item["summarize_prompts"] = np.array([], dtype=object)
+        item["n_draft_capped"] = 0
         return item
 
     if isinstance(split_points, np.ndarray):
@@ -495,9 +518,9 @@ def process_single_item(
 
     # --- single column (extra-step): one fractional prefix ---
     sp_single = int(round(single_ratio * n_tgt))
-    item["summarize_prompt"] = _build_prompt_array(
+    item["summarize_prompt"], capped_single = _build_prompt_array(
         system_msg, question, template, tgt_tokens, n_tgt,
-        [(sp_single, single_ratio < 1.0)],
+        [(sp_single, single_ratio < 1.0)], max_draft_tokens,
     )
 
     # --- list column (normal-step): prefix ASCENDING ---
@@ -506,18 +529,19 @@ def process_single_item(
         list_pairs = [(int(sp), False) for sp in split_points]
     else:  # custom: one prompt per (pre-sorted) ratio
         list_pairs = [(int(round(r * n_tgt)), r < 1.0) for r in (list_ratios or [])]
-    item["summarize_prompts"] = _build_prompt_array(
-        system_msg, question, template, tgt_tokens, n_tgt, list_pairs,
+    item["summarize_prompts"], capped_list = _build_prompt_array(
+        system_msg, question, template, tgt_tokens, n_tgt, list_pairs, max_draft_tokens,
     )
+    item["n_draft_capped"] = capped_single + capped_list
     return item
 
 
 def _worker_process(
-    args: Tuple[Dict[str, Any], str, str, float, str, List[float] | None],
+    args: Tuple[Dict[str, Any], str, str, float, str, List[float] | None, int],
 ) -> Dict[str, Any]:
-    item, template, single_mode, single_ratio, list_mode, list_ratios = args
+    item, template, single_mode, single_ratio, list_mode, list_ratios, max_draft_tokens = args
     return process_single_item(
-        item, template, single_mode, single_ratio, list_mode, list_ratios
+        item, template, single_mode, single_ratio, list_mode, list_ratios, max_draft_tokens
     )
 
 
@@ -629,6 +653,16 @@ def main() -> None:
              f"({', '.join(pt.template_names())}), or a path to a .txt file containing "
              "{question} and {prefix}. The default reproduces what this script rendered "
              "before templates were centralised. Default: %(default)s",
+    )
+    parser.add_argument(
+        "--max-draft-tokens",
+        type=int,
+        default=0,
+        help="Cap the reasoning draft at N tokens (0 = no cap). A ratio alone does not "
+             "bound the rendered prompt, because the reasoning it slices varies in length "
+             "by an order of magnitude; uncapped prompts then get silently truncated by "
+             "training data.max_length or evaluation rollout.prompt_length. A capped "
+             "draft is backed up to a sentence boundary.",
     )
     parser.add_argument("--limit", type=int, default=None, help="Optional row limit for quick smoke tests.")
     parser.add_argument(
@@ -744,14 +778,14 @@ def main() -> None:
         processed = [
             process_single_item(
                 item, template_text, args.single_mode, row_ratios[i],
-                args.list_mode, list_ratios,
+                args.list_mode, list_ratios, args.max_draft_tokens,
             )
             for i, item in enumerate(tqdm(records, total=len(records), desc="rendering"))
         ]
     else:
         task_iter = (
             (item, template_text, args.single_mode, row_ratios[i],
-             args.list_mode, list_ratios)
+             args.list_mode, list_ratios, args.max_draft_tokens)
             for i, item in enumerate(records)
         )
         with mp.Pool(
@@ -769,6 +803,18 @@ def main() -> None:
             )
 
     out_df = pd.DataFrame(processed)
+
+    # Report the cap's effect, then drop the bookkeeping column: it is per-row noise,
+    # not something a downstream consumer needs.
+    if "n_draft_capped" in out_df.columns:
+        n_rows_capped = int((out_df["n_draft_capped"] > 0).sum())
+        n_prefixes_capped = int(out_df["n_draft_capped"].sum())
+        if args.max_draft_tokens:
+            print(
+                f"  -> --max-draft-tokens {args.max_draft_tokens:,}: shortened "
+                f"{n_prefixes_capped:,} prefix(es) across {n_rows_capped:,}/{len(out_df):,} rows"
+            )
+        out_df = out_df.drop(columns=["n_draft_capped"])
     for col in ("summarize_prompt", "summarize_prompts"):
         n_emitted = sum(
             1 for p in out_df[col]
