@@ -71,6 +71,56 @@ def read_prompt_id(path: Path) -> str | None:
     return str(ids[0])
 
 
+def report_prompt_lengths(prompts, tokenizer_path, prompt_length, label="prompt", quiet_tokenizer=False):
+    """Report prompt token lengths and how many exceed the evaluation cap.
+
+    ``main_generation`` calls ``apply_chat_template`` with ``truncation=True`` and
+    ``max_length=rollout.prompt_length``, so a longer prompt silently loses its tail
+    -- the end of the reasoning draft. The model is then scored on an input it never
+    fully saw, which reads as a weaker model rather than as a truncated prompt.
+
+    The whole conversation is measured, not just the user turn: the system message
+    and the template's own role markers all consume the same budget. Role-marker
+    overhead is still not counted, so a prompt near the cap may already cross it --
+    hence the "within 5%" line.
+    """
+    encode = None
+    if tokenizer_path:
+        try:
+            from transformers import AutoTokenizer
+
+            tok = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
+            encode = lambda text: len(tok(text, add_special_tokens=False)["input_ids"])  # noqa: E731
+            if not quiet_tokenizer:
+                print(f"[length] tokenizer: {tokenizer_path}")
+        except Exception as error:
+            if not quiet_tokenizer:
+                print(f"[length] could not load {tokenizer_path} ({error}); falling back to chars/3.2")
+    if encode is None:
+        encode = lambda text: int(len(text) / 3.2)  # noqa: E731
+        if not quiet_tokenizer:
+            print("[length] no tokenizer: counts are chars/3.2 ESTIMATES, not exact")
+
+    lengths = pd.Series([encode("".join(m["content"] for m in p)) for p in prompts])
+    print(
+        f"[length] {label:15s} p50={int(lengths.median()):>6,}  p90={int(lengths.quantile(0.9)):>6,}  "
+        f"p99={int(lengths.quantile(0.99)):>6,}  max={int(lengths.max()):>6,}"
+    )
+
+    over = int((lengths > prompt_length).sum())
+    near = int((lengths > prompt_length * 0.95).sum()) - over
+    print(
+        f"[length] {label:15s} vs rollout.prompt_length={prompt_length:,}: {over} over"
+        + (f", {near} within 5%" if near else "")
+    )
+    if over:
+        print(
+            f"         -> those prompts lose their tail at evaluation. Run the sweep with "
+            f"PROMPT_LENGTH={int(lengths.max()) + 512:,} or higher, or re-render with a "
+            f"smaller --max-draft-tokens."
+        )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--input", type=Path, required=True, help="Rendered summarize parquet.")
@@ -85,6 +135,12 @@ def main() -> None:
                     help="Proceed even when the eval and training prompt_id differ. Only for a "
                          "deliberate cross-prompt comparison.")
     ap.add_argument("--limit", type=int, default=None, help="Keep only the first N rows.")
+    ap.add_argument("--tokenizer-path", default=None,
+                    help="Tokenizer for exact token counts (needs transformers). "
+                         "Without it, lengths are chars/3.2 estimates.")
+    ap.add_argument("--prompt-length", type=int, default=4096,
+                    help="Evaluation rollout.prompt_length to check against, i.e. "
+                         "sweep_sft_checkpoints.sh's PROMPT_LENGTH (default: %(default)s).")
     args = ap.parse_args()
 
     if not args.input.is_file():
@@ -142,8 +198,12 @@ def main() -> None:
             "the flattened prompt ends with an assistant turn; generation expects the "
             "conversation to stop after the user turn"
         )
-    chars = pd.Series([len(m["content"]) for p in df["prompt"] for m in p if m["role"] == "user"])
-    print(f"[eval] user-turn chars: p50={int(chars.median()):,} max={int(chars.max()):,}")
+    report_prompt_lengths(df["prompt"].tolist(), args.tokenizer_path, args.prompt_length)
+    if "question_prompt" in df.columns:
+        report_prompt_lengths(
+            df["question_prompt"].tolist(), args.tokenizer_path, args.prompt_length,
+            label="question_prompt", quiet_tokenizer=True,
+        )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(args.output, index=False)
