@@ -30,6 +30,9 @@ export WANDB_MODE=offline
 #   # evaluate plain problem-solving instead of the rephrase task
 #   CKPT_DIR=... EVAL_PATH=... PROMPT_KEY=question_prompt bash sweep_sft_checkpoints.sh
 #
+#   # override the model name that prefixes every label
+#   CKPT_DIR=... EVAL_PATH=... MODEL_NAME=qwen3-4b-run2 bash sweep_sft_checkpoints.sh
+#
 #   # only some steps, or the untrained model as a baseline
 #   CKPT_DIR=... EVAL_PATH=... STEPS=15,30 bash sweep_sft_checkpoints.sh
 #   BASE_MODEL=/home/data/shared/Qwen3-4b-base EVAL_PATH=... bash sweep_sft_checkpoints.sh
@@ -44,6 +47,9 @@ EVAL_PATH=${EVAL_PATH:-$HOME/LLM/Data/sft/rephrase_eval_flat.parquet}
 
 # Comma-separated global_step numbers to evaluate; empty = every checkpoint found.
 STEPS=${STEPS:-}
+
+# Name used in the result labels. Empty = derive it from CKPT_DIR / BASE_MODEL.
+MODEL_NAME=${MODEL_NAME:-}
 
 # Which prompt column to evaluate. prepare_rephrase_eval.py writes both:
 #   prompt          -> the rephrase task (question + expert-reasoning draft)
@@ -76,10 +82,28 @@ fi
 
 GPU_NUM=$(awk -F',' '{print NF}' <<< "$GPU_DEVICES")
 
-# Collect the models to evaluate as "<label>:<path>" pairs.
+# Model name for the labels. train_sft.sh names its run directory
+# train_sft_<suffix>_<model>_<dataset>, so the model is in there but so is
+# everything else; pull out the recognisable model part rather than using the whole
+# string, since the label also becomes a directory name. Set MODEL_NAME to override.
+if [ -z "$MODEL_NAME" ]; then
+    if [ -n "$CKPT_DIR" ]; then
+        run_name=$(basename "$(dirname "$(dirname "$CKPT_DIR")")")
+        # e.g. train_sft_rephraser_Qwen3-4b-base_self_rollouts... -> Qwen3-4b-base
+        MODEL_NAME=$(grep -oE '''[Qq]wen[A-Za-z0-9._-]*''' <<< "$run_name" | head -1)
+        MODEL_NAME=${MODEL_NAME:-$run_name}
+    else
+        MODEL_NAME=$(basename "$BASE_MODEL")
+    fi
+fi
+echo "model name for labels: $MODEL_NAME"
+
+# Collect the models to evaluate as "<label>:<path>" pairs. The label names the
+# model as well as the step, so summaries from different runs stay distinguishable
+# when compared side by side.
 TARGETS=()
 if [ -n "$BASE_MODEL" ]; then
-    TARGETS+=("base:$BASE_MODEL")
+    TARGETS+=("${MODEL_NAME}-base:$BASE_MODEL")
 fi
 if [ -n "$CKPT_DIR" ]; then
     if [ ! -d "$CKPT_DIR" ]; then
@@ -98,7 +122,7 @@ if [ -n "$CKPT_DIR" ]; then
             echo "[skip] $path has no weight files yet"
             continue
         fi
-        TARGETS+=("step$step:$path")
+        TARGETS+=("${MODEL_NAME}-step${step}:$path")
     done
 fi
 
@@ -110,7 +134,7 @@ fi
 SWEEP_DIR=${LOG_ROOT}/${EXP_NAME}
 mkdir -p "$SWEEP_DIR"
 SUMMARY="${SWEEP_DIR}/summary.tsv"
-printf 'label\tavg_score\toutput_dir\n' > "$SUMMARY"
+printf 'label\tavg_score\tmax_score\tavg_len\toutput_dir\n' > "$SUMMARY"
 
 echo "=== sweeping ${#TARGETS[@]} model(s) on $(basename "$EVAL_PATH"), prompt_key=$PROMPT_KEY ==="
 for target in "${TARGETS[@]}"; do
@@ -154,28 +178,38 @@ for target in "${TARGETS[@]}"; do
         +max_steps=$MAX_STEPS \
         +reward_model.reward_impl_version=4 2>&1 | tee "$log_path"
 
-    # Recompute the mean from the written parquets rather than scraping the log:
+    # Recompute the metrics from the written parquets rather than scraping the log:
     # main_generation averages over batches, so a short final batch would be
     # weighted the same as a full one.
-    score=$(python - "$out_dir" <<'PYEOF'
+    #   avg_score -- mean of per-question mean_score, i.e. overall pass rate
+    #   max_score -- mean of per-question max_score, i.e. pass@N
+    #   avg_len   -- mean response length in characters, to spot a model that
+    #                started rambling or truncating rather than answering
+    metrics=$(python - "$out_dir" <<'PYEOF'
 import glob
 import sys
 
 import pandas as pd
 
 files = sorted(glob.glob(f"{sys.argv[1]}/*.parquet"))
-if not files:
-    print("NA")
-    sys.exit()
-means = []
+means, maxes, lengths = [], [], []
 for path in files:
-    df = pd.read_parquet(path, columns=["test_score"])
-    means.extend(float(s["mean_score"]) for s in df["test_score"])
-print(f"{sum(means) / len(means):.4f}" if means else "NA")
+    df = pd.read_parquet(path, columns=["test_score", "responses"])
+    for score in df["test_score"]:
+        means.append(float(score["mean_score"]))
+        maxes.append(float(score["max_score"]))
+    for responses in df["responses"]:
+        lengths.extend(len(str(r)) for r in responses)
+
+if not means:
+    print("NA\tNA\tNA")
+else:
+    avg_len = sum(lengths) / len(lengths) if lengths else float("nan")
+    print(f"{sum(means) / len(means):.4f}\t{sum(maxes) / len(maxes):.4f}\t{avg_len:.0f}")
 PYEOF
 )
-    printf '%s\t%s\t%s\n' "$label" "$score" "$out_dir" >> "$SUMMARY"
-    echo "=== [$label] mean score: $score ==="
+    printf '%s\t%s\t%s\n' "$label" "$metrics" "$out_dir" >> "$SUMMARY"
+    echo "=== [$label] avg_score / max_score / avg_len: $metrics ==="
 done
 
 echo
