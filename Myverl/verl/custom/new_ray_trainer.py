@@ -433,7 +433,97 @@ class NewRayPPOTrainer(RayPPOTrainer):
             raise NotImplementedError
 
         self._validate_config()
+        self._validate_rephraser_config()
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+
+    def _validate_rephraser_config(self):
+        """Reject configurations the frozen-rephraser split cannot serve correctly.
+
+        Every check here guards against a failure that would otherwise be SILENT -- either
+        a wasted model or a biased gradient. A no-op unless ``rephraser.enable=True``.
+        """
+        if not self.config.get("rephraser", {}).get("enable", False):
+            return
+
+        rollout_cfg = self.config.actor_rollout_ref.rollout
+
+        # 1. The rephraser exists to generate the summarize-replacement candidates. With
+        #    summarize_replace off it would only be used by _validate_summarize -- a whole
+        #    model's worth of GPU memory for a metric. That is a config typo, not a choice.
+        sr_mode = rollout_cfg.get("summarize_replace", False)
+        if sr_mode is False or sr_mode == "off":
+            raise ValueError(
+                "rephraser.enable=True but rollout.summarize_replace is off, so the rephraser "
+                "would only be used for validation while still holding a full model in memory. "
+                "Set +actor_rollout_ref.rollout.summarize_replace=True (or 'wrong_only')."
+            )
+
+        # 2. summarize_loss_on_rollout_prompt=True computes the loss on the SAME long prompt
+        #    the rollout used, which makes the off-policy prompt-shift correction degenerate
+        #    into plain PPO. That is sound when one model plays both roles, but here the
+        #    samples come from the rephraser and the update lands on the reasoner: without
+        #    the ratio there is no importance correction at all, and the gradient is biased
+        #    with nothing to signal it. The short-prompt path gives the full
+        #    pi_theta(y|x_short) / pi_phi(y|x_long) correction.
+        if rollout_cfg.get("summarize_loss_on_rollout_prompt", False):
+            raise ValueError(
+                "rephraser.enable=True requires summarize_loss_on_rollout_prompt=False. With "
+                "True the loss is computed under the long prompt, so samples drawn from the "
+                "rephraser update the reasoner with NO importance correction -- silently "
+                "biased. Remove +actor_rollout_ref.rollout.summarize_loss_on_rollout_prompt."
+            )
+
+        # 3. Recycle / warmup steps are out of scope for this split: they would roll out and
+        #    update the reasoner under the long prompt, which contradicts "the rephraser is
+        #    the rewriter". Refuse at startup rather than quietly training the wrong model.
+        if self.config.data.get("warmup_steps", 0) > 0:
+            raise ValueError(
+                "rephraser.enable=True does not support data.warmup_steps>0 (those are "
+                "recycle steps, which are not routed to the rephraser yet). Set "
+                "+data.warmup_steps=0."
+            )
+        if self.config.data.get("collect_failures", False):
+            raise ValueError(
+                "rephraser.enable=True does not support data.collect_failures=True: a filled "
+                "failure buffer triggers recycle steps, which are not routed to the rephraser "
+                "yet. Set +data.collect_failures=False."
+            )
+
+        # 4. async_rollout_manager is wired to the reasoner only, so _validate_summarize
+        #    would generate from the wrong model under async mode.
+        if rollout_cfg.get("mode", "sync") != "sync":
+            raise ValueError(
+                f"rephraser.enable=True requires rollout.mode='sync', got "
+                f"{rollout_cfg.get('mode')!r}: the async rollout manager is connected to the "
+                f"reasoner only."
+            )
+
+        # 5. The IS story only holds for reshapes that actually consume old_log_probs.
+        #    'p_div_p_0.1' overwrites off_ratio outright and discards the proposal density;
+        #    'dynamic_clip'/'vanilla' skip the off_old_log_probs -> old_log_probs swap, which
+        #    leaves the reasoner's short-prompt value in place and collapses the ratio to ~1.
+        reshape = self.config.actor_rollout_ref.actor.policy_loss.get("off_policy_reshape", "clip")
+        if reshape in ("dynamic_clip", "vanilla", "p_div_p_0.1"):
+            raise ValueError(
+                f"rephraser.enable=True is incompatible with off_policy_reshape={reshape!r}: "
+                f"the proposal density pi_phi(y|x_long) would not reach the loss, so the "
+                f"importance ratio degenerates. Use 'clip' (or batch_mean_norm / "
+                f"group_ess_weight)."
+            )
+
+        # Not an error: a different rephraser model is the intended setup. But the two models
+        # MUST share a tokenizer -- summarize_input_ids are pre-tokenized offline with the
+        # reasoner's tokenizer, and raw token ids from the rephraser's rollout are spliced
+        # directly into the reasoner's input_ids. A different vocab corrupts data silently.
+        rp_path = self.config.get("actor_rollout_rephraser", {}).get("model", {}).get("path", None)
+        if rp_path and rp_path != self.config.actor_rollout_ref.model.path:
+            print(
+                f"[rephraser] reasoner: {self.config.actor_rollout_ref.model.path}\n"
+                f"[rephraser] rephraser: {rp_path}\n"
+                f"[rephraser] the two MUST come from the same tokenizer family -- "
+                f"summarize_input_ids are pre-tokenized offline and rollout token ids are "
+                f"spliced into the reasoner's input_ids without re-tokenizing."
+            )
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler):
         """
         Creates the train and validation dataloaders.
@@ -577,6 +667,24 @@ class NewRayPPOTrainer(RayPPOTrainer):
                 )
                 self.resource_pool_to_cls[resource_pool_se]["se_rollout_ref"] = actor_rollout_se_cls
 
+            # Frozen rephraser: the second model. Rolls out the long summarize prompt and
+            # supplies the proposal density for the importance ratio; never updated.
+            if Role.ActorRolloutRephraser in self.role_worker_mapping:
+                resource_pool_rp = self.resource_pool_manager.get_resource_pool(Role.ActorRolloutRephraser)
+                # deepcopy is required, not defensive: the worker's __init__ MUTATES
+                # config.actor.ppo_mini_batch_size / ppo_micro_batch_size in place, so a
+                # shared node would be normalized twice -- once per worker group.
+                rp_config = OmegaConf.merge(
+                    deepcopy(self.config.actor_rollout_ref),
+                    self.config.get("actor_rollout_rephraser", OmegaConf.create()),
+                )
+                print(f"Using rephraser config, model.path={rp_config.model.path}")
+                self.resource_pool_to_cls[resource_pool_rp]["rephraser"] = RayClassWithInitArgs(
+                    cls=self.role_worker_mapping[Role.ActorRolloutRephraser],
+                    config=rp_config,
+                    role="rephraser_rollout",
+                )
+
         else:
             raise NotImplementedError
 
@@ -640,6 +748,16 @@ class NewRayPPOTrainer(RayPPOTrainer):
             self.actor_rollout_se_wg = all_wg["se_rollout_ref"]
             self.actor_rollout_se_wg.init_model()
             #print("Secondary ActorRollout (SE) initialized.")
+
+        # Frozen rephraser. Set unconditionally first: the routing sites read it with
+        # `self.rephraser_wg or self.actor_rollout_wg`, which needs the attribute to exist
+        # even when the feature is off. init_model runs AFTER the reasoner's so the main
+        # model's vLLM kv-cache estimation sees the same free memory it does today.
+        self.rephraser_wg = None
+        if "rephraser" in all_wg:
+            self.rephraser_wg = all_wg["rephraser"]
+            self.rephraser_wg.init_model()
+            print("Frozen rephraser initialized (rollout + log-prob only, no optimizer).")
 
 
         # create async rollout manager and request scheduler
@@ -1163,6 +1281,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
         train_batch_size: int,
         timing_raw: dict,
         metrics: dict,
+        gen_wg=None,
     ) -> DataProto:
         """Normal-step only (与 extra_step / recycle 逻辑完全无关) 的 summarize 替换。
 
@@ -1190,11 +1309,24 @@ class NewRayPPOTrainer(RayPPOTrainer):
 
         其余 on-policy 行 prefix_mask=0，照常走 GRPO。对每题都生成候选并尝试替换最后一槽；
         无合格候选的题保持原状。
+
+        ``gen_wg`` 决定由**哪个模型**生成候选并提供 proposal 密度（None = reasoner，
+        即单模型时的原行为）。传 rephraser 后 off_ratio 从纯 prompt-shift 修正
+        `π_θ(y|x_short)/π_θ(y|x_long)` 变成 prompt-shift + model-shift 联合修正
+        `π_θ(y|x_short)/π_φ(y|x_long)`，公式与代码都不变、含义变了。
+
+        **采样与 logprob 必须来自同一个模型**：若只把生成换成 rephraser 而 logprob 仍由
+        reasoner 算，得到的 proposal 密度对应一个从未采出过 y 的分布，估计量被静默引入
+        偏差且不报错。这就是本函数用显式形参而非实例属性的原因。
         """
         if 'summarize_input_ids' not in batch.batch:
             raise ValueError(
                 "summarize_replace=True 需要 data.use_summarize=True (缺 summarize_input_ids)"
             )
+        # 候选生成与 proposal logprob 的模型。二者用同一个 wg 是 IS 修正成立的前提。
+        if gen_wg is None:
+            gen_wg = self.actor_rollout_wg
+        metrics['debug/sr_gen_role'] = 1 if gen_wg is getattr(self, 'rephraser_wg', None) else 0
         pad_token_id = self.tokenizer.pad_token_id
         success_value = 1
         responses = gen_batch_output.batch['responses']
@@ -1292,14 +1424,16 @@ class NewRayPPOTrainer(RayPPOTrainer):
         cand_gen.meta_info['is_se'] = False
         cand_gen.meta_info['is_extra'] = False
         with marked_timer("sr_gen", timing_raw, color="cyan"):
-            cand_out = self.actor_rollout_wg.generate_sequences(cand_gen)
+            cand_out = gen_wg.generate_sequences(cand_gen)
             timing_raw.update(cand_out.meta_info.get("timing", {}))
             cand_out.meta_info.pop("timing", None)
         cand_resp = cand_out.batch['responses']               # [W*K, w]
 
         # --- 4. 候选在长 prompt 下的 logprob（off_old_log_probs / target_probs 来源）---
+        #     必须与上面的 generate 同一个 gen_wg：这是 proposal 密度 q，采样分布与密度
+        #     不同源就是静默有偏（见函数 docstring）。
         with marked_timer("sr_logprob", timing_raw, color="cyan"):
-            _lp = self.actor_rollout_wg.compute_log_prob(cand_out)
+            _lp = gen_wg.compute_log_prob(cand_out)
             long_log_prob = _lp.batch.pop('old_log_probs')    # [W*K, w]
             if 'entropys' in _lp.batch.keys():
                 _lp.batch.pop('entropys')
@@ -1344,6 +1478,12 @@ class NewRayPPOTrainer(RayPPOTrainer):
         # 候选越有把握。注意这是长 prompt 下的自信度，作为 no-prefix 亲和度的零成本代理
         # （不额外 forward）。select='logp' 时用它选合格里分数最高的；默认 'shortest'
         # 保持旧行为（按 k 升序取第一条＝prefix 最短）。
+        #
+        # gen_wg 是 rephraser（两模型模式）时此分数**换了含义**：long_log_prob 来自 φ，
+        # 于是它衡量「rephraser 对哪条最自信」，而不是「哪条最亲和当前 reasoner」——
+        # 后者才是 'logp' 这个选项的本意。想要真正的 reasoner 亲和度需要对 W*K 行做一次
+        # reasoner forward（最多 128×8 序列，成本接近整轮 rollout），故未实现。
+        # **两模型模式下建议保持默认 'shortest'。**
         cand_valid = (cand_resp != pad_token_id).float()            # [W*K, w]
         cand_logp_mean = (long_log_prob * cand_valid).sum(-1) / (cand_valid.sum(-1) + 1e-8)  # [W*K]
         sr_select = self.config.actor_rollout_ref.rollout.get('summarize_replace_select', 'shortest')
@@ -1439,10 +1579,15 @@ class NewRayPPOTrainer(RayPPOTrainer):
         若配置了 trainer.rollout_data_dir，会复用父类 _dump_generations 把候选逐条
         存成 JSONL（含 input/output/score + reward_model/data_source/uid/target），
         路径 <rollout_data_dir>/summarize_val/，可直接喂给 Data/visualize_rollouts.py。
+
+        两模型模式下这个指标衡量的是 **rephraser**（φ）—— 它才是在 summarize prompt 下
+        工作的模型。reasoner 的能力由继承的 `_validate()` 单独报告，二者互不混淆。
         """
         if getattr(self, "summarize_val_dataloader", None) is None:
             return {}
 
+        # 在 summarize prompt 下工作的模型。单模型时退回 reasoner，行为不变。
+        val_wg = getattr(self, "rephraser_wg", None) or self.actor_rollout_wg
         pad_token_id = self.tokenizer.pad_token_id
         success_value = 1
         fail_value = 0
@@ -1493,10 +1638,10 @@ class NewRayPPOTrainer(RayPPOTrainer):
             # pad 到 dp world_size 整除（SR 训练路径靠 batch 恰好可整除才免 pad；
             # val 的 batch/GPU 数任意，必须 pad，与父类 _validate 同款）。
             cand_gen_padded, pad_size = pad_dataproto_to_divisor(
-                cand_gen, self.actor_rollout_wg.world_size
+                cand_gen, val_wg.world_size
             )
             if not self.async_rollout_mode:
-                cand_out_padded = self.actor_rollout_wg.generate_sequences(cand_gen_padded)
+                cand_out_padded = val_wg.generate_sequences(cand_gen_padded)
             else:
                 self.async_rollout_manager.wake_up()
                 cand_out_padded = self.async_rollout_manager.generate_sequences(cand_gen_padded)
@@ -1518,7 +1663,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
             resp_tok_sum += int(resp_valid.sum().item())
 
             # ---- entropy（forward-only compute_log_prob 的副产物）----
-            _lp = self.actor_rollout_wg.compute_log_prob(cand_out)
+            _lp = val_wg.compute_log_prob(cand_out)
             if 'entropys' in _lp.batch.keys():
                 entropys = _lp.batch['entropys']                  # [B*K, w]
                 ent_mask = resp_valid.to(entropys.dtype)
@@ -1783,6 +1928,8 @@ class NewRayPPOTrainer(RayPPOTrainer):
         do_profile = self.global_steps in self.config.trainer.profile_steps if self.config.trainer.profile_steps is not None else False
         if do_profile:
             self.actor_rollout_wg.start_profile()
+            if self.rephraser_wg is not None:
+                self.rephraser_wg.start_profile()
             if self.use_reference_policy:
                 self.ref_policy_wg.start_profile()
             if self.use_critic:
@@ -2222,6 +2369,11 @@ class NewRayPPOTrainer(RayPPOTrainer):
                             train_batch_size=train_batch_size,
                             timing_raw=timing_raw,
                             metrics=metrics,
+                            # The rewrites come from the rephraser when it exists. Passed
+                            # explicitly, not read from self inside: this is a normal-step
+                            # sub-path that must NOT use the step's own model, so the
+                            # divergence should be visible at the call site.
+                            gen_wg=self.rephraser_wg or self.actor_rollout_wg,
                         )
             #import time
             #time.sleep(5) # wait for a while to make the logs more readable
@@ -2809,10 +2961,26 @@ class NewRayPPOTrainer(RayPPOTrainer):
                 #print(f"Average old_log_prob on standard off-policy samples before update policy: {old_prob_standard_off:.4f}")
                 #print()
                 #根据prefix_mask将old_log_prob中off_policy的部分替换为old_log_prob_off
+                _swap_done = False
                 if "off_old_log_probs" in batch.batch and self.config.actor_rollout_ref.actor.policy_loss.off_policy_reshape not in ['dynamic_clip','vanilla']:
                     print(f"{off_policy_mask.sum().item()} off-policy samples in the batch.")
                     old_log_probs_rollout = batch.batch.pop("off_old_log_probs")
                     old_log_prob.batch["old_log_probs"][off_policy_mask] = old_log_probs_rollout[off_policy_mask]
+                    _swap_done = True
+                # 两模型模式：这次 swap 是 proposal 密度 π_φ(y|x_long) 进入 loss 的唯一通道。
+                # 被跳过时 off 行的 old_log_probs 仍是 reasoner 的短 prompt 值，off_ratio 退化
+                # 成 ≈1，IS 修正整个消失 —— 而且不会报错。_validate_rephraser_config 已在启动时
+                # 拒掉会导致跳过的 reshape，这里兜住配置之外的路径。
+                if (
+                    self.config.get("rephraser", {}).get("enable", False)
+                    and off_policy_mask.any()
+                    and not _swap_done
+                ):
+                    raise RuntimeError(
+                        "rephraser.enable=True but off_old_log_probs never reached old_log_probs: "
+                        "the off-policy rows would train with an importance ratio of ~1, silently "
+                        "dropping the rephraser's proposal density. Check off_policy_reshape."
+                    )
                 
                 batch = batch.union(old_log_prob)
 
@@ -3116,6 +3284,8 @@ class NewRayPPOTrainer(RayPPOTrainer):
         sys.stdout.flush()
         if do_profile:
             self.actor_rollout_wg.stop_profile()
+            if self.rephraser_wg is not None:
+                self.rephraser_wg.stop_profile()
             if self.use_reference_policy:
                 self.ref_policy_wg.stop_profile()
             if self.use_critic:

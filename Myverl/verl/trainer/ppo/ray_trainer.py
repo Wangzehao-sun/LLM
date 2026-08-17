@@ -75,6 +75,7 @@ class Role(Enum):
     RewardModel = 5
     ActorRolloutRef = 6
     ActorRolloutSE = 7  # Secondary ActorRollout for SE training
+    ActorRolloutRephraser = 8  # Frozen second model that rolls out the summarize prompt
 
 
 @dataclass
