@@ -1,8 +1,8 @@
 set -x
 #!/usr/bin/env bash
 # GPU selection. Override with, for example: GPU_DEVICES=4,5,6,7
-GPU_DEVICES=${GPU_DEVICES:-${CUDA_VISIBLE_DEVICES:-4,5,6,7}}
-GPU_DEVICES=${GPU_DEVICES:-${CUDA_VISIBLE_DEVICES:-4,5,6,7}}
+GPU_DEVICES=${GPU_DEVICES:-${CUDA_VISIBLE_DEVICES:-0,1,2,3}}
+
 export CUDA_VISIBLE_DEVICES=$GPU_DEVICES
 
 echo $HOME
@@ -39,7 +39,7 @@ export WANDB_MODE=offline
 # ---------------------------------------------------------------------------
 
 # Where train_sft.sh wrote the checkpoints (its trainer.default_local_dir).
-CKPT_DIR=${CKPT_DIR:-"/home/data/zhwang_logs/sft_4b/train_sft_rephraser_Qwen3-4B-Instruct_expert_rephrase_rollout_sft/sft_0812/ckpt"}
+#CKPT_DIR=${CKPT_DIR:-"/home/data/zhwang_logs/sft_4b/train_sft_rephraser_Qwen3-4B-Instruct_expert_rephrase_rollout_sft/sft_0812_1e5/ckpt"}
 # Evaluate this model too -- use it for the untrained baseline, which is what makes
 # the SFT numbers interpretable.
 BASE_MODEL=${BASE_MODEL:-}
@@ -59,8 +59,8 @@ PROMPT_KEY=${PROMPT_KEY:-prompt}
 N_SAMPLES=${N_SAMPLES:-4}          # samples per question; >1 to see sampling variance
 TEMPERATURE=${TEMPERATURE:-0.7}
 TOP_P=${TOP_P:-0.8}
-PROMPT_LENGTH=${PROMPT_LENGTH:-10240}     # rephrase prompts carry a draft, so longer than a bare question
-RESPONSE_LENGTH=${RESPONSE_LENGTH:-16384}
+PROMPT_LENGTH=${PROMPT_LENGTH:-8192}     # rephrase prompts carry a draft, so longer than a bare question
+RESPONSE_LENGTH=${RESPONSE_LENGTH:-10240}
 BATCH_SIZE=${BATCH_SIZE:-256}
 MAX_STEPS=${MAX_STEPS:-1000}       # batch cap inside main_generation
 GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.8}
