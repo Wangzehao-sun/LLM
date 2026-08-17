@@ -134,7 +134,7 @@ fi
 SWEEP_DIR=${LOG_ROOT}/${EXP_NAME}
 mkdir -p "$SWEEP_DIR"
 SUMMARY="${SWEEP_DIR}/summary.tsv"
-printf 'label\tavg_score\tmax_score\tavg_len\toutput_dir\n' > "$SUMMARY"
+printf 'label\tavg_score\tmax_score\tavg_len_tokens\toutput_dir\n' > "$SUMMARY"
 
 echo "=== sweeping ${#TARGETS[@]} model(s) on $(basename "$EVAL_PATH"), prompt_key=$PROMPT_KEY ==="
 for target in "${TARGETS[@]}"; do
@@ -183,33 +183,46 @@ for target in "${TARGETS[@]}"; do
     # weighted the same as a full one.
     #   avg_score -- mean of per-question mean_score, i.e. overall pass rate
     #   max_score -- mean of per-question max_score, i.e. pass@N
-    #   avg_len   -- mean response length in characters, to spot a model that
-    #                started rambling or truncating rather than answering
+    #   avg_len   -- mean response length in TOKENS, to spot a model that started
+    #                rambling or truncating rather than answering. Compare it
+    #                against RESPONSE_LENGTH to see whether generations are
+    #                hitting the cap.
     metrics=$(python - "$out_dir" <<'PYEOF'
 import glob
 import sys
 
 import pandas as pd
+import pyarrow.parquet as pq
 
 files = sorted(glob.glob(f"{sys.argv[1]}/*.parquet"))
 means, maxes, lengths = [], [], []
+missing_lengths = False
 for path in files:
-    df = pd.read_parquet(path, columns=["test_score", "responses"])
+    # response_lengths is the per-response valid token count recorded by
+    # main_generation; parquets written before it existed have to be reported as
+    # NA rather than silently measured in characters, which reads ~3x larger.
+    columns = ["test_score"]
+    if "response_lengths" in pq.read_schema(path).names:
+        columns.append("response_lengths")
+    else:
+        missing_lengths = True
+    df = pd.read_parquet(path, columns=columns)
     for score in df["test_score"]:
         means.append(float(score["mean_score"]))
         maxes.append(float(score["max_score"]))
-    for responses in df["responses"]:
-        lengths.extend(len(str(r)) for r in responses)
+    if "response_lengths" in df:
+        for row in df["response_lengths"]:
+            lengths.extend(int(n) for n in row)
 
 if not means:
     print("NA\tNA\tNA")
 else:
-    avg_len = sum(lengths) / len(lengths) if lengths else float("nan")
-    print(f"{sum(means) / len(means):.4f}\t{sum(maxes) / len(maxes):.4f}\t{avg_len:.0f}")
+    avg_len = f"{sum(lengths) / len(lengths):.0f}" if lengths and not missing_lengths else "NA"
+    print(f"{sum(means) / len(means):.4f}\t{sum(maxes) / len(maxes):.4f}\t{avg_len}")
 PYEOF
 )
     printf '%s\t%s\t%s\n' "$label" "$metrics" "$out_dir" >> "$SUMMARY"
-    echo "=== [$label] avg_score / max_score / avg_len: $metrics ==="
+    echo "=== [$label] avg_score / max_score / avg_len_tokens: $metrics ==="
 done
 
 echo

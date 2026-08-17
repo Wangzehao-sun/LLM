@@ -137,6 +137,7 @@ def main_task(config):
         avg_token_length = 0
         print(f"[{batch_idx + 1}/{num_batch}] Start to generate.")
         batch_output_lst = [[] for _ in range(config.data.n_samples)]
+        batch_length_lst = [[] for _ in range(config.data.n_samples)]
         batch_logits_lst = [[] for _ in range(config.data.n_samples)]
         
         for n_sample in range(config.data.n_samples):
@@ -153,6 +154,7 @@ def main_task(config):
 
 
             output_texts = []
+            output_lengths = []
             for i in range(len(output)):
                 data_item = output[i]
                 prompt_length = data_item.batch["prompts"].shape[-1]
@@ -160,6 +162,7 @@ def main_task(config):
                 valid_response_ids = data_item.batch["responses"][:valid_response_length]
                 response_str = tokenizer.decode(valid_response_ids, skip_special_tokens=True)
                 output_texts.append(response_str)
+                output_lengths.append(int(valid_response_length.item()))
                 avg_token_length += valid_response_length.item()
                 # 处理并保存 logits
                 if se_log_probs is not None:
@@ -171,6 +174,7 @@ def main_task(config):
 
             #output_lst[n_sample].extend(output_texts)
             batch_output_lst[n_sample].extend(output_texts)
+            batch_length_lst[n_sample].extend(output_lengths)
         avg_token_length /= (len(output) * config.data.n_samples)
         print(f"Average token length for batch {batch_idx}: {avg_token_length:.2f}")
     # convert output_lst from (n_samples, n_data) to (n_data, n_sampels)
@@ -178,9 +182,13 @@ def main_task(config):
     # output_lst = np.transpose(output_lst, axes=(1, 0)).tolist()
         batch_output_lst = np.array(batch_output_lst, dtype=object)
         batch_output_lst = np.transpose(batch_output_lst, axes=(1, 0)).tolist()
+        # 同样转置 token 长度，使其与 responses 逐条对齐。avg_token_length 只打到日志里，
+        # 下游（如 sweep_sft_checkpoints.sh）只能读 parquet，没有这一列就只能退化成数字符。
+        batch_length_lst = np.transpose(np.array(batch_length_lst, dtype=np.int64), axes=(1, 0)).tolist()
         #batch_dataset
     # add to the data frame
         batch_dataset["responses"] = batch_output_lst
+        batch_dataset["response_lengths"] = batch_length_lst
         if config.data.get("se_logits", False):
             batch_logits_lst = np.array(batch_logits_lst, dtype=object)
             batch_logits_lst = np.transpose(batch_logits_lst, axes=(1, 0)).tolist()
