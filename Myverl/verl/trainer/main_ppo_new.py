@@ -158,6 +158,14 @@ class TaskRunner:
         if config.se_model.enable:
             role_worker_mapping[Role.ActorRolloutSE] = ray.remote(actor_rollout_cls)
             mapping[Role.ActorRolloutSE] = global_pool_id
+        # Frozen rephraser: a SECOND model that rolls out the long summarize prompt and
+        # supplies the proposal density for the importance ratio, but is never updated.
+        # Shares the global pool -- the two roles are strictly serial within a step, so
+        # splitting GPUs would buy no concurrency while breaking every world_size
+        # assumption. Default False keeps every existing script byte-identical.
+        if config.get("rephraser", {}).get("enable", False):
+            role_worker_mapping[Role.ActorRolloutRephraser] = ray.remote(actor_rollout_cls)
+            mapping[Role.ActorRolloutRephraser] = global_pool_id
         # Load the reward manager for training and validation.
         reward_fn = load_reward_manager(config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {}))
         val_reward_fn = load_reward_manager(config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {}))

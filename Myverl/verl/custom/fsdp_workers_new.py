@@ -92,6 +92,22 @@ def get_sharding_strategy(device_mesh):
     return sharding_strategy
 
 
+# Role -> capability flags. Kept as module-level constants rather than inline literals so
+# the mapping is unit-testable on CPU, and so the deliberate asymmetries are visible:
+#
+#   * "se_rollout_ref" appears ONLY in _REF_ROLES. It is inference-only by construction --
+#     update_actor / generate_sequences / compute_log_prob / save_checkpoint all assert
+#     _is_actor or _is_rollout, none of which it has. Do not "fix" this by adding it here.
+#   * "rephraser_rollout" is the frozen second model: it rolls out and computes log-probs,
+#     but has NO optimizer, so update_actor and save_checkpoint (both `assert self._is_actor`)
+#     reject it. Freezing is therefore structural, not a matter of us not calling them.
+_ACTOR_ROLES = ("actor", "actor_rollout", "actor_rollout_ref")
+_ROLLOUT_ROLES = ("rollout", "actor_rollout", "actor_rollout_ref", "rephraser_rollout")
+_REF_ROLES = ("ref", "actor_rollout_ref", "se_rollout_ref")
+_FROZEN_LM_ROLES = ("rephraser_rollout",)
+_ALL_ROLES = tuple(dict.fromkeys(_ACTOR_ROLES + _ROLLOUT_ROLES + _REF_ROLES + _FROZEN_LM_ROLES))
+
+
 class NewActorRolloutRefWorker(Worker, DistProfilerExtension):
     """
     This worker can be instantiated as a standalone actor or a standalone rollout or a standalone reference policy
@@ -127,11 +143,13 @@ class NewActorRolloutRefWorker(Worker, DistProfilerExtension):
         self._is_lora = self._lora_rank > 0
 
         self.role = role
-        assert self.role in ["actor", "rollout", "ref", "actor_rollout", "actor_rollout_ref",'se_rollout_ref']
+        assert self.role in _ALL_ROLES, f"unknown role {self.role!r}, expected one of {_ALL_ROLES}"
 
-        self._is_actor = self.role in ["actor", "actor_rollout", "actor_rollout_ref",]
-        self._is_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref", ]
-        self._is_ref = self.role in ["ref", "actor_rollout_ref","se_rollout_ref"]
+        self._is_actor = self.role in _ACTOR_ROLES
+        self._is_rollout = self.role in _ROLLOUT_ROLES
+        self._is_ref = self.role in _REF_ROLES
+        # Frozen LM: rollout + forward-only log-prob, no optimizer, never updated or saved.
+        self._is_frozen_lm = self.role in _FROZEN_LM_ROLES
         profiler_config: Optional[ProfilerConfig] = None
         if self._is_actor:
             profiler_config = omega_conf_to_dataclass(config.actor.get("profiler", {}), ProfilerConfig)
@@ -147,6 +165,12 @@ class NewActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_actor:
             self._is_offload_param = self.config.actor.fsdp_config.get("param_offload", False)
             self._is_offload_optimizer = self.config.actor.fsdp_config.get("optimizer_offload", False)
+        elif self._is_frozen_lm:
+            # Reads actor.fsdp_config (not ref.*): the frozen model is built through the
+            # actor path -- same FSDP wrapping, just without an optimizer. Offloading its
+            # params between steps is what lets two vLLM engines share the GPUs.
+            # _is_offload_optimizer stays False: there is no optimizer to offload.
+            self._is_offload_param = self.config.actor.fsdp_config.get("param_offload", False)
         elif self._is_ref:
             # TODO: it seems that manual offload is slowly than FSDP offload
             self._is_offload_param = self.config.ref.fsdp_config.get("param_offload", False)
@@ -517,6 +541,16 @@ class NewActorRolloutRefWorker(Worker, DistProfilerExtension):
             if self._is_actor:
                 optim_config = self.config.actor.optim
                 fsdp_config = self.config.actor.fsdp_config
+            elif self._is_frozen_lm:
+                # optim_config=None is what freezes it: _build_model_optimizer only builds
+                # AdamW + LR scheduler `if role == "actor" and optim_config is not None`, so
+                # the frozen model costs params only -- no Adam state (~2x params saved). It
+                # also loads in bf16 rather than fp32, since torch_dtype keys off _is_actor.
+                # fsdp_config is the REAL actor config, not the empty one the standalone
+                # rollout path passes: FSDP wrapping reads wrap_policy / mixed_precision, and
+                # the fsdp2 branch reads offload_policy / reshard_after_forward.
+                optim_config = None
+                fsdp_config = self.config.actor.fsdp_config
             else:
                 optim_config = None
                 fsdp_config = OmegaConf.create()
@@ -553,11 +587,16 @@ class NewActorRolloutRefWorker(Worker, DistProfilerExtension):
                 offload_fsdp_optimizer(optimizer=self.actor_optimizer)
                 log_gpu_memory_usage("After offload actor optimizer during init", logger=logger)
         from .new_dp_actor import NewDataParallelPPOActor
-        if self._is_actor:
+        if self._is_actor or self._is_frozen_lm:
             OmegaConf.set_struct(self.config.actor, True)
             with open_dict(self.config.actor):
                 self.config.actor.use_remove_padding = use_remove_padding
                 self.config.actor.use_fused_kernels = use_fused_kernels
+            # The frozen model needs this object too: compute_log_prob delegates to
+            # self.actor.compute_log_prob, which is forward-only (torch.no_grad) and never
+            # touches the optimizer. self.actor_optimizer is already None for it --
+            # _build_model_optimizer returns None when optim_config is None -- so the
+            # frozen actor cannot run update_policy even if something tried.
             self.actor = NewDataParallelPPOActor(config=self.config.actor, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer)
             #self.actor = DataParallelPPOActor(config=self.config.actor, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer)
 
@@ -693,7 +732,10 @@ class NewActorRolloutRefWorker(Worker, DistProfilerExtension):
     def compute_log_prob(self, data: DataProto):
         # when is_lora is True, we use the actor without lora applied to calculate the log_prob
         # which is mostly used for ref log_prob calculation
-        assert self._is_actor
+        # A frozen LM is allowed here: this is forward-only, and its log-probs are the
+        # PROPOSAL density in the importance ratio exp(logp_short - logp_long). update_actor
+        # and save_checkpoint keep asserting _is_actor alone, so it still cannot be trained.
+        assert self._is_actor or self._is_frozen_lm
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
 

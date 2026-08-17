@@ -1026,3 +1026,20 @@ ray_init:
 
   # Path to save Ray timeline JSON for performance profiling
   timeline_json_file: null
+
+# Frozen rephraser: a SECOND model that generates the summarize-prompt rewrites and
+# supplies the proposal density for the importance ratio exp(logp_short - logp_long).
+# It rolls out and computes log-probs but is NEVER updated -- no optimizer is built for it.
+# See examples/custom/train_hype_summarize_2model.sh.
+rephraser:
+
+  # False keeps every existing script byte-identical: no second worker group is created.
+  enable: False
+
+# Overrides layered ON TOP OF actor_rollout_ref for the rephraser worker -- set only the
+# keys that differ (model.path, rollout.gpu_memory_utilization, actor.fsdp_config.*).
+# Everything else (max lengths, dtype, remove_padding) is inherited, which is what the
+# shared-tokenizer constraint requires: the dataset pre-tokenizes summarize_input_ids
+# offline, and raw token ids from this model's rollout are spliced straight into the
+# reasoner's input_ids. An empty node merges to a no-op.
+actor_rollout_rephraser: {}
