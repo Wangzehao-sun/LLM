@@ -3,11 +3,12 @@
 Two invariants that would otherwise only be observable after a multi-GPU job has
 started, and whose violations are silent rather than loud:
 
-1. **The frozen rephraser must be rollout-capable but NOT an actor.** That is what
-   freezes it: ``update_actor`` and ``save_checkpoint`` both ``assert self._is_actor``,
-   so a role outside ``_ACTOR_ROLES`` cannot be trained or saved even by mistake. Adding
-   ``rephraser_rollout`` to ``_ACTOR_ROLES`` would silently un-freeze it -- it would
-   build an AdamW, load in fp32, and accept updates, with no test failing. Hence this.
+1. **The frozen rephraser must be neither an actor nor a rollout.** Not an actor is what
+   freezes it: ``update_actor`` and ``save_checkpoint`` both ``assert self._is_actor``, so
+   a role outside ``_ACTOR_ROLES`` cannot be trained or saved even by mistake. Not a
+   rollout is what lets it exist at all: a second vLLM engine in one process shares a
+   global ``CuMemAllocator``, so one engine's ``sleep()`` frees the other's memory.
+   Adding it to either tuple breaks something with no test failing. Hence this.
 
 2. **The rephraser's config must be a private copy.** The worker's ``__init__`` mutates
    ``config.actor.ppo_mini_batch_size`` in place, so a config node shared with the
@@ -104,15 +105,28 @@ class TestRoleFlags(unittest.TestCase):
         """
         self.assertEqual(self.flags("se_rollout_ref"), (False, False, True, False))
 
-    def test_frozen_rephraser_can_roll_out_but_not_train(self):
-        """The load-bearing assertion of the whole two-model split."""
-        is_actor, is_rollout, is_ref, is_frozen = self.flags("rephraser_rollout")
-        self.assertTrue(is_rollout, "the rephraser must generate: it produces the rewrite candidates")
+    def test_frozen_rephraser_computes_logprobs_but_neither_trains_nor_generates(self):
+        """The load-bearing assertion of the whole split.
+
+        Both omissions matter. Not an actor -> no optimizer, so update_actor and
+        save_checkpoint reject it. Not a rollout -> no vLLM engine, and THAT is what lets
+        it coexist with the reasoner at all: vLLM's sleep mode uses a process-global
+        CuMemAllocator with hardcoded "weights"/"kv_cache" tags, so a second engine in the
+        same process would have its memory freed by the first one's sleep(). Log-probs need
+        no engine -- one forward pass, the same path critic/reward scoring already takes.
+        """
+        is_actor, is_rollout, is_ref, is_frozen = self.flags("rephraser_logprob")
         self.assertTrue(is_frozen, "the rephraser must be flagged frozen so compute_log_prob admits it")
         self.assertFalse(
             is_actor,
-            "rephraser_rollout must NOT be in _ACTOR_ROLES -- that is what makes update_actor "
+            "rephraser_logprob must NOT be in _ACTOR_ROLES -- that is what makes update_actor "
             "and save_checkpoint reject it. Freezing is structural, not a convention.",
+        )
+        self.assertFalse(
+            is_rollout,
+            "rephraser_logprob must NOT be in _ROLLOUT_ROLES: a second vLLM engine in one "
+            "process shares a global CuMemAllocator and the engines free each other's memory. "
+            "Candidate generation is done offline precisely to avoid needing an engine here.",
         )
         self.assertFalse(is_ref, "the rephraser is not a reference policy; a third copy of the weights is pointless")
 
@@ -121,9 +135,15 @@ class TestRoleFlags(unittest.TestCase):
         union = set(self.const["_ACTOR_ROLES"]) | set(self.const["_ROLLOUT_ROLES"]) | set(self.const["_REF_ROLES"]) | set(self.const["_FROZEN_LM_ROLES"])
         self.assertEqual(set(self.const["_ALL_ROLES"]), union)
 
-    def test_frozen_roles_are_a_subset_of_rollout_roles(self):
-        """A frozen LM that cannot roll out has no reason to exist."""
-        self.assertTrue(set(self.const["_FROZEN_LM_ROLES"]) <= set(self.const["_ROLLOUT_ROLES"]))
+    def test_frozen_roles_are_disjoint_from_rollout_roles(self):
+        """A frozen LM must NOT be a rollout: that is what keeps it off the vLLM engine.
+
+        The inverse of what an earlier revision asserted. The rephraser used to generate
+        candidates online, which required an engine -- until it turned out two engines
+        cannot share a process. Generation moved offline and the role lost _is_rollout;
+        putting it back would reintroduce the allocator conflict.
+        """
+        self.assertEqual(set(self.const["_FROZEN_LM_ROLES"]) & set(self.const["_ROLLOUT_ROLES"]), set())
 
     def test_frozen_and_actor_are_disjoint(self):
         """The two are contradictory: frozen means no optimizer, actor means one exists."""
@@ -239,54 +259,111 @@ class TestRephraserPlumbing(unittest.TestCase):
         block = block[1][:1200]
         self.assertIn("deepcopy(self.config.actor_rollout_ref)", block)
         self.assertIn("actor_rollout_rephraser", block)
-        self.assertIn('role="rephraser_rollout"', block)
+        self.assertIn('role="rephraser_logprob"', block)
 
     def test_rephraser_wg_is_always_defined(self):
         """The routing sites read `self.rephraser_wg or ...`, so it must always exist."""
         src = TRAINER_FILE.read_text(encoding="utf-8")
         self.assertIn("self.rephraser_wg = None", src)
 
-    def test_candidate_sampling_and_logprob_use_the_same_worker(self):
+    def test_proposal_density_comes_from_the_designated_worker(self):
         """The one error here that produces no exception, only a biased gradient.
 
-        The ratio is pi_theta(y|x_short) / pi_phi(y|x_long). If the candidates are drawn
-        from phi but the denominator is computed by theta, the proposal density belongs to
-        a distribution that never emitted y -- an invalid importance weight, silently.
+        The ratio is pi_theta(y|x_short) / pi_phi(y|x_long). If the candidates come from
+        phi (generated offline by Data/aggregate_sr_responses.py) but the denominator is
+        computed by theta, the proposal density belongs to a distribution that never
+        emitted y -- an invalid importance weight, and nothing raises or NaNs.
         """
         src = TRAINER_FILE.read_text(encoding="utf-8")
         tree = ast.parse(src)
         for node in ast.walk(tree):
             if isinstance(node, ast.FunctionDef) and node.name == "_summarize_replace_normal_step":
                 body = ast.get_source_segment(src, node) or ""
-                self.assertIn("gen_wg.generate_sequences(cand_gen)", body)
-                self.assertIn("gen_wg.compute_log_prob(cand_out)", body)
-                self.assertNotIn(
-                    "self.actor_rollout_wg.generate_sequences",
-                    body,
-                    "candidate generation must go through gen_wg, not the step's own model",
-                )
+                self.assertIn("logp_wg.compute_log_prob(logp_in)", body)
+                # Online fallback (no rephraser worker) still generates through the same
+                # handle, so sampling and density share a source by construction.
+                self.assertIn("logp_wg.generate_sequences(cand_gen)", body)
                 self.assertNotIn(
                     "self.actor_rollout_wg.compute_log_prob",
                     body,
-                    "the proposal density must come from the SAME worker that sampled",
+                    "the proposal density must come from logp_wg -- the model that produced "
+                    "the candidates -- not from the model being updated",
+                )
+                self.assertNotIn(
+                    "self.actor_rollout_wg.generate_sequences",
+                    body,
+                    "candidate generation must go through logp_wg, not the step's own model",
                 )
                 return
         self.fail("_summarize_replace_normal_step not found")
 
-    def test_validate_summarize_measures_the_rephraser(self):
-        """It reports accuracy under the summarize prompt, which is phi's job."""
+    def test_offline_path_reads_the_column_instead_of_generating(self):
+        """sr_use_offline must take the column branch, and force K=1 before the reshape.
+
+        K is used to flatten long_prompt to [W*K, L]; the offline column holds ONE
+        candidate per question, so a K>1 left in place would leave long_prompt with more
+        rows than cand_resp -- a shape error at best, misaligned pairs at worst.
+        """
+        src = TRAINER_FILE.read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "_summarize_replace_normal_step":
+                body = ast.get_source_segment(src, node) or ""
+                self.assertIn("sr_response_ids", body)
+                head = body.split("long_rows = []", 1)
+                self.assertEqual(len(head), 2, "the long_prompt flattening loop moved")
+                self.assertIn("K = 1", head[0], "K must be forced to 1 BEFORE long_prompt is flattened")
+                return
+        self.fail("_summarize_replace_normal_step not found")
+
+    def test_short_logprob_prompt_reuses_the_loss_time_prompt_tensor(self):
+        """sr_logprob_prompt='short' must use the SAME tensor the loss is computed under.
+
+        The point of 'short' is that the ratio's numerator and denominator share a prompt.
+        Rebuilding the short prompt separately (a second slice of gen_batch, a different
+        repeat order) would silently break exactly the property being asked for -- the two
+        prompts would be nearly identical, so nothing would look wrong.
+
+        Hence short_wk is computed ONCE, before the log-prob step, and passed to
+        _build_hybrid_off_policy_output as loss_prompts afterwards.
+        """
+        src = TRAINER_FILE.read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "_summarize_replace_normal_step":
+                body = ast.get_source_segment(src, node) or ""
+                self.assertEqual(
+                    body.count("short_prompts = gen_batch.batch['input_ids'][::n]"),
+                    1,
+                    "short_wk must be derived once; a second derivation can drift from the "
+                    "tensor the loss uses",
+                )
+                # Built before the log-prob call, and fed to the loss rows after it.
+                pre, sep, post = body.partition("logp_wg.compute_log_prob(logp_in)")
+                self.assertTrue(sep, "the log-prob call moved")
+                self.assertIn("short_wk = short_prompts[wq_idx]", pre)
+                self.assertIn("'prompts': short_wk", pre, "the short branch must use short_wk")
+                self.assertIn("loss_prompts=short_wk", post, "the loss rows must reuse short_wk")
+                return
+        self.fail("_summarize_replace_normal_step not found")
+
+    def test_validate_summarize_is_disabled_with_a_logprob_only_rephraser(self):
+        """It needs to generate under the summarize prompt, which that worker cannot do.
+
+        Falling back to the reasoner would silently retitle theta's accuracy as the
+        rephraser's, so the function returns {} instead.
+        """
         src = TRAINER_FILE.read_text(encoding="utf-8")
         tree = ast.parse(src)
         for node in ast.walk(tree):
             if isinstance(node, ast.FunctionDef) and node.name == "_validate_summarize":
                 body = ast.get_source_segment(src, node) or ""
-                self.assertIn("val_wg = getattr(self, \"rephraser_wg\", None) or self.actor_rollout_wg", body)
-                self.assertIn("val_wg.generate_sequences", body)
-                self.assertIn("val_wg.compute_log_prob", body)
-                # world_size too: padding to the wrong worker's dp size would misalign
-                # the unpad on the way back.
-                self.assertIn("val_wg.world_size", body)
-                self.assertNotIn("self.actor_rollout_wg.generate_sequences", body)
+                self.assertIn('if getattr(self, "rephraser_wg", None) is not None:', body)
+                self.assertNotIn(
+                    "rephraser_wg.generate_sequences",
+                    body,
+                    "the logprob-only rephraser has no engine; it cannot generate here",
+                )
                 return
         self.fail("_validate_summarize not found")
 
@@ -299,6 +376,7 @@ class TestRephraserPlumbing(unittest.TestCase):
             if isinstance(node, ast.FunctionDef) and node.name == "_validate_rephraser_config":
                 body = ast.get_source_segment(src, node) or ""
                 for guard in (
+                    "sr_use_offline",                    # the rephraser's only reason to exist
                     "summarize_loss_on_rollout_prompt",  # would drop the IS correction
                     "summarize_replace",                 # rephraser built but unused
                     "warmup_steps",                      # recycle steps, not routed yet
