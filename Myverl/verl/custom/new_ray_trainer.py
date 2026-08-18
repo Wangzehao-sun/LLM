@@ -434,7 +434,101 @@ class NewRayPPOTrainer(RayPPOTrainer):
 
         self._validate_config()
         self._validate_rephraser_config()
+        self._validate_sr_offline_config()
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+
+    def _validate_sr_offline_config(self):
+        """Check the offline-SR wiring at startup, not mid-step.
+
+        The sr_logprob_prompt report applies to both modes; the rest is a no-op unless
+        ``rollout.sr_use_offline=True``.
+        """
+        rollout_cfg = self.config.actor_rollout_ref.rollout
+
+        # Which prompt the importance-ratio DENOMINATOR is computed under. Reported at
+        # startup because the two settings are different estimators, not a tuning knob,
+        # and picking the wrong one produces no error -- only a wrong gradient.
+        sr_logp_prompt = rollout_cfg.get("sr_logprob_prompt", "long")
+        if sr_logp_prompt not in ("long", "short"):
+            raise ValueError(
+                f"rollout.sr_logprob_prompt must be 'long' or 'short', got {sr_logp_prompt!r}"
+            )
+        sr_mode_on = rollout_cfg.get("summarize_replace", False) not in (False, "off")
+        if sr_mode_on and sr_logp_prompt == "short":
+            has_rephraser = self.config.get("rephraser", {}).get("enable", False)
+            print(
+                "[sr] sr_logprob_prompt='short': the ratio denominator uses the SAME short "
+                "prompt as the on-policy rows, so off_ratio reflects only the model gap. "
+                "Lower variance, but it is no longer the density y was sampled from, so the "
+                "estimator is biased."
+                + (
+                    ""
+                    if has_rephraser
+                    else " With no rephraser worker the numerator and denominator are the same "
+                    "model under the same prompt, so off_ratio ~= 1 and the importance "
+                    "correction vanishes entirely -- this trains on the offline candidates as "
+                    "if they were on-policy (closer to SFT than to a policy gradient)."
+                )
+            )
+        elif sr_mode_on:
+            print(
+                "[sr] sr_logprob_prompt='long': the denominator is the distribution the "
+                "candidates actually came from -- a consistent policy gradient. Watch "
+                "actor/off_ratio_ess; long-vs-short prompt drift can degrade the sequence "
+                "weight exponentially."
+            )
+
+        if not rollout_cfg.get("sr_use_offline", False):
+            return
+
+        # Offline candidates only reach the loss through the summarize-replacement path.
+        sr_mode = rollout_cfg.get("summarize_replace", False)
+        if sr_mode is False or sr_mode == "off":
+            raise ValueError(
+                "rollout.sr_use_offline=True but rollout.summarize_replace is off, so the "
+                "pre-generated sr_response column would never be read. Set "
+                "+actor_rollout_ref.rollout.summarize_replace=True (or 'wrong_only')."
+            )
+
+        # The dataset only tokenizes sr_response when use_summarize is on (the offline path
+        # still needs summarize_input_ids as the long prompt the log-prob is taken under).
+        if not self.config.data.get("use_summarize", False):
+            raise ValueError(
+                "rollout.sr_use_offline=True requires data.use_summarize=True: the candidate "
+                "text comes from the column, but its proposal density log pi(y|x_long) is "
+                "still computed under summarize_input_ids."
+            )
+
+        # K>1 is meaningless offline -- there is one pre-selected candidate per question,
+        # and the choice (correct + median length) was already made by
+        # Data/aggregate_sr_responses.py. Silently forcing K=1 would leave the configured
+        # value in the logs, so say it.
+        k = int(rollout_cfg.get("summarize_replace_k", 1))
+        if k > 1:
+            print(
+                f"[sr_offline] summarize_replace_k={k} is ignored: the offline column holds one "
+                f"pre-selected candidate per question, so K is forced to 1."
+            )
+
+        # First column check that does not need a GPU. The dataset writes an all-pad row
+        # when a question has no candidate, so a missing COLUMN (vs. missing values) is the
+        # config error worth catching before the model loads.
+        key = self.config.data.get("sr_response_key", "sr_response")
+        train_files = self.config.data.train_files
+        if isinstance(train_files, str):
+            train_files = [train_files]
+        try:
+            import pandas as pd
+
+            head = pd.read_parquet(train_files[0], columns=[key])
+        except Exception as error:
+            print(f"[sr_offline] could not verify the {key!r} column in {train_files[0]}: {error}")
+        else:
+            n_empty = int((head[key].fillna("").astype(str).str.strip() == "").sum())
+            print(
+                f"[sr_offline] {key!r} present in {train_files[0]}: {len(head):,} row(s), "
+                f"{n_empty:,} empty (those questions get no replacement)"
+            )
 
     def _validate_rephraser_config(self):
         """Reject configurations the frozen-rephraser split cannot serve correctly.
@@ -447,18 +541,30 @@ class NewRayPPOTrainer(RayPPOTrainer):
 
         rollout_cfg = self.config.actor_rollout_ref.rollout
 
-        # 1. The rephraser exists to generate the summarize-replacement candidates. With
-        #    summarize_replace off it would only be used by _validate_summarize -- a whole
-        #    model's worth of GPU memory for a metric. That is a config typo, not a choice.
+        # 1. The rephraser is a logprob-only worker: it has no vLLM engine, so its ONLY job
+        #    is supplying log pi_phi(y|x_long) for candidates that were generated offline.
+        #    Without sr_use_offline there is nothing for it to score -- the candidates would
+        #    be generated on the fly by the reasoner, whose log-probs the reasoner can
+        #    compute itself. A whole model's weights for nothing.
+        if not rollout_cfg.get("sr_use_offline", False):
+            raise ValueError(
+                "rephraser.enable=True requires rollout.sr_use_offline=True. The rephraser "
+                "worker has no vLLM engine (see _FROZEN_LM_ROLES in fsdp_workers_new.py) and "
+                "exists solely to compute the proposal density for candidates produced "
+                "offline by Data/aggregate_sr_responses.py. Either set "
+                "+actor_rollout_ref.rollout.sr_use_offline=True, or drop rephraser.enable."
+            )
+
+        # 2. Offline candidates only reach the loss through the summarize-replacement path.
         sr_mode = rollout_cfg.get("summarize_replace", False)
         if sr_mode is False or sr_mode == "off":
             raise ValueError(
                 "rephraser.enable=True but rollout.summarize_replace is off, so the rephraser "
-                "would only be used for validation while still holding a full model in memory. "
-                "Set +actor_rollout_ref.rollout.summarize_replace=True (or 'wrong_only')."
+                "would never be asked for a log-prob while still holding a full model in "
+                "memory. Set +actor_rollout_ref.rollout.summarize_replace=True (or 'wrong_only')."
             )
 
-        # 2. summarize_loss_on_rollout_prompt=True computes the loss on the SAME long prompt
+        # 3. summarize_loss_on_rollout_prompt=True computes the loss on the SAME long prompt
         #    the rollout used, which makes the off-policy prompt-shift correction degenerate
         #    into plain PPO. That is sound when one model plays both roles, but here the
         #    samples come from the rephraser and the update lands on the reasoner: without
@@ -473,7 +579,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
                 "biased. Remove +actor_rollout_ref.rollout.summarize_loss_on_rollout_prompt."
             )
 
-        # 3. Recycle / warmup steps are out of scope for this split: they would roll out and
+        # 4. Recycle / warmup steps are out of scope for this split: they would roll out and
         #    update the reasoner under the long prompt, which contradicts "the rephraser is
         #    the rewriter". Refuse at startup rather than quietly training the wrong model.
         if self.config.data.get("warmup_steps", 0) > 0:
@@ -489,8 +595,20 @@ class NewRayPPOTrainer(RayPPOTrainer):
                 "yet. Set +data.collect_failures=False."
             )
 
-        # 4. async_rollout_manager is wired to the reasoner only, so _validate_summarize
-        #    would generate from the wrong model under async mode.
+        # 5. _validate_summarize needs to GENERATE under the summarize prompt, which the
+        #    logprob-only rephraser cannot do. It returns {} in this mode rather than
+        #    silently reporting the reasoner's accuracy under a name that says rephraser.
+        #    Keyed on the CONFIG, not on summarize_val_dataloader: this method runs before
+        #    _create_dataloader, so that attribute does not exist yet.
+        if self.config.data.get("summarize_val_files", None):
+            print(
+                "[rephraser] val_summarize/* is DISABLED: measuring it needs generation under "
+                "the summarize prompt, and the rephraser worker is logprob-only. Evaluate the "
+                "rephraser offline instead (sweep_sft_checkpoints.sh + "
+                "Data/prepare_rephrase_eval.py)."
+            )
+
+        # 6. async_rollout_manager is wired to the reasoner only.
         if rollout_cfg.get("mode", "sync") != "sync":
             raise ValueError(
                 f"rephraser.enable=True requires rollout.mode='sync', got "
@@ -549,7 +667,16 @@ class NewRayPPOTrainer(RayPPOTrainer):
                                          summarize_prompts_key=self.config.data.get('summarize_prompts_key', 'summarize_prompts'),
                                          summarize_prompt_key=self.config.data.get('summarize_prompt_key', 'summarize_prompt'),
                                          max_summarize_prompts=self.config.data.get('max_summarize_prompts', 8),
-                                         max_summarize_length=self.config.data.get('max_summarize_length', 8192),)
+                                         max_summarize_length=self.config.data.get('max_summarize_length', 8192),
+                                         # ---- 离线 SR 候选：仅 sr_use_offline=True 时分词 ----
+                                         # 长度对齐 max_response_length：这条候选要当成模型自己的
+                                         # response 参与 loss，宽度必须和 on-policy rollout 一致。
+                                         sr_response_key=self.config.data.get('sr_response_key', 'sr_response'),
+                                         max_sr_response_length=(
+                                             self.config.data.max_response_length
+                                             if self.config.actor_rollout_ref.rollout.get('sr_use_offline', False)
+                                             else 0
+                                         ),)
 
         # use sampler for better ckpt resume
         if train_sampler is None:
@@ -682,7 +809,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
                 self.resource_pool_to_cls[resource_pool_rp]["rephraser"] = RayClassWithInitArgs(
                     cls=self.role_worker_mapping[Role.ActorRolloutRephraser],
                     config=rp_config,
-                    role="rephraser_rollout",
+                    role="rephraser_logprob",
                 )
 
         else:
@@ -1281,7 +1408,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
         train_batch_size: int,
         timing_raw: dict,
         metrics: dict,
-        gen_wg=None,
+        logp_wg=None,
     ) -> DataProto:
         """Normal-step only (与 extra_step / recycle 逻辑完全无关) 的 summarize 替换。
 
@@ -1310,23 +1437,39 @@ class NewRayPPOTrainer(RayPPOTrainer):
         其余 on-policy 行 prefix_mask=0，照常走 GRPO。对每题都生成候选并尝试替换最后一槽；
         无合格候选的题保持原状。
 
-        ``gen_wg`` 决定由**哪个模型**生成候选并提供 proposal 密度（None = reasoner，
-        即单模型时的原行为）。传 rephraser 后 off_ratio 从纯 prompt-shift 修正
-        `π_θ(y|x_short)/π_θ(y|x_long)` 变成 prompt-shift + model-shift 联合修正
-        `π_θ(y|x_short)/π_φ(y|x_long)`，公式与代码都不变、含义变了。
+        ``logp_wg`` 决定由**哪个模型**提供 proposal 密度 log π(y|x_long)，即 IS 比值的
+        分母（None = reasoner，单模型时的原行为）。它必须是**实际产出候选的那个模型**：
 
-        **采样与 logprob 必须来自同一个模型**：若只把生成换成 rephraser 而 logprob 仍由
-        reasoner 算，得到的 proposal 密度对应一个从未采出过 y 的分布，估计量被静默引入
-        偏差且不报错。这就是本函数用显式形参而非实例属性的原因。
+          * 在线模式（sr_use_offline=False）——候选由 logp_wg 自己 generate，天然自洽。
+          * 离线模式（sr_use_offline=True）——候选来自 Data/aggregate_sr_responses.py，
+            由某个 checkpoint 离线生成；logp_wg 应指向**同一个模型**（rephraser worker），
+            这样分母才是真正的 proposal 密度。
+
+        传 rephraser 后 off_ratio 从纯 prompt-shift 修正 `π_θ(y|x_short)/π_θ(y|x_long)`
+        变成 prompt-shift + model-shift 联合修正 `π_θ(y|x_short)/π_φ(y|x_long)`，
+        公式与代码都不变、含义变了。
+
+        **采样分布与密度必须同源**：若候选由 φ 产出而 logprob 由 reasoner 算，得到的
+        proposal 密度对应一个从未采出过 y 的分布，估计量被静默引入偏差且不报错 —— 不抛
+        异常、不出 NaN，只是梯度是错的。这就是本函数用显式形参而非实例属性的原因。
+
+        ``rollout.sr_logprob_prompt`` 决定在哪个 prompt 下算这个密度，两者是不同的估计量：
+
+          * ``'long'``（默认）—— q = π(y|x_long)，即实际产出候选的分布。数学上唯一正确
+            的 proposal 密度，off_ratio 是一致的 policy gradient。风险在方差：长短 prompt
+            差异大，10k token 上序列权重可能指数退化（盯 actor/off_ratio_ess）。
+          * ``'short'`` —— q = π(y|x_short)，与 on-policy 行逐字相同的 prompt。ratio 只剩
+            模型差异，方差小得多；代价是它不是 y 的采样分布，估计量有偏。logp_wg 就是
+            reasoner 时 ratio≈1，IS 修正完全消失，等价于把外来样本当自己的（近似 SFT）。
         """
         if 'summarize_input_ids' not in batch.batch:
             raise ValueError(
                 "summarize_replace=True 需要 data.use_summarize=True (缺 summarize_input_ids)"
             )
-        # 候选生成与 proposal logprob 的模型。二者用同一个 wg 是 IS 修正成立的前提。
-        if gen_wg is None:
-            gen_wg = self.actor_rollout_wg
-        metrics['debug/sr_gen_role'] = 1 if gen_wg is getattr(self, 'rephraser_wg', None) else 0
+        # proposal 密度 log π(y|x_long) 的来源模型。在线模式下它也负责生成候选。
+        if logp_wg is None:
+            logp_wg = self.actor_rollout_wg
+        metrics['debug/sr_logp_role'] = 1 if logp_wg is getattr(self, 'rephraser_wg', None) else 0
         pad_token_id = self.tokenizer.pad_token_id
         success_value = 1
         responses = gen_batch_output.batch['responses']
@@ -1405,6 +1548,20 @@ class NewRayPPOTrainer(RayPPOTrainer):
         K_data = sum_ids.size(1)
         L_long = sum_ids.size(2)
         K = max(1, int(self.config.actor_rollout_ref.rollout.get('summarize_replace_k', 1)))
+        # 离线 SR：候选来自 parquet 的 sr_response 列（Data/aggregate_sr_responses.py 预生成、
+        # 预筛好），不再每步 generate。省掉的是每步 W*K 条上万 token 的自回归 —— 128 题 ×
+        # 8 条，最终每题只留 1 条，~97% 被丢掉；而离线候选一次生成、多轮训练复用。
+        #
+        # 前提是 rephraser 冻结：它权重不变、summarize prompt 离线预渲染、温度固定，
+        # 所以 π_φ(·|x_long) 在整个训练过程是同一个分布，每步重新采样只是重掷同一个骰子。
+        # rephraser 若要训练，离线就不成立（候选必须来自当前的 φ）。
+        #
+        # K 必须在这里就压成 1（而不是取完候选再改）：下面 long_prompt 按 [W*K, L_long] 展平，
+        # 而离线一题只有一条候选，K>1 会让 long_prompt 的行数和 cand_resp 对不上。
+        # 「哪条候选」的选择（正确 + 长度中位数）已经在离线阶段做完了。
+        sr_offline = self.config.actor_rollout_ref.rollout.get('sr_use_offline', False)
+        if sr_offline:
+            K = 1
         W = len(all_q)
         # 展平成 [W*K, L_long]：行 r = w_idx*K + k -> 第 all_q[w_idx] 题的第 k 条候选。
         long_rows = []
@@ -1423,21 +1580,118 @@ class NewRayPPOTrainer(RayPPOTrainer):
         cand_gen.meta_info = deepcopy(gen_batch.meta_info)
         cand_gen.meta_info['is_se'] = False
         cand_gen.meta_info['is_extra'] = False
-        with marked_timer("sr_gen", timing_raw, color="cyan"):
-            cand_out = gen_wg.generate_sequences(cand_gen)
-            timing_raw.update(cand_out.meta_info.get("timing", {}))
-            cand_out.meta_info.pop("timing", None)
-        cand_resp = cand_out.batch['responses']               # [W*K, w]
 
-        # --- 4. 候选在长 prompt 下的 logprob（off_old_log_probs / target_probs 来源）---
-        #     必须与上面的 generate 同一个 gen_wg：这是 proposal 密度 q，采样分布与密度
-        #     不同源就是静默有偏（见函数 docstring）。
+        # 离线 SR：候选取自数据集列，不 generate。
+        if sr_offline:
+            if 'sr_response_ids' not in batch.batch:
+                raise ValueError(
+                    "sr_use_offline=True 但 batch 里没有 'sr_response_ids'。该列由 "
+                    "RLHFDatasetWithTarget 从 parquet 的 sr_response 列分词得到，需要用 "
+                    "Data/aggregate_sr_responses.py 产出的 parquet 训练。"
+                )
+            # 只取目标题的候选，与 long_prompt 的 [W*K, ...] 行序对齐（K=1 故 W*1=W）。
+            sr_ids = batch.batch['sr_response_ids'][torch.tensor(all_q, device=batch.batch['sr_response_ids'].device)]
+            cand_resp = sr_ids.to(device)                       # [W, L_sr]
+            # 全 pad 行 = 该题无可用候选（aggregate --keep-unsolved 会留这种行）。
+            # 记下来后面统一跳过，而不是让它当成一条空回复进 loss。
+            sr_missing = (cand_resp == pad_token_id).all(-1)    # [W]
+            metrics['batch/sr_offline_missing'] = int(sr_missing.sum().item())
+
+            # 拼出 generate_sequences 会给的同一个结构：prompts / responses / input_ids /
+            # attention_mask / position_ids（见 vllm_rollout_spmd.py:363-372）。下游
+            # compute_log_prob、compute_reward、_build_hybrid_off_policy_output 都按这五个
+            # key 读，缺一个就在别处炸。
+            #
+            # mask 与 position_ids 对整条拼好的 input_ids 一次算出，而不是分段算再 cat：
+            # 这与 _build_hybrid_off_policy_output(:1009) 的既有做法一致。左填充的 prompt +
+            # 右填充的 response 拼起来后，position_ids 必须按 cumsum 连续编号，分段计算容易
+            # 在 prompt 全长（无填充）或 response 全 pad 的边界上算出错位的偏移。
+            cand_input_ids = torch.cat([long_prompt, cand_resp], dim=-1)
+            cand_attn, cand_pos = generate_masks_from_input_ids(
+                cand_input_ids, pad_token_id, long_attn.dtype,
+            )
+            cand_out = DataProto.from_single_dict({
+                'prompts': long_prompt,
+                'responses': cand_resp,
+                'input_ids': cand_input_ids,
+                'attention_mask': cand_attn,
+                'position_ids': cand_pos,
+            })
+            cand_out.meta_info = deepcopy(cand_gen.meta_info)
+        else:
+            # 在线模式：候选由 logp_wg 自己 generate，所以采样分布与下面算的密度天然同源。
+            # 注意此时 logp_wg 必须能 generate —— rephraser worker 是 logprob-only 角色
+            # （无 vLLM 引擎），所以在线模式下 logp_wg 只能是 reasoner。
+            with marked_timer("sr_gen", timing_raw, color="cyan"):
+                cand_out = logp_wg.generate_sequences(cand_gen)
+                timing_raw.update(cand_out.meta_info.get("timing", {}))
+                cand_out.meta_info.pop("timing", None)
+            cand_resp = cand_out.batch['responses']               # [W*K, w]
+            sr_missing = None
+        metrics['debug/sr_offline'] = 1 if sr_offline else 0
+
+        # 原始短 question prompt（每题一条，去掉 n 份 interleave 复制）。同时供两处使用：
+        # 下面 sr_logprob_prompt='short' 时当 logprob 的 prompt 段，以及第 6 步建 off 行时
+        # 当 loss-time prompt。两处必须是**同一个张量**，否则 loss 与分母的 prompt 会错开。
+        short_prompts = gen_batch.batch['input_ids'][::n]      # [B, L_short]
+        wq_idx = torch.tensor(all_q, device=short_prompts.device)
+        # 每题短 prompt 重复 K 次，与 W*K 候选对齐。
+        short_wk = short_prompts[wq_idx].repeat_interleave(K, dim=0).to(device)  # [W*K, L_short]
+
+        # --- 4. 候选的 logprob（off_old_log_probs / target_probs 来源）= IS 比值的分母 q ---
+        #
+        # sr_logprob_prompt 决定在**哪个 prompt** 下算这个密度，两个选择是不同的估计量：
+        #
+        #   'long'（默认）——  q = π(y|x_long)，即实际产出候选的那个分布。这是唯一数学上
+        #       正确的 proposal 密度，off_ratio = π_θ(y|x_short)/π_φ(y|x_long) 是一致的
+        #       policy gradient。风险是方差：长短 prompt 差异大，10k token 上序列权重可能
+        #       指数退化，盯 actor/off_ratio_ess。
+        #
+        #   'short'      ——  q = π(y|x_short)，与 on-policy 行**逐字相同**的 prompt。
+        #       ratio 只剩模型差异，方差小得多、ESS 高。但代价是它不再是 y 的采样分布
+        #       （y 是在长 prompt 下采出的），所以估计量有偏；logp_wg 就是 reasoner 时
+        #       ratio≈1，IS 修正完全消失，等价于把外来样本当自己的（近似 SFT/模仿）。
+        #
+        # 换 prompt 只是换 input_ids 的前半段：compute_log_prob 只读 responses / input_ids /
+        # attention_mask / position_ids（dp_actor.py:316），不关心 prompt 的来历。
+        sr_logp_prompt = self.config.actor_rollout_ref.rollout.get('sr_logprob_prompt', 'long')
+        if sr_logp_prompt not in ('long', 'short'):
+            raise ValueError(
+                f"rollout.sr_logprob_prompt must be 'long' or 'short', got {sr_logp_prompt!r}"
+            )
+        metrics['debug/sr_logprob_prompt_short'] = 1 if sr_logp_prompt == 'short' else 0
+
+        logp_in = cand_out
+        if sr_logp_prompt == 'short':
+            # 只重建 logprob 用的这一份结构；cand_out 本身保持长 prompt 不动，因为第 5 步
+            # 的 compute_reward 和轨迹过滤读的是它的 responses（与 prompt 无关），而
+            # 第 6 步的 off 行由 _build_hybrid_off_policy_output 独立构造。
+            short_input_ids = torch.cat([short_wk, cand_resp], dim=-1)
+            short_attn, short_pos = generate_masks_from_input_ids(
+                short_input_ids, pad_token_id, cand_out.batch['attention_mask'].dtype,
+            )
+            logp_in = DataProto.from_single_dict({
+                'prompts': short_wk,
+                'responses': cand_resp,
+                'input_ids': short_input_ids,
+                'attention_mask': short_attn,
+                'position_ids': short_pos,
+            })
+            logp_in.meta_info = deepcopy(cand_out.meta_info)
+
+        #     离线模式下这一步**省不掉**：候选文本可以预存，但密度必须由产出候选的那个模型
+        #     算 —— 所以离线 + rephraser worker 的组合正是为此存在。好在这只是一次 forward
+        #     （无自回归、无 KV cache），和 critic/reward 打分同一条路，比 generate 便宜一个
+        #     量级；也正因为不需要引擎，它才能与 reasoner 的 vLLM 引擎共存（引擎才是
+        #     CuMemAllocator 单例冲突的来源）。
         with marked_timer("sr_logprob", timing_raw, color="cyan"):
-            _lp = gen_wg.compute_log_prob(cand_out)
-            long_log_prob = _lp.batch.pop('old_log_probs')    # [W*K, w]
+            _lp = logp_wg.compute_log_prob(logp_in)
+            cand_log_prob = _lp.batch.pop('old_log_probs')    # [W*K, w]
             if 'entropys' in _lp.batch.keys():
                 _lp.batch.pop('entropys')
             del _lp
+        if logp_in is not cand_out:
+            del logp_in
 
         # --- 5. 候选打分 + 轨迹过滤（按 W*K 展平，每行一条候选）---
         # ground-truth 展平到 W*K：每题 GT 重复 K 次（与候选行一一对应）。
@@ -1453,10 +1707,8 @@ class NewRayPPOTrainer(RayPPOTrainer):
         )
 
         # --- 6. 构建 explain-style off 行（短 prompt + 候选 response），展平到 W*K ---
-        short_prompts = gen_batch.batch['input_ids'][::n]     # [B, L_short]
-        wq_idx = torch.tensor(all_q, device=short_prompts.device)
-        # 每题短 prompt 重复 K 次，与 W*K 候选对齐。
-        short_wk = short_prompts[wq_idx].repeat_interleave(K, dim=0).to(device)  # [W*K, L_short]
+        #     short_wk 已在第 4 步之前算好（那里 sr_logprob_prompt='short' 时也要用它）。
+        #     复用同一个张量，保证 loss 用的 prompt 与分母用的 prompt 逐字一致。
         off_batch = self._build_hybrid_off_policy_output(
             n_divide=1,
             n_repeat=1,
@@ -1469,34 +1721,45 @@ class NewRayPPOTrainer(RayPPOTrainer):
         )
         # 宽度一致性：generate 把 response 右填充到 max_response_length，
         # _build_hybrid 也 pad 到 max(max_response_length, w)，与 on 批 resp_width 相同。
-        off_batch.batch['target_probs'] = torch.exp(long_log_prob)
-        off_batch.batch['off_old_log_probs'] = long_log_prob
+        # 离线模式同样成立：dataset 把 sr_response_ids 右填充到恰好 max_response_length，
+        # 所以那个 max() 取回同一个值。
+        off_batch.batch['target_probs'] = torch.exp(cand_log_prob)
+        off_batch.batch['off_old_log_probs'] = cand_log_prob
 
-        # 候选选择打分（近似 no-prefix 亲和度）：用已算好的 long_log_prob（候选在长
-        # summarize prompt 下的 per-token logprob）做「序列平均 log_prob」——在候选
-        # response 的有效 token 上取均值，长度归一化避免偏向短候选。分数越高＝模型对该
-        # 候选越有把握。注意这是长 prompt 下的自信度，作为 no-prefix 亲和度的零成本代理
-        # （不额外 forward）。select='logp' 时用它选合格里分数最高的；默认 'shortest'
-        # 保持旧行为（按 k 升序取第一条＝prefix 最短）。
+        # 候选选择打分（近似 no-prefix 亲和度）：用已算好的 cand_log_prob（候选在
+        # sr_logprob_prompt 指定的那个 prompt 下的 per-token logprob）做「序列平均
+        # log_prob」——在候选 response 的有效 token 上取均值，长度归一化避免偏向短候选。
+        # 分数越高＝模型对该候选越有把握。作为 no-prefix 亲和度的零成本代理（不额外
+        # forward）。select='logp' 时用它选合格里分数最高的；默认 'shortest' 保持旧行为
+        # （按 k 升序取第一条＝prefix 最短）。
         #
-        # gen_wg 是 rephraser（两模型模式）时此分数**换了含义**：long_log_prob 来自 φ，
-        # 于是它衡量「rephraser 对哪条最自信」，而不是「哪条最亲和当前 reasoner」——
-        # 后者才是 'logp' 这个选项的本意。想要真正的 reasoner 亲和度需要对 W*K 行做一次
-        # reasoner forward（最多 128×8 序列，成本接近整轮 rollout），故未实现。
-        # **两模型模式下建议保持默认 'shortest'。**
+        # 两处会让这个分数**换含义**，两者叠加时更远离注释本意：
+        #   * logp_wg 是 rephraser —— 它衡量「φ 对哪条最自信」，而非「哪条最亲和当前
+        #     reasoner」，后者才是 'logp' 的本意。
+        #   * sr_logprob_prompt='short' —— 变成短 prompt 下的自信度，反而更接近本意。
+        # 想要严格的 reasoner 亲和度需要对 W*K 行做一次 reasoner forward（最多 128×8
+        # 序列，成本接近整轮 rollout），故未实现。**离线模式下 K=1，本选择逻辑无事可做
+        # （候选已在离线挑好），建议保持默认 'shortest'。**
         cand_valid = (cand_resp != pad_token_id).float()            # [W*K, w]
-        cand_logp_mean = (long_log_prob * cand_valid).sum(-1) / (cand_valid.sum(-1) + 1e-8)  # [W*K]
+        cand_logp_mean = (cand_log_prob * cand_valid).sum(-1) / (cand_valid.sum(-1) + 1e-8)  # [W*K]
         sr_select = self.config.actor_rollout_ref.rollout.get('summarize_replace_select', 'shortest')
 
         # --- 7. 每题挑一条合格候选，替换其最后一条 rollout（固定第 n-1 槽）---
         #     select='shortest'（默认）：按 k 升序取第一条合格＝prefix 最短。
         #     select='longest'：合格候选里取 k 最大的＝prefix 最多（信息最充分的改写）。
-        #     select='logp'：合格候选里取 long_log_prob 序列平均最大的（最亲和当前策略）。
+        #     select='logp'：合格候选里取 cand_log_prob 序列平均最大的（最亲和当前策略）。
         #     合格判据：reward==success 且通过轨迹过滤；无合格候选则不替换。
         n_acc = n_rej_inc = n_rej_flt = n_no_cand = 0
         for w_idx, p in enumerate(all_q):
             chosen = -1  # off_batch 内（W*K 展平）被选中的行
             best_score = float('-inf')
+            # 离线模式下这题可能压根没有候选（aggregate --keep-unsolved 留下的全 pad 行）。
+            # 空 response 打分自然不 success，靠下面的 reward 判据也能挡住，但会被记成
+            # "rej_incorrect"，把"数据里没有"和"生成得不对"混在一起。显式跳过，让
+            # sr_offline_missing 和 no_candidate 各自说清自己的事。
+            if sr_missing is not None and bool(sr_missing[w_idx]):
+                n_no_cand += 1
+                continue
             for k in range(K):
                 r = w_idx * K + k
                 if cand_reward_sum[r].item() != success_value:
@@ -1580,14 +1843,16 @@ class NewRayPPOTrainer(RayPPOTrainer):
         存成 JSONL（含 input/output/score + reward_model/data_source/uid/target），
         路径 <rollout_data_dir>/summarize_val/，可直接喂给 Data/visualize_rollouts.py。
 
-        两模型模式下这个指标衡量的是 **rephraser**（φ）—— 它才是在 summarize prompt 下
-        工作的模型。reasoner 的能力由继承的 `_validate()` 单独报告，二者互不混淆。
+        **rephraser.enable=True 时本函数直接返回 {}。** 它需要在 summarize prompt 下
+        generate，而 rephraser worker 是 logprob-only 角色（没有 vLLM 引擎，见
+        fsdp_workers_new.py 的 _FROZEN_LM_ROLES 注释）。用 reasoner 生成会让这个指标偷偷
+        变成「θ 在 summarize prompt 下的准确率」，与它的名字不符 —— 宁可不报。
+        rephraser 的能力改为离线评测：sweep_sft_checkpoints.sh + Data/prepare_rephrase_eval.py。
         """
         if getattr(self, "summarize_val_dataloader", None) is None:
             return {}
-
-        # 在 summarize prompt 下工作的模型。单模型时退回 reasoner，行为不变。
-        val_wg = getattr(self, "rephraser_wg", None) or self.actor_rollout_wg
+        if getattr(self, "rephraser_wg", None) is not None:
+            return {}
         pad_token_id = self.tokenizer.pad_token_id
         success_value = 1
         fail_value = 0
@@ -1638,10 +1903,10 @@ class NewRayPPOTrainer(RayPPOTrainer):
             # pad 到 dp world_size 整除（SR 训练路径靠 batch 恰好可整除才免 pad；
             # val 的 batch/GPU 数任意，必须 pad，与父类 _validate 同款）。
             cand_gen_padded, pad_size = pad_dataproto_to_divisor(
-                cand_gen, val_wg.world_size
+                cand_gen, self.actor_rollout_wg.world_size
             )
             if not self.async_rollout_mode:
-                cand_out_padded = val_wg.generate_sequences(cand_gen_padded)
+                cand_out_padded = self.actor_rollout_wg.generate_sequences(cand_gen_padded)
             else:
                 self.async_rollout_manager.wake_up()
                 cand_out_padded = self.async_rollout_manager.generate_sequences(cand_gen_padded)
@@ -1663,7 +1928,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
             resp_tok_sum += int(resp_valid.sum().item())
 
             # ---- entropy（forward-only compute_log_prob 的副产物）----
-            _lp = val_wg.compute_log_prob(cand_out)
+            _lp = self.actor_rollout_wg.compute_log_prob(cand_out)
             if 'entropys' in _lp.batch.keys():
                 entropys = _lp.batch['entropys']                  # [B*K, w]
                 ent_mask = resp_valid.to(entropys.dtype)
@@ -2369,11 +2634,13 @@ class NewRayPPOTrainer(RayPPOTrainer):
                             train_batch_size=train_batch_size,
                             timing_raw=timing_raw,
                             metrics=metrics,
-                            # The rewrites come from the rephraser when it exists. Passed
+                            # The proposal density comes from the rephraser when it exists --
+                            # it is the model that produced the offline candidates, so it is
+                            # the only correct denominator for the importance ratio. Passed
                             # explicitly, not read from self inside: this is a normal-step
                             # sub-path that must NOT use the step's own model, so the
                             # divergence should be visible at the call site.
-                            gen_wg=self.rephraser_wg or self.actor_rollout_wg,
+                            logp_wg=self.rephraser_wg or self.actor_rollout_wg,
                         )
             #import time
             #time.sleep(5) # wait for a while to make the logs more readable

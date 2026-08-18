@@ -98,13 +98,22 @@ def get_sharding_strategy(device_mesh):
 #   * "se_rollout_ref" appears ONLY in _REF_ROLES. It is inference-only by construction --
 #     update_actor / generate_sequences / compute_log_prob / save_checkpoint all assert
 #     _is_actor or _is_rollout, none of which it has. Do not "fix" this by adding it here.
-#   * "rephraser_rollout" is the frozen second model: it rolls out and computes log-probs,
-#     but has NO optimizer, so update_actor and save_checkpoint (both `assert self._is_actor`)
-#     reject it. Freezing is therefore structural, not a matter of us not calling them.
+#   * "rephraser_logprob" is the frozen second model, and it appears in NEITHER _ACTOR_ROLES
+#     NOR _ROLLOUT_ROLES. Both omissions are load-bearing:
+#       - not an actor  -> no optimizer; update_actor and save_checkpoint (both
+#         `assert self._is_actor`) reject it, so freezing is structural rather than a
+#         convention we happen to follow.
+#       - not a rollout -> no vLLM engine. vLLM's sleep mode is built on a PROCESS-GLOBAL
+#         CuMemAllocator with hardcoded "weights"/"kv_cache" tags, so a second engine in
+#         the same process would have its memory freed by the first one's sleep(). SGLang
+#         has the same problem via torch_memory_saver. Computing log-probs needs no engine
+#         at all -- it is one forward pass, the same path critic/reward scoring takes,
+#         which is why those can already coexist. Candidate GENERATION, which does need an
+#         engine, is done offline instead (Data/aggregate_sr_responses.py).
 _ACTOR_ROLES = ("actor", "actor_rollout", "actor_rollout_ref")
-_ROLLOUT_ROLES = ("rollout", "actor_rollout", "actor_rollout_ref", "rephraser_rollout")
+_ROLLOUT_ROLES = ("rollout", "actor_rollout", "actor_rollout_ref")
 _REF_ROLES = ("ref", "actor_rollout_ref", "se_rollout_ref")
-_FROZEN_LM_ROLES = ("rephraser_rollout",)
+_FROZEN_LM_ROLES = ("rephraser_logprob",)
 _ALL_ROLES = tuple(dict.fromkeys(_ACTOR_ROLES + _ROLLOUT_ROLES + _REF_ROLES + _FROZEN_LM_ROLES))
 
 
@@ -190,7 +199,10 @@ class NewActorRolloutRefWorker(Worker, DistProfilerExtension):
                 assert self.config.actor.ppo_mini_batch_size // self.config.actor.ppo_micro_batch_size_per_gpu > 0, f"normalized ppo_mini_batch_size {self.config.actor.ppo_mini_batch_size} should be larger than ppo_micro_batch_size_per_gpu {self.config.actor.ppo_micro_batch_size_per_gpu}"
 
         # normalize rollout config
-        if self._is_rollout and self.config.rollout.log_prob_micro_batch_size is not None:
+        # The frozen LM is included even though it has no engine: compute_log_prob reads
+        # config.rollout.log_prob_micro_batch_size_per_gpu (not the ref.* one), so skipping
+        # the normalization here would leave it None and the log-prob micro-batching unset.
+        if (self._is_rollout or self._is_frozen_lm) and self.config.rollout.log_prob_micro_batch_size is not None:
             self.config.rollout.log_prob_micro_batch_size //= self.device_mesh.size() // self.ulysses_sequence_parallel_size
             self.config.rollout.log_prob_micro_batch_size_per_gpu = self.config.rollout.log_prob_micro_batch_size
         # normalize ref config
@@ -536,8 +548,10 @@ class NewActorRolloutRefWorker(Worker, DistProfilerExtension):
         use_shm = self.config.model.get("use_shm", False)
         use_fused_kernels = self.config.model.get("use_fused_kernels", False)
 
-        if self._is_actor or self._is_rollout:
-            # we need the model for actor and rollout
+        if self._is_actor or self._is_rollout or self._is_frozen_lm:
+            # we need the model for actor and rollout -- and for the frozen LM, whose whole
+            # job is a forward pass, so it needs the weights but neither an engine nor an
+            # optimizer.
             if self._is_actor:
                 optim_config = self.config.actor.optim
                 fsdp_config = self.config.actor.fsdp_config
@@ -632,9 +646,11 @@ class NewActorRolloutRefWorker(Worker, DistProfilerExtension):
                 checkpoint_config=self.config.actor.checkpoint,
             )
 
-        if not self._is_actor and self._is_rollout:
+        if not self._is_actor and (self._is_rollout or self._is_frozen_lm):
             # If ActorRolloutRefWorker is initialized as a standalone rollout,
             # create a checkpoint manager for FSDP model to allow loading FSDP checkpoints for rollout.
+            # The frozen LM takes this branch too: load-only (save_contents is empty), which
+            # is the right shape for a model that is never updated.
 
             checkpoint_contents = OmegaConf.create({"load_contents": ["model"], "save_contents": []})
             self.checkpoint_manager = FSDPCheckpointManager(

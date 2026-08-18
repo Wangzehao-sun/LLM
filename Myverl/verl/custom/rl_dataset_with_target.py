@@ -90,6 +90,9 @@ class RLHFDatasetWithTarget(RLHFDataset):
                  summarize_prompt_key='summarize_prompt',
                  max_summarize_prompts=8,           # K, 与训练时 n_prefix 对齐
                  max_summarize_length=8192,         # rollout-time 长 prompt 容量
+                 # ---- 离线 SR 候选（Data/aggregate_sr_responses.py 产出）----
+                 sr_response_key='sr_response',
+                 max_sr_response_length=0,          # 0 = 关闭；否则 = data.max_response_length
         ):
         super().__init__(parquet_files, tokenizer, config=config)
 
@@ -110,6 +113,9 @@ class RLHFDatasetWithTarget(RLHFDataset):
         self.summarize_prompt_key = summarize_prompt_key
         self.max_summarize_prompts = max_summarize_prompts
         self.max_summarize_length = max_summarize_length
+        # ---- 离线 SR 候选 ----
+        self.sr_response_key = sr_response_key
+        self.max_sr_response_length = max_sr_response_length
         if self.filter_targets:
             self._filter_targets()
     def _filter_targets(self):
@@ -385,6 +391,40 @@ class RLHFDatasetWithTarget(RLHFDataset):
             row_dict['summarize_input_id'] = summarize_input_id
             row_dict['summarize_attention_mask_single'] = summarize_attention_mask_single
             row_dict['summarize_position_id_single'] = summarize_position_id_single
+
+        # ---- 离线 SR 候选（sr_response 列）----
+        # Data/aggregate_sr_responses.py 预先跑好、筛好的一条「正确且长度中位数」回复。
+        # 训练时 _summarize_replace_normal_step 直接用它，不再每步 generate K 条候选
+        # （128 题 × 8 条 × 上万 token，最终每题只留 1 条，~97% 被丢掉）。
+        #
+        # 右填充，与 responses 的排布一致：off 行最终形状是 [短 prompt, response]，
+        # response 段必须右填充才能和 on-policy 批的 response 宽度对齐。
+        # 这里只出 token；是否真的启用由 trainer 端判断（全 pad 行 = 该题无候选）。
+        if self.max_sr_response_length > 0:
+            sr_text = original_row.get(self.sr_response_key)
+            if isinstance(sr_text, str) and sr_text.strip():
+                sr_ids = self.tokenizer(
+                    sr_text, add_special_tokens=False, return_tensors='pt',
+                )['input_ids'].reshape(1, -1)
+                if sr_ids.shape[-1] < self.max_sr_response_length:
+                    sr_ids = pad_sequence_to_length(
+                        sr_ids,
+                        max_seq_len=self.max_sr_response_length,
+                        pad_token_id=self.tokenizer.pad_token_id,
+                        left_pad=False,
+                    )
+                else:
+                    # 右截断：SR 候选是要被当成模型自己的 response 来算 loss 的，
+                    # 左截断会砍掉开头、留下无头的推理，比截掉结尾更糟。
+                    sr_ids = sr_ids[:, :self.max_sr_response_length]
+                row_dict['sr_response_ids'] = sr_ids.squeeze(0)
+            else:
+                # 该题没有可用候选（aggregate 脚本 --keep-unsolved，或本来就没这列）。
+                # 必须仍然写入这个 key：collate_fn 要求整批 key 一致，缺一行就崩。
+                # 全 pad 是 trainer 端判「跳过这题」的判据。
+                row_dict['sr_response_ids'] = torch.full(
+                    (self.max_sr_response_length,), self.tokenizer.pad_token_id, dtype=torch.long,
+                )
 
         # 父类已经处理了 'raw_prompt', 'index' 等字段，我们无需重复
         # 直接返回被我们追加了 target 相关字段的 `row_dict`
