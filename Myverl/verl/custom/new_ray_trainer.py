@@ -1622,8 +1622,15 @@ class NewRayPPOTrainer(RayPPOTrainer):
             # 在线模式：候选由 logp_wg 自己 generate，所以采样分布与下面算的密度天然同源。
             # 注意此时 logp_wg 必须能 generate —— rephraser worker 是 logprob-only 角色
             # （无 vLLM 引擎），所以在线模式下 logp_wg 只能是 reasoner。
+            #
+            # pad 到该 worker 的 dp world_size：两个池卡数可以不同，而 auto-padding 默认关闭
+            # （protocol.py:45-58），dispatch 按 world_size 直接 chunk。summarize_replace=
+            # 'wrong_only' 时 W 是"全错题数"这个任意整数，除不尽任何卡数，会在 chunk 里炸。
+            # 与 _validate_summarize 同一套用法。
             with marked_timer("sr_gen", timing_raw, color="cyan"):
-                cand_out = logp_wg.generate_sequences(cand_gen)
+                cand_gen_padded, pad_size = pad_dataproto_to_divisor(cand_gen, logp_wg.world_size)
+                cand_out_padded = logp_wg.generate_sequences(cand_gen_padded)
+                cand_out = unpad_dataproto(cand_out_padded, pad_size=pad_size)
                 timing_raw.update(cand_out.meta_info.get("timing", {}))
                 cand_out.meta_info.pop("timing", None)
             cand_resp = cand_out.batch['responses']               # [W*K, w]
@@ -1684,12 +1691,18 @@ class NewRayPPOTrainer(RayPPOTrainer):
         #     （无自回归、无 KV cache），和 critic/reward 打分同一条路，比 generate 便宜一个
         #     量级；也正因为不需要引擎，它才能与 reasoner 的 vLLM 引擎共存（引擎才是
         #     CuMemAllocator 单例冲突的来源）。
+        #
+        #     pad 的理由同上面的 generate：这条路也走 DP_COMPUTE_PROTO dispatch，按
+        #     logp_wg.world_size 直接 chunk。注意 pad 的是 logp_in —— sr_logprob_prompt=
+        #     'short' 时它是另建的那份结构，pad cand_out 不会影响真正被送进去的张量。
         with marked_timer("sr_logprob", timing_raw, color="cyan"):
-            _lp = logp_wg.compute_log_prob(logp_in)
+            logp_in_padded, lp_pad_size = pad_dataproto_to_divisor(logp_in, logp_wg.world_size)
+            _lp = logp_wg.compute_log_prob(logp_in_padded)
+            _lp = unpad_dataproto(_lp, pad_size=lp_pad_size)
             cand_log_prob = _lp.batch.pop('old_log_probs')    # [W*K, w]
             if 'entropys' in _lp.batch.keys():
                 _lp.batch.pop('entropys')
-            del _lp
+            del _lp, logp_in_padded
         if logp_in is not cand_out:
             del logp_in
 
