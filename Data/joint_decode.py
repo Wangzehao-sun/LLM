@@ -476,6 +476,18 @@ def main() -> int:
     if start:
         start.record()
 
+    # One bar, on rank 0 only: four ranks each drawing their own would interleave
+    # into unreadable output, and `tee`ing that to a log file leaves it full of
+    # cursor-movement escapes. The shards differ in length by at most one row, so
+    # rank 0's progress tracks the whole job closely enough. Other ranks print a
+    # line per batch instead (below), which is coarse but keeps their logs plain.
+    n_batches = -(-len(shard) // args.batch_size) * args.n_samples
+    bar = None
+    if rank == 0:
+        from tqdm import tqdm
+
+        bar = tqdm(total=n_batches, desc=f"decode ({args.fuse})", unit="batch")
+
     for sample_idx in range(args.n_samples):
         for begin in range(0, len(shard), args.batch_size):
             stop = min(begin + args.batch_size, len(shard))
@@ -492,9 +504,20 @@ def main() -> int:
                 texts[begin + row].append(tok_a.decode(ids, skip_special_tokens=True))
                 tok_lens[begin + row].append(n_tok)
                 total_tokens += n_tok
-            print(f"[rank {rank}] sample {sample_idx + 1}/{args.n_samples} "
-                  f"rows {begin}-{stop - 1} done", flush=True)
+            if bar is not None:
+                # tok/s is the number that decides whether this path is fast enough
+                # to be worth keeping, so surface it live rather than only in the
+                # final summary. tqdm's own rate is batches/s, which hides the fact
+                # that batches vary hugely in generated length.
+                bar.update(1)
+                bar.set_postfix(sample=f"{sample_idx + 1}/{args.n_samples}",
+                                tok_s=f"{total_tokens / max(bar.format_dict['elapsed'], 1e-6):.0f}")
+            else:
+                print(f"[rank {rank}] sample {sample_idx + 1}/{args.n_samples} "
+                      f"rows {begin}-{stop - 1} done", flush=True)
 
+    if bar is not None:
+        bar.close()
     if start:
         end.record()
         torch.cuda.synchronize()
