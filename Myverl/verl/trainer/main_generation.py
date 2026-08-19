@@ -113,16 +113,62 @@ def main_task(config):
         batch_dataset = dataset.iloc[start_idx:end_idx].copy()
         batch_chat_lst = chat_lst[start_idx:end_idx]
         #batch_chat_lst = chat_lst[batch_idx * config_batch_size : (batch_idx + 1) * config_batch_size]
-        inputs = tokenizer.apply_chat_template(
-            batch_chat_lst,
-            add_generation_prompt=True,
-            padding=True,
-            truncation=True,
-            max_length=config.rollout.prompt_length,
-            return_tensors="pt",
-            return_dict=True,
-            tokenize=True,
-        )
+        # PREFILL_NOTE. A prompt whose last message is an ASSISTANT turn is a prefill: the
+        # model must RESUME writing that message, not start a new one. The two chat-template
+        # flags that control this are mutually exclusive in transformers (passing both
+        # raises):
+        #   add_generation_prompt=True     -> ...assistant\nPREFIX<|im_end|>\n<|im_start|>assistant\n
+        #                                     the prefix is closed as a finished turn and the
+        #                                     model writes a SECOND answer from scratch.
+        #   continue_final_message=True    -> ...assistant\nPREFIX
+        #                                     no end-of-turn token, so generation resumes
+        #                                     inside the prefix. This is what prefill means.
+        # Built by Data/prepare_prefill_continue.py.
+        #
+        # The flag is per-CALL but the decision is per-ROW, so a batch mixing prefilled and
+        # plain prompts cannot use one call. Rather than forbid that (rows with an empty
+        # prefix are legitimately plain), each row is rendered to text with its own flag and
+        # the batch is tokenized afterwards -- same padding/truncation, same result for the
+        # all-plain case.
+        def _ends_with_assistant(chat):
+            return bool(len(chat)) and chat[-1].get("role") == "assistant"
+
+        n_prefill = sum(_ends_with_assistant(chat) for chat in batch_chat_lst)
+        if n_prefill == 0:
+            inputs = tokenizer.apply_chat_template(
+                batch_chat_lst,
+                add_generation_prompt=True,
+                padding=True,
+                truncation=True,
+                max_length=config.rollout.prompt_length,
+                return_tensors="pt",
+                return_dict=True,
+                tokenize=True,
+            )
+        else:
+            if batch_idx == start_step:
+                print(f"[prefill] {n_prefill}/{len(batch_chat_lst)} prompts end with an assistant "
+                      f"turn -> continue_final_message (the model resumes that message)")
+            rendered = [
+                tokenizer.apply_chat_template(
+                    chat,
+                    tokenize=False,
+                    **({"continue_final_message": True} if _ends_with_assistant(chat)
+                       else {"add_generation_prompt": True}),
+                )
+                for chat in batch_chat_lst
+            ]
+            # add_special_tokens=False: the rendered text already carries every control
+            # token the template needs, so letting the tokenizer add BOS again would
+            # duplicate it.
+            inputs = tokenizer(
+                rendered,
+                add_special_tokens=False,
+                padding=True,
+                truncation=True,
+                max_length=config.rollout.prompt_length,
+                return_tensors="pt",
+            )
         input_ids = inputs["input_ids"]
         attention_mask = inputs["attention_mask"]
         position_ids = compute_position_id_with_mask(attention_mask)
