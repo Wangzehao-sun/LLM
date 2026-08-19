@@ -1,0 +1,548 @@
+"""Joint decoding: combine two models' predictions at every generated token.
+
+Two families of rule, chosen with ``--fuse``:
+
+* ``linear`` / ``contrastive`` / ``max`` -- blend the two next-token distributions
+  in log space, then sample from the result (contrastive-decoding / proxy-tuning /
+  DExperts).
+* ``agree`` -- do not blend. The TEACHER (model B) constrains which tokens are
+  allowed: a candidate must sit in both models' top-k and clear each side's
+  probability floor. The STUDENT (model A) then samples among the survivors, so
+  the teacher steers direction while the student picks the token it finds most
+  natural. When nothing survives there is no agreement to honour and the step
+  samples from the teacher instead. Both branches respect ``--temperature`` /
+  ``--top-p``.
+
+This deliberately does NOT go through verl's rollout stack. vLLM is entered once
+per request (``vllm_rollout_spmd.py:304`` calls ``LLM.generate()``), so there is
+no per-token hook to fuse into, and the pinned ``vllm<=0.8.5`` (setup.py:51) runs
+the V1 engine, which dropped per-request ``logits_processors``. The one token-level
+loop that does exist, ``naive_rollout.py:68-100``, re-forwards the whole prefix
+every step (no KV cache, O(n^2)) -- unusable at these response lengths. So this is
+a plain HF decode loop WITH a KV cache, run outside Ray.
+
+The cost of leaving vLLM behind is throughput: no paged attention, no CUDA graph,
+and two forwards per token. Data parallelism claws back some of it -- launch under
+torchrun and each rank decodes its own slice of the rows onto its own GPU. Ranks
+never talk to each other, so there is no process group to initialise; each writes
+its own shard, matching what ``main_generation.py:233`` does per batch. Every
+downstream reader (``aggregate_sr_responses.py:119``,
+``sweep_sft_checkpoints.sh``) globs ``*.parquet``, so no merge step is needed.
+
+Because it is this much slower than vLLM, it is for OFFLINE evaluation only --
+putting it in the GRPO rollout path would need the V0/logits_processors route
+instead.
+
+Usage:
+
+    # 4-way data parallel
+    torchrun --standalone --nproc_per_node=4 Data/joint_decode.py \\
+        --model-a /home/data/shared/Qwen3-4b-base \\
+        --model-b /home/data/shared/rephraser-ckpt \\
+        --input   Data/eval_rephrase_flat.parquet \\
+        --output-dir /tmp/joint_out \\
+        --fuse linear --fuse-weight 0.5
+
+    # single GPU, no torchrun needed (RANK defaults to 0, WORLD_SIZE to 1)
+    python Data/joint_decode.py --model-a ... --model-b ... \\
+        --input ... --output-dir ... --fuse-weight 0
+
+    # top-k agreement: teacher B constrains, student A picks
+    torchrun --standalone --nproc_per_node=4 Data/joint_decode.py \\
+        --model-a ... --model-b ... --input ... --output-dir ... \\
+        --fuse agree --agree-top-k 10 --agree-teacher-min-prob 0.05
+
+``--fuse-weight 0`` reduces exactly to model A alone; with ``--temperature 0`` it
+must reproduce A's greedy output token for token, which is the sanity check that
+the KV cache and masks are wired correctly.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn.functional as F
+
+
+# ---------------------------------------------------------------------------
+# fusion
+# ---------------------------------------------------------------------------
+def fuse_logits(logits_a: torch.Tensor, logits_b: torch.Tensor, mode: str, weight: float) -> torch.Tensor:
+    """Combine two next-token logit rows into one, in LOG-PROBABILITY space.
+
+    Normalising first is load-bearing for two of the three modes:
+
+    * ``max`` needs it outright -- an elementwise max over raw logits compares two
+      models' arbitrary offsets against each other, which is meaningless.
+    * ``linear`` / ``contrastive`` are affine, so a per-row offset survives into the
+      result as another per-row offset and softmax cancels it; normalising is
+      mathematically a no-op there. It is still done, because it makes
+      ``weight == 0`` return exactly A's log-probs (so the degenerate case is bit-
+      comparable against a single-model run) and keeps the returned scores on one
+      interpretable scale for all three modes.
+
+    Returns log-probabilities, not logits.
+    """
+    log_pa = F.log_softmax(logits_a.float(), dim=-1)
+    if weight == 0.0:
+        return log_pa
+    log_pb = F.log_softmax(logits_b.float(), dim=-1)
+
+    if mode == "linear":
+        # Geometric mixture of the two distributions (arithmetic mean in log space).
+        return (1.0 - weight) * log_pa + weight * log_pb
+    if mode == "contrastive":
+        # Extrapolate along B-minus-A. weight>0 pushes AWAY from A towards B and
+        # may leave the interval spanned by the two models -- that is the point
+        # (proxy tuning / DExperts), but it also means the result can be sharper
+        # than either input, so expect it to need a smaller weight than 'linear'.
+        return log_pa + weight * (log_pb - log_pa)
+    if mode == "max":
+        # Ignores `weight` by construction: an elementwise max has no mixing knob.
+        return torch.maximum(log_pa, log_pb)
+    raise ValueError(f"unknown --fuse {mode!r}")
+
+
+def agree_select(
+    logits_a: torch.Tensor,
+    logits_b: torch.Tensor,
+    *,
+    top_k: int,
+    student_min_prob: float,
+    teacher_min_prob: float,
+    temperature: float,
+    top_p: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Let the teacher constrain the direction and the student pick within it.
+
+    Model B is the teacher (it steers), model A is the student (it chooses). The
+    asymmetry is the point, so the two roles use the mask and the scores
+    differently:
+
+      * CONSTRAINT (teacher-led) -- a candidate must be in BOTH models' top-k, and
+        clear ``teacher_min_prob`` under B and ``student_min_prob`` under A. The
+        teacher's floor sets how wide the allowed region is; the student's floor
+        only drops tokens it would itself be very reluctant to emit.
+      * CHOICE (student-led) -- among the survivors, sample by the STUDENT's
+        distribution. Ranking by the teacher instead would collapse this to the
+        teacher's own argmax almost every step, leaving the student a veto and no
+        say -- which is not the intended division of labour.
+      * FALLBACK -- when nothing survives there is no agreement to honour, so the
+        step defers to the model steering direction: sample from the TEACHER.
+
+    Sampling, not argmax, in both branches: an argmax fallback would pin every
+    disagreeing position to one fixed token, so a sequence's diversity would decay
+    with each fallback and ``--n-samples > 1`` would stop meaning anything.
+    ``temperature == 0`` still gives greedy behaviour on both paths.
+
+    Returns (token ids [B, 1], fell_back [B] bool) so the caller can report how
+    often the agreement actually bound anything. A rate near 1.0 means the run is
+    effectively plain teacher decoding and the intersection is doing no work.
+    """
+    log_pa = F.log_softmax(logits_a.float(), dim=-1)
+    log_pb = F.log_softmax(logits_b.float(), dim=-1)
+    k = min(top_k, log_pa.size(-1))
+
+    # Membership masks over the FULL vocab, so the intersection is a plain AND
+    # rather than a set-of-ids comparison (which would need a loop per row).
+    in_a = torch.zeros_like(log_pa, dtype=torch.bool)
+    in_b = torch.zeros_like(log_pb, dtype=torch.bool)
+    in_a.scatter_(-1, log_pa.topk(k, dim=-1).indices, True)
+    in_b.scatter_(-1, log_pb.topk(k, dim=-1).indices, True)
+
+    # Compare in log space; a floor of 0 becomes -inf, which every finite log-prob
+    # clears, so it disables that side's threshold.
+    def _floor(value: float) -> torch.Tensor:
+        return torch.log(torch.tensor(value, device=log_pa.device, dtype=log_pa.dtype))
+
+    eligible = (
+        in_a & in_b
+        & (log_pa >= _floor(student_min_prob))
+        & (log_pb >= _floor(teacher_min_prob))
+    )
+    fell_back = ~eligible.any(dim=-1)
+
+    # Student chooses inside the allowed set; teacher decides the fallback rows.
+    # Renormalising is not needed -- sample_next softmaxes, and the -inf entries
+    # drop out of it -- but the masked rows must not be all -inf, which is why
+    # fallback rows are routed to the teacher's unmasked distribution instead.
+    student_scores = log_pa.masked_fill(~eligible, float("-inf"))
+    scores = torch.where(fell_back.unsqueeze(-1), log_pb, student_scores)
+
+    # top_k is already enforced by the intersection above, so only top_p is left to
+    # apply here; passing top_k again would re-cut the (already tiny) survivor set.
+    chosen = sample_next(scores, temperature, top_p, -1)
+    return chosen, fell_back
+
+
+def sample_next(scores: torch.Tensor, temperature: float, top_p: float, top_k: int) -> torch.Tensor:
+    """Pick the next token id per row. Mirrors naive_rollout.py:77-88, plus top-p.
+
+    ``temperature == 0`` means greedy, which is what makes the output a
+    deterministic fingerprint of the weights (the trick smoke_dual_vllm.py:21-24
+    relies on).
+    """
+    if temperature == 0.0:
+        return scores.argmax(dim=-1, keepdim=True)
+
+    scores = scores / temperature
+    if top_k > 0:
+        kth = torch.topk(scores, min(top_k, scores.size(-1)), dim=-1).values[:, -1:]
+        scores = scores.masked_fill(scores < kth, float("-inf"))
+    if top_p < 1.0:
+        ordered, order = torch.sort(scores, descending=True, dim=-1)
+        cumulative = ordered.softmax(dim=-1).cumsum(dim=-1)
+        # Shift by one so the token that crosses the threshold is kept: otherwise
+        # top_p smaller than the top token's probability would mask everything.
+        drop = cumulative - ordered.softmax(dim=-1) > top_p
+        ordered = ordered.masked_fill(drop, float("-inf"))
+        scores = torch.empty_like(scores).scatter_(-1, order, ordered)
+    return torch.multinomial(scores.softmax(dim=-1), num_samples=1)
+
+
+# ---------------------------------------------------------------------------
+# decoding
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def joint_generate(model_a, model_b, batch_a, batch_b, *, eos_ids, pad_id, args):
+    """Decode one batch under both models, fusing per token.
+
+    ``batch_a`` / ``batch_b`` are the two tokenised prompt sides. They may differ
+    in content AND length (A can see the bare question while B sees a richer
+    prompt) -- only the GENERATED suffix has to stay aligned, which it does
+    because both models are fed the same sampled token each step. This is the
+    same split the trainer's sr_logprob_prompt uses.
+
+    Returns (responses [B, T] padded with pad_id, lengths [B], n_fallback, n_decided).
+    The last two are teacher-fallback counters for ``--fuse agree`` and stay 0 for
+    the other modes.
+    """
+    device = next(model_a.parameters()).device
+    ids_a = batch_a["input_ids"].to(device)
+    mask_a = batch_a["attention_mask"].to(device)
+    ids_b = batch_b["input_ids"].to(device)
+    mask_b = batch_b["attention_mask"].to(device)
+    n_rows = ids_a.size(0)
+
+    # Left-padded prompts: position_ids must start from 0 at the first REAL token,
+    # so build them from the mask rather than arange. A wrong offset here shifts
+    # RoPE and corrupts generation silently.
+    pos_a = (mask_a.cumsum(dim=-1) - 1).clamp(min=0)
+    pos_b = (mask_b.cumsum(dim=-1) - 1).clamp(min=0)
+
+    out_a = model_a(input_ids=ids_a, attention_mask=mask_a, position_ids=pos_a, use_cache=True)
+    out_b = model_b(input_ids=ids_b, attention_mask=mask_b, position_ids=pos_b, use_cache=True)
+    kv_a, kv_b = out_a.past_key_values, out_b.past_key_values
+    last_a, last_b = out_a.logits[:, -1, :], out_b.logits[:, -1, :]
+    next_pos_a = pos_a[:, -1:] + 1
+    next_pos_b = pos_b[:, -1:] + 1
+
+    collected = []
+    lengths = torch.zeros(n_rows, dtype=torch.long, device=device)
+    unfinished = torch.ones(n_rows, dtype=torch.bool, device=device)
+    eos_tensor = torch.tensor(eos_ids, device=device)
+    # Only meaningful for --fuse agree: how many emitted tokens came from the
+    # teacher fallback rather than from an agreed-upon candidate.
+    n_fallback = 0
+    n_decided = 0
+
+    for _ in range(args.max_new_tokens):
+        if args.fuse == "agree":
+            nxt, fell_back = agree_select(
+                last_a, last_b,
+                top_k=args.agree_top_k,
+                student_min_prob=args.agree_student_min_prob,
+                teacher_min_prob=args.agree_teacher_min_prob,
+                temperature=args.temperature,
+                top_p=args.top_p,
+            )
+            # Count only live rows: finished ones would inflate the rate with tokens
+            # that get trimmed off anyway.
+            n_fallback += int((fell_back & unfinished).sum().item())
+            n_decided += int(unfinished.sum().item())
+        else:
+            scores = fuse_logits(last_a, last_b, args.fuse, args.fuse_weight)
+            nxt = sample_next(scores, args.temperature, args.top_p, args.top_k)
+
+        # Finished rows emit pad and stop counting, but keep stepping so the batch
+        # stays rectangular -- their tokens are trimmed off at the end.
+        nxt = torch.where(unfinished.unsqueeze(-1), nxt, torch.full_like(nxt, pad_id))
+        collected.append(nxt)
+        lengths += unfinished.long()
+        # nxt is [B, 1] and eos_tensor is [n_eos], so the comparison broadcasts to
+        # [B, n_eos] and any(-1) collapses back to [B].
+        unfinished = unfinished & ~(nxt == eos_tensor).any(dim=-1)
+        if not unfinished.any():
+            break
+
+        mask_a = torch.cat([mask_a, torch.ones_like(nxt)], dim=-1)
+        mask_b = torch.cat([mask_b, torch.ones_like(nxt)], dim=-1)
+        step_a = model_a(input_ids=nxt, attention_mask=mask_a, position_ids=next_pos_a,
+                         past_key_values=kv_a, use_cache=True)
+        step_b = model_b(input_ids=nxt, attention_mask=mask_b, position_ids=next_pos_b,
+                         past_key_values=kv_b, use_cache=True)
+        kv_a, kv_b = step_a.past_key_values, step_b.past_key_values
+        last_a, last_b = step_a.logits[:, -1, :], step_b.logits[:, -1, :]
+        next_pos_a = next_pos_a + 1
+        next_pos_b = next_pos_b + 1
+
+    responses = torch.cat(collected, dim=-1) if collected else torch.zeros((n_rows, 0), dtype=torch.long)
+    return responses.cpu(), lengths.cpu(), n_fallback, n_decided
+
+
+# ---------------------------------------------------------------------------
+# prompts
+# ---------------------------------------------------------------------------
+def render(tokenizer, chats, max_length):
+    """Left-pad a batch of chat prompts, the way main_generation.py:138-147 does."""
+    return tokenizer.apply_chat_template(
+        chats,
+        add_generation_prompt=True,
+        padding=True,
+        truncation=True,
+        max_length=max_length,
+        return_tensors="pt",
+        return_dict=True,
+        tokenize=True,
+    )
+
+
+def as_chat(cell):
+    """Normalise one prompt cell to a list of {role, content} dicts."""
+    items = [dict(m) for m in list(cell)]
+    if items and "role" in items[0]:
+        return items
+    raise ValueError("prompt cell is not a flat [{role, content}] list; build the eval "
+                     "parquet with Data/prepare_rephrase_eval.py")
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--model-a", required=True, help="Model that is being steered (the 'base').")
+    p.add_argument("--model-b", required=True, help="Model whose distribution is mixed in.")
+    p.add_argument("--input", type=Path, required=True,
+                   help="Eval parquet with a flat prompt column (Data/prepare_rephrase_eval.py).")
+    p.add_argument("--output-dir", type=Path, required=True,
+                   help="Directory for the per-rank shards; read back with glob('*.parquet').")
+    p.add_argument("--prompt-key", default="prompt", help="Prompt column for model A (default: %(default)s)")
+    p.add_argument("--prompt-key-b", default=None,
+                   help="Prompt column for model B. Defaults to --prompt-key, i.e. both models see the "
+                        "same prompt and the fusion is purely a model difference.")
+    p.add_argument("--fuse", default="linear", choices=("linear", "contrastive", "max", "agree"),
+                   help="How to combine the two models. linear/contrastive/max blend the "
+                        "distributions and then sample; 'agree' lets the teacher (model B) "
+                        "constrain which tokens are allowed and the student (model A) sample "
+                        "among them, deferring to the teacher when they do not overlap "
+                        "(default: %(default)s)")
+    p.add_argument("--fuse-weight", type=float, default=0.5,
+                   help="Mixing weight on model B. 0 == model A alone. Unused by --fuse agree "
+                        "(default: %(default)s)")
+    p.add_argument("--agree-top-k", type=int, default=10,
+                   help="--fuse agree: size of each model's candidate set before intersecting "
+                        "(default: %(default)s)")
+    p.add_argument("--agree-teacher-min-prob", type=float, default=0.05,
+                   help="--fuse agree: a candidate needs p >= this under the TEACHER (model B). "
+                        "This is the knob that sets how wide the allowed region is. 0 disables "
+                        "it (default: %(default)s)")
+    p.add_argument("--agree-student-min-prob", type=float, default=0.0,
+                   help="--fuse agree: a candidate needs p >= this under the STUDENT (model A). "
+                        "Defaults to 0 -- the student already ranks the survivors, so this only "
+                        "needs raising to exclude tokens it is very reluctant to emit "
+                        "(default: %(default)s)")
+    p.add_argument("--n-samples", type=int, default=1, help="Samples per question (default: %(default)s)")
+    p.add_argument("--temperature", type=float, default=0.6, help="0 == greedy (default: %(default)s)")
+    p.add_argument("--top-p", type=float, default=0.95)
+    p.add_argument("--top-k", type=int, default=-1, help="<=0 disables top-k (default: %(default)s)")
+    p.add_argument("--prompt-length", type=int, default=4096, help="Prompt truncation cap (default: %(default)s)")
+    p.add_argument("--max-new-tokens", type=int, default=4096)
+    p.add_argument("--batch-size", type=int, default=8,
+                   help="Rows per decode batch. Much smaller than vLLM's because there is no "
+                        "request-level scheduling here: one long row holds up its whole batch "
+                        "(default: %(default)s)")
+    p.add_argument("--limit", type=int, default=0, help="Only process the first N rows (0 = all).")
+    p.add_argument("--reward-impl-version", type=int, default=4,
+                   help="Passed to math_select_rm_score_fn; 4 = no-think math-verify, what the "
+                        "summarize/grpo scripts use (default: %(default)s)")
+    p.add_argument("--no-score", action="store_true",
+                   help="Skip scoring (no test_score column). Use when the reward fn is unavailable.")
+    return p.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    if args.temperature == 0.0 and args.n_samples > 1:
+        print(f"[warn] --temperature 0 is deterministic, so --n-samples {args.n_samples} "
+              f"just repeats identical work", file=sys.stderr)
+    if args.fuse == "agree":
+        # --top-k is the only sampling flag agree really ignores: the top-k
+        # intersection has already narrowed the candidates, so re-cutting the
+        # survivor set would be both redundant and confusing. temperature and top_p
+        # DO apply, on the student branch and the teacher fallback alike.
+        if args.top_k > 0:
+            print(f"[warn] --fuse agree ignores --top-k {args.top_k}; the candidate sets are "
+                  f"already cut by --agree-top-k {args.agree_top_k}", file=sys.stderr)
+        if args.fuse_weight != 0.5:
+            print(f"[warn] --fuse agree ignores --fuse-weight {args.fuse_weight}: it constrains "
+                  f"and selects rather than blending", file=sys.stderr)
+        for name, value in (("--agree-teacher-min-prob", args.agree_teacher_min_prob),
+                            ("--agree-student-min-prob", args.agree_student_min_prob)):
+            if not 0.0 <= value <= 1.0:
+                print(f"[fatal] {name} must be in [0, 1], got {value}", file=sys.stderr)
+                return 2
+        if args.agree_top_k < 1:
+            print(f"[fatal] --agree-top-k must be >= 1, got {args.agree_top_k}", file=sys.stderr)
+            return 2
+
+    rank = int(os.environ.get("RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    tok_a = AutoTokenizer.from_pretrained(args.model_a, trust_remote_code=True)
+    tok_b = AutoTokenizer.from_pretrained(args.model_b, trust_remote_code=True)
+    # Fusion is elementwise over the vocab axis, so a mismatched vocab silently
+    # adds up unrelated tokens' scores. The trainer only warns about this
+    # (new_ray_trainer.py:664-676); here it is fatal.
+    if tok_a.get_vocab() != tok_b.get_vocab():
+        print("[fatal] the two models have different vocabularies -- logits cannot be fused "
+              "elementwise. They must come from the same tokenizer family.", file=sys.stderr)
+        return 2
+    for tok in (tok_a, tok_b):
+        tok.padding_side = "left"
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token
+
+    df = pd.read_parquet(args.input)
+    if args.limit:
+        df = df.iloc[: args.limit]
+    prompt_key_b = args.prompt_key_b or args.prompt_key
+    for key in {args.prompt_key, prompt_key_b}:
+        if key not in df.columns:
+            print(f"[fatal] column {key!r} not in {args.input} (have: {list(df.columns)})", file=sys.stderr)
+            return 2
+
+    # Strided, not contiguous: eval sets are often ordered by difficulty or source,
+    # so a contiguous split would hand one rank all the long rows.
+    shard = df.iloc[rank::world_size].copy()
+    if rank == 0:
+        print(f"[data] {len(df):,} rows -> {world_size} rank(s); this rank: {len(shard):,}", flush=True)
+    if shard.empty:
+        print(f"[rank {rank}] no rows in this shard, nothing to do")
+        return 0
+
+    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # Plain .to(device), NOT device_map="auto": each rank owns exactly one GPU here,
+    # and letting accelerate shard a model across all of them would collide with
+    # the other ranks' models.
+    print(f"[rank {rank}] loading A={args.model_a}", flush=True)
+    model_a = AutoModelForCausalLM.from_pretrained(
+        args.model_a, torch_dtype=dtype, trust_remote_code=True).to(device).eval()
+    print(f"[rank {rank}] loading B={args.model_b}", flush=True)
+    model_b = AutoModelForCausalLM.from_pretrained(
+        args.model_b, torch_dtype=dtype, trust_remote_code=True).to(device).eval()
+
+    # Stop on real EOS only. pad_token_id is excluded on purpose: many chat models
+    # set pad == eos, but for those that do not, treating pad as a stop signal would
+    # end generation the first time the model emits a pad-ish token.
+    if tok_a.eos_token_id is None:
+        print("[fatal] model A's tokenizer has no eos_token_id, so generation would never "
+              "stop early. Set one or lower --max-new-tokens deliberately.", file=sys.stderr)
+        return 2
+    eos_ids = [tok_a.eos_token_id]
+    pad_id = tok_a.pad_token_id
+
+    chats_a = [as_chat(c) for c in shard[args.prompt_key]]
+    chats_b = [as_chat(c) for c in shard[prompt_key_b]]
+
+    # [n_rows][n_samples] -- transposed to match main_generation.py's per-row lists.
+    texts: list[list[str]] = [[] for _ in range(len(shard))]
+    tok_lens: list[list[int]] = [[] for _ in range(len(shard))]
+
+    total_tokens = 0
+    fallback_tokens = 0
+    decided_tokens = 0
+    start = torch.cuda.Event(enable_timing=True) if torch.cuda.is_available() else None
+    end = torch.cuda.Event(enable_timing=True) if torch.cuda.is_available() else None
+    if start:
+        start.record()
+
+    for sample_idx in range(args.n_samples):
+        for begin in range(0, len(shard), args.batch_size):
+            stop = min(begin + args.batch_size, len(shard))
+            batch_a = render(tok_a, chats_a[begin:stop], args.prompt_length)
+            batch_b = render(tok_b, chats_b[begin:stop], args.prompt_length)
+            responses, lengths, n_fb, n_dec = joint_generate(
+                model_a, model_b, batch_a, batch_b, eos_ids=eos_ids, pad_id=pad_id, args=args,
+            )
+            fallback_tokens += n_fb
+            decided_tokens += n_dec
+            for row in range(responses.size(0)):
+                n_tok = int(lengths[row].item())
+                ids = responses[row, :n_tok]
+                texts[begin + row].append(tok_a.decode(ids, skip_special_tokens=True))
+                tok_lens[begin + row].append(n_tok)
+                total_tokens += n_tok
+            print(f"[rank {rank}] sample {sample_idx + 1}/{args.n_samples} "
+                  f"rows {begin}-{stop - 1} done", flush=True)
+
+    if start:
+        end.record()
+        torch.cuda.synchronize()
+        seconds = start.elapsed_time(end) / 1000.0
+        print(f"[rank {rank}] {total_tokens:,} tokens in {seconds:.1f}s "
+              f"= {total_tokens / max(seconds, 1e-6):.1f} tok/s", flush=True)
+
+    if args.fuse == "agree" and decided_tokens:
+        # A rate near 1.0 means the two models almost never overlapped under these
+        # settings, so the student never got to choose and the run is really just
+        # teacher sampling -- loosen the floors or raise --agree-top-k before
+        # reading anything into the scores.
+        rate = fallback_tokens / decided_tokens
+        print(f"[rank {rank}] teacher fallback on {fallback_tokens:,}/{decided_tokens:,} "
+              f"tokens = {rate:.1%} (top_k={args.agree_top_k}, "
+              f"teacher_min_prob={args.agree_teacher_min_prob}, "
+              f"student_min_prob={args.agree_student_min_prob})", flush=True)
+
+    shard["responses"] = texts
+    shard["response_lengths"] = tok_lens
+
+    if not args.no_score:
+        # Same entry point main_generation.py:216 uses, so scores are comparable
+        # with everything else in the repo rather than a second opinion.
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "Myverl"))
+        from verl.custom.math_verify_reward import math_select_rm_score_fn
+
+        scores = []
+        for i in range(len(shard)):
+            row = shard.iloc[i]
+            score_fn = math_select_rm_score_fn(row["data_source"], reward_impl_version=args.reward_impl_version)
+            ground_truth = row["reward_model"]["ground_truth"]
+            per_response = [score_fn(solution_str=r, ground_truth=ground_truth) for r in row["responses"]]
+            scores.append({
+                "scores_per_response": per_response,
+                "mean_score": float(np.mean(per_response)),
+                "max_score": bool(np.max(per_response)),
+            })
+        shard["test_score"] = scores
+        print(f"[rank {rank}] mean_score={np.mean([s['mean_score'] for s in scores]):.4f} "
+              f"pass@{args.n_samples}={np.mean([s['max_score'] for s in scores]):.4f}", flush=True)
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    out_path = args.output_dir / f"rank{rank}.parquet"
+    shard.to_parquet(out_path, index=False)
+    print(f"[rank {rank}] {len(shard):,} rows -> {out_path}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
