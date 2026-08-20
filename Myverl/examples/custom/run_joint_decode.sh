@@ -111,6 +111,13 @@ AGREE_STUDENT_MIN_PROB=${AGREE_STUDENT_MIN_PROB:-0}
 PROMPT_KEY=${PROMPT_KEY:-prompt}
 PROMPT_KEY_B=${PROMPT_KEY_B:-}
 
+# Prefill eval sets (Data/prepare_prefill_continue.py) put a partial student answer
+# in the prompt's last message, as an assistant turn the model must RESUME. The
+# student should see it -- that is the experiment. The teacher generally should not:
+# its guidance would then be conditional on the very text being judged. Set this to
+# strip that turn from model B's side only. No effect on non-prefill prompts.
+TEACHER_DROP_PREFILL=${TEACHER_DROP_PREFILL:-1}
+
 N_SAMPLES=${N_SAMPLES:-4}          # samples per question; >1 to see sampling variance
 TEMPERATURE=${TEMPERATURE:-0.6}
 TOP_P=${TOP_P:-0.95}
@@ -189,6 +196,9 @@ for value in "${SWEEP_LIST[@]}"; do
     extra_args=()
     if [ -n "$PROMPT_KEY_B" ]; then
         extra_args+=(--prompt-key-b "$PROMPT_KEY_B")
+    fi
+    if [ "$TEACHER_DROP_PREFILL" != "0" ]; then
+        extra_args+=(--teacher-drop-prefill)
     fi
     if [ "$LIMIT" -gt 0 ]; then
         extra_args+=(--limit "$LIMIT")
