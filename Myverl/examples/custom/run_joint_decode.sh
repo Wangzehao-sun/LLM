@@ -35,12 +35,13 @@ export TOKENIZERS_PARALLELISM=true
 # plain single-model greedy run token for token. Keep 0 in the sweep and compare
 # it against main_generation.py on the same eval set before trusting any other row.
 #
-# For FUSE=agree the analogous check is the per-rank "teacher fallback" rate that
-# joint_decode.py prints: near 100% means the overlap was always empty, the student
-# never chose anything, and the run is just teacher sampling -- so the scores say
-# nothing about the method. Near 0% with a floor of 0 means the allowed set covers
-# everything, which makes it student sampling instead. The method only does work in
-# between.
+# For FUSE=agree the analogous check is the summary's "fallback" column: near 1.0
+# means the overlap was always empty, the student never chose anything, and the run
+# is just teacher sampling -- so the scores say nothing about the method. Near 0.0
+# with a floor of 0 means the allowed set covers everything, which makes it student
+# sampling instead. The method only does work in between. The "student_prob" column
+# is the other half of the picture: it falls as the constraint pushes the student off
+# its own preferences, so it prices what the constraint cost.
 #
 # Parallelism: torchrun starts one process per GPU and each decodes its own stride
 # of the rows (Data/joint_decode.py shards with iloc[rank::world_size]). The ranks
@@ -152,7 +153,7 @@ echo "model names for labels: A=$NAME_A  B=$NAME_B"
 SWEEP_DIR=${LOG_ROOT}/${EXP_NAME}
 mkdir -p "$SWEEP_DIR"
 SUMMARY="${SWEEP_DIR}/summary.tsv"
-printf 'label\tavg_score\tmax_score\tavg_len_tokens\toutput_dir\n' > "$SUMMARY"
+printf 'label\tavg_score\tmax_score\tavg_len_tokens\tfallback\tstudent_prob\toutput_dir\n' > "$SUMMARY"
 
 # The swept variable depends on the mode: a mixing weight for the blending modes,
 # a min-prob floor for the selection mode.
@@ -226,28 +227,42 @@ for value in "${SWEEP_LIST[@]}"; do
     # Recompute the metrics from the written parquets rather than scraping the log:
     # each rank prints only its own shard's mean, so the printed numbers are
     # per-rank and a short final shard would be weighted like a full one.
-    #   avg_score -- mean of per-question mean_score, i.e. overall pass rate
-    #   max_score -- mean of per-question max_score, i.e. pass@N
-    #   avg_len   -- mean response length in TOKENS. Compare it against
-    #                MAX_NEW_TOKENS to see whether generations are hitting the cap.
+    #   avg_score     -- mean of per-question mean_score, i.e. overall pass rate
+    #   max_score     -- mean of per-question max_score, i.e. pass@N
+    #   avg_len       -- mean response length in TOKENS. Compare it against
+    #                    MAX_NEW_TOKENS to see whether generations are hitting the cap.
+    #   fallback      -- share of emitted tokens that came from the teacher fallback.
+    #                    0 outside --fuse agree. This is the column that says whether
+    #                    the method did anything: ~1.0 is plain teacher sampling, ~0.0
+    #                    at a zero floor is plain student sampling.
+    #   student_prob  -- geometric-mean p_student of the emitted tokens. Falls as the
+    #                    constraint pushes the student off its own preferences, so read
+    #                    it against avg_score to see what the accuracy cost.
     metrics=$(python - "$out_dir" <<'PYEOF'
 import glob
+import math
 import sys
 
 import pandas as pd
 import pyarrow.parquet as pq
 
 files = sorted(glob.glob(f"{sys.argv[1]}/*.parquet"))
-means, maxes, lengths = [], [], []
+means, maxes, lengths, fbs, logps = [], [], [], [], []
 missing_lengths = False
+
+
+def _usable(v):
+    return v is not None and not math.isnan(v)
+
+
 for path in files:
-    # response_lengths is the per-response valid token count; a parquet written
-    # without it has to be reported as NA rather than silently measured in
-    # characters, which reads ~3x larger.
-    columns = ["test_score"]
-    if "response_lengths" in pq.read_schema(path).names:
-        columns.append("response_lengths")
-    else:
+    # These columns are all optional: a parquet written before they existed has to
+    # report NA rather than a silently wrong number (response_lengths in particular
+    # would otherwise fall back to characters, which reads ~3x larger).
+    present = set(pq.read_schema(path).names)
+    columns = ["test_score"] + [c for c in ("response_lengths", "fallback_frac",
+                                            "student_mean_logp") if c in present]
+    if "response_lengths" not in present:
         missing_lengths = True
     df = pd.read_parquet(path, columns=columns)
     for score in df["test_score"]:
@@ -256,16 +271,27 @@ for path in files:
     if "response_lengths" in df:
         for row in df["response_lengths"]:
             lengths.extend(int(n) for n in row)
+    # NaN marks a response that emitted no tokens, so there was nothing to average
+    # over. Arrow stores those as nulls, which read back as None rather than NaN, so
+    # both have to be filtered -- math.isnan(None) is a TypeError, not False.
+    if "fallback_frac" in df:
+        fbs.extend(v for row in df["fallback_frac"] for v in row if _usable(v))
+    if "student_mean_logp" in df:
+        logps.extend(v for row in df["student_mean_logp"] for v in row if _usable(v))
 
 if not means:
-    print("NA\tNA\tNA")
+    print("NA\tNA\tNA\tNA\tNA")
 else:
     avg_len = f"{sum(lengths) / len(lengths):.0f}" if lengths and not missing_lengths else "NA"
-    print(f"{sum(means) / len(means):.4f}\t{sum(maxes) / len(maxes):.4f}\t{avg_len}")
+    fb = f"{sum(fbs) / len(fbs):.4f}" if fbs else "NA"
+    # exp of the mean per-token log-prob: a geometric mean, so it is not skewed by
+    # response length the way a plain mean of probabilities would be.
+    sp = f"{math.exp(sum(logps) / len(logps)):.4f}" if logps else "NA"
+    print(f"{sum(means) / len(means):.4f}\t{sum(maxes) / len(maxes):.4f}\t{avg_len}\t{fb}\t{sp}")
 PYEOF
 )
     printf '%s\t%s\t%s\n' "$label" "$metrics" "$out_dir" >> "$SUMMARY"
-    echo "=== [$label] avg_score / max_score / avg_len_tokens: $metrics ==="
+    echo "=== [$label] avg_score / max_score / avg_len / fallback / student_prob: $metrics ==="
 done
 
 echo
@@ -273,12 +299,14 @@ echo "=== joint-decode summary ($SUMMARY) ==="
 column -t "$SUMMARY" 2>/dev/null || cat "$SUMMARY"
 echo
 if [ "$FUSE" = "agree" ]; then
-    echo "reminder: check the 'teacher fallback' rate in the per-run logs"
-    echo "  ($SWEEP_DIR/*.log). Near 100% = the overlap was always empty, so the student"
-    echo "  never chose and this is plain teacher sampling; near 0% at tmp0 = the allowed"
-    echo "  set covers everything, so it is plain student sampling. Only the middle range"
-    echo "  actually tests 'teacher steers, student picks' -- tune AGREE_TEACHER_MIN_PROBS"
-    echo "  and AGREE_TOP_K until the rate lands there."
+    echo "reminder: read the 'fallback' column above. Near 1.0 = the overlap was always"
+    echo "  empty, so the student never chose and this is plain teacher sampling; near 0.0"
+    echo "  at tmp0 = the allowed set covers everything, so it is plain student sampling."
+    echo "  Only the middle range actually tests 'teacher steers, student picks' -- tune"
+    echo "  AGREE_TEACHER_MIN_PROBS and AGREE_TOP_K until it lands there."
+    echo "  'student_prob' is the geometric-mean p_student of the emitted tokens: it falls"
+    echo "  as the constraint pushes the student off its own preferences, so read it next"
+    echo "  to avg_score to see what that constraint bought or cost."
 else
     echo "reminder: the w0 row must match a single-model run of A. With TEMPERATURE=0,"
     echo "compare it against sweep_sft_checkpoints.sh on the same EVAL_PATH -- if they"
