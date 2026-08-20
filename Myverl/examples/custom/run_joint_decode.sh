@@ -1,7 +1,7 @@
 set -x
 #!/usr/bin/env bash
 # GPU selection. Override with, for example: GPU_DEVICES=4,5,6,7
-GPU_DEVICES=${GPU_DEVICES:-${CUDA_VISIBLE_DEVICES:-4,5,6,7}}
+GPU_DEVICES=${GPU_DEVICES:-${CUDA_VISIBLE_DEVICES:-0,1,2,3}}
 export CUDA_VISIBLE_DEVICES=$GPU_DEVICES
 
 echo $HOME
@@ -125,7 +125,7 @@ MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-10240}
 # row for a 4B pair at prompt+response 8192. On an 80GB card that puts the limit
 # around 20; past that expect OOM. Raise it while watching nvidia-smi, and halve it
 # for a 7B pair.
-BATCH_SIZE=${BATCH_SIZE:-8}
+BATCH_SIZE=${BATCH_SIZE:-16}
 LIMIT=${LIMIT:-0}                  # 0 = all rows; small values for a smoke run
 
 CODE_DIR=${CODE_DIR:-$HOME/LLM}
