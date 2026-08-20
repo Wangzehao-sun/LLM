@@ -74,14 +74,14 @@ export TOKENIZERS_PARALLELISM=true
 # ---------------------------------------------------------------------------
 
 # The model being steered, and the model mixed into it.
-MODEL_A=${MODEL_A:-}
-MODEL_B=${MODEL_B:-}
-EVAL_PATH=${EVAL_PATH:-$HOME/LLM/Data/eval_rephrase_flat.parquet}
+MODEL_A=${MODEL_A:-"/home/data/shared/Qwen3-4b-base"}
+MODEL_B=${MODEL_B:-"/home/data/shared/Qwen3-4B-Instruct"}
+EVAL_PATH=${EVAL_PATH:-$HOME/LLM/Data/deepmath/prefill15_guidance.parquet}
 
 # Fusion weights on model B, one run each. 0 must stay in the list (see header).
 # Ignored when FUSE=agree, which sweeps AGREE_TEACHER_MIN_PROBS instead.
 WEIGHTS=${WEIGHTS:-0,0.25,0.5,0.75,1.0}
-FUSE=${FUSE:-linear}               # linear | contrastive | max | agree
+FUSE=${FUSE:-agree}               # linear | contrastive | max | agree
 
 # --- FUSE=agree knobs ------------------------------------------------------
 # The TEACHER (model B) constrains which tokens are allowed -- both models' top-k
@@ -96,8 +96,8 @@ FUSE=${FUSE:-linear}               # linear | contrastive | max | agree
 # distributions the top-k sets overlap almost completely, so k stops mattering
 # above ~10 while the floor still moves both the fallback rate and how often the
 # student's pick differs from the teacher's. So the sweep runs over it.
-AGREE_TEACHER_MIN_PROBS=${AGREE_TEACHER_MIN_PROBS:-0,0.02,0.05,0.1}
-AGREE_TOP_K=${AGREE_TOP_K:-10}
+AGREE_TEACHER_MIN_PROBS=${AGREE_TEACHER_MIN_PROBS:-0.1}
+AGREE_TOP_K=${AGREE_TOP_K:-20}
 # Only raise this to veto tokens the student is very reluctant to emit -- it
 # already ranks the survivors, so 0 is the natural default.
 AGREE_STUDENT_MIN_PROB=${AGREE_STUDENT_MIN_PROB:-0}
@@ -107,18 +107,18 @@ AGREE_STUDENT_MIN_PROB=${AGREE_STUDENT_MIN_PROB:-0}
 #   question_prompt -> the bare question, i.e. plain problem-solving ability
 # PROMPT_KEY_B empty = model B reads the same column as A, so the fusion is purely
 # a model difference; set it to feed B a richer prompt than A instead.
-PROMPT_KEY=${PROMPT_KEY:-prompt}
-PROMPT_KEY_B=${PROMPT_KEY_B:-}
+PROMPT_KEY=${PROMPT_KEY:-question_prompt}
+PROMPT_KEY_B=${PROMPT_KEY_B:-prompt}
 
-N_SAMPLES=${N_SAMPLES:-4}          # samples per question; >1 to see sampling variance
+N_SAMPLES=${N_SAMPLES:-1}          # samples per question; >1 to see sampling variance
 TEMPERATURE=${TEMPERATURE:-0.6}
 TOP_P=${TOP_P:-0.95}
 TOP_K=${TOP_K:--1}
 PROMPT_LENGTH=${PROMPT_LENGTH:-4096}      # rephrase prompts carry a draft, so longer than a bare question
-MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-4096}
+MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-10240}
 # Far smaller than the vLLM path's 256: there is no request-level scheduling here,
 # so the longest row in a batch holds up every other row in it.
-BATCH_SIZE=${BATCH_SIZE:-8}
+BATCH_SIZE=${BATCH_SIZE:-64}
 LIMIT=${LIMIT:-0}                  # 0 = all rows; small values for a smoke run
 
 CODE_DIR=${CODE_DIR:-$HOME/LLM}
