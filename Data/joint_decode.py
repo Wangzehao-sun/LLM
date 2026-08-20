@@ -125,6 +125,7 @@ def agree_select(
     teacher_min_prob: float,
     temperature: float,
     top_p: float,
+    fallback: str = "teacher",
     narrow_counter: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Let the teacher constrain the direction and the student pick within it.
@@ -141,8 +142,19 @@ def agree_select(
         distribution. Ranking by the teacher instead would collapse this to the
         teacher's own argmax almost every step, leaving the student a veto and no
         say -- which is not the intended division of labour.
-      * FALLBACK -- when nothing survives there is no agreement to honour, so the
-        step defers to the model steering direction: sample from the TEACHER.
+      * FALLBACK -- when nothing survives there is no agreement to honour, and
+        ``fallback`` decides who breaks the tie. These are different experiments, not
+        two spellings of one:
+
+          'teacher' -- defer to the model steering direction. The teacher gets to
+              intervene exactly where the student disagrees with it, which is the
+              aggressive reading of "the teacher steers".
+          'student' -- let the student continue on its own. The teacher then only ever
+              CONSTRAINS, never overrides: agreement narrows the student's choices and
+              nothing else. Text stays in the student's voice throughout, and a run
+              whose fallback rate is high degenerates toward plain student decoding
+              rather than plain teacher decoding -- which also flips how the fallback
+              column should be read.
 
     Sampling, not argmax, in both branches: an argmax fallback would pin every
     disagreeing position to one fixed token, so a sequence's diversity would decay
@@ -151,8 +163,9 @@ def agree_select(
 
     Returns (token ids [B, 1], fell_back [B] bool, log_pa [B, vocab]) so the caller can
     report how often the agreement actually bound anything, and reuse the student's
-    log-probs. A fallback rate near 1.0 means the run is effectively plain teacher
-    decoding and the intersection is doing no work.
+    log-probs. Under ``fallback='teacher'`` a rate near 1.0 means the run is
+    effectively plain teacher decoding; under ``'student'`` it means plain student
+    decoding. Either way the intersection is doing no work.
     """
     log_pa = F.log_softmax(logits_a.float(), dim=-1)
     log_pb = F.log_softmax(logits_b.float(), dim=-1)
@@ -177,12 +190,13 @@ def agree_select(
     )
     fell_back = ~eligible.any(dim=-1)
 
-    # Student chooses inside the allowed set; teacher decides the fallback rows.
-    # Renormalising is not needed -- sample_next softmaxes, and the -inf entries
-    # drop out of it -- but the masked rows must not be all -inf, which is why
-    # fallback rows are routed to the teacher's unmasked distribution instead.
+    # Student chooses inside the allowed set. Renormalising is not needed --
+    # sample_next softmaxes and the -inf entries drop out -- but a row masked to all
+    # -inf would give softmax nothing to sample, which is why the rows with no survivor
+    # are routed to a full, unmasked distribution instead.
     student_scores = log_pa.masked_fill(~eligible, float("-inf"))
-    scores = torch.where(fell_back.unsqueeze(-1), log_pb, student_scores)
+    fallback_scores = log_pb if fallback == "teacher" else log_pa
+    scores = torch.where(fell_back.unsqueeze(-1), fallback_scores, student_scores)
 
     # top_k is already enforced by the intersection above, so only top_p is left to
     # apply here; passing top_k again would re-cut the (already tiny) survivor set.
@@ -364,6 +378,7 @@ def joint_generate(model_a, model_b, batch_a, batch_b, *, eos_ids, pad_id, args)
                 teacher_min_prob=args.agree_teacher_min_prob,
                 temperature=args.temperature,
                 top_p=args.top_p,
+                fallback=args.agree_fallback,
                 narrow_counter=narrow,
             )
             fb_rows.index_add_(0, alive_idx, (fell_back & alive).long())
@@ -558,6 +573,13 @@ def parse_args() -> argparse.Namespace:
                         "Defaults to 0 -- the student already ranks the survivors, so this only "
                         "needs raising to exclude tokens it is very reluctant to emit "
                         "(default: %(default)s)")
+    p.add_argument("--agree-fallback", default="teacher", choices=("teacher", "student"),
+                   help="--fuse agree: who decides a step where no candidate survives the "
+                        "constraint. 'teacher' lets it override the student exactly where they "
+                        "disagree; 'student' lets the student carry on, so the teacher only ever "
+                        "narrows its choices and never overrides. This also flips what a high "
+                        "fallback rate means -- teacher decoding in the first case, student "
+                        "decoding in the second (default: %(default)s)")
     p.add_argument("--n-samples", type=int, default=1, help="Samples per question (default: %(default)s)")
     p.add_argument("--temperature", type=float, default=0.6, help="0 == greedy (default: %(default)s)")
     p.add_argument("--top-p", type=float, default=0.95)
@@ -856,12 +878,13 @@ def main() -> int:
 
     if args.fuse == "agree" and decided_tokens:
         # A rate near 1.0 means the two models almost never overlapped under these
-        # settings, so the student never got to choose and the run is really just
-        # teacher sampling -- loosen the floors or raise --agree-top-k before
+        # settings, so the constraint never bound and the run collapses to whichever
+        # model owns the fallback -- loosen the floors or raise --agree-top-k before
         # reading anything into the scores.
         rate = fallback_tokens / decided_tokens
-        print(f"[rank {rank}] teacher fallback on {fallback_tokens:,}/{decided_tokens:,} "
-              f"tokens = {rate:.1%} (top_k={args.agree_top_k}, "
+        print(f"[rank {rank}] fallback to {args.agree_fallback} on "
+              f"{fallback_tokens:,}/{decided_tokens:,} tokens = {rate:.1%} "
+              f"(top_k={args.agree_top_k}, "
               f"teacher_min_prob={args.agree_teacher_min_prob}, "
               f"student_min_prob={args.agree_student_min_prob})", flush=True)
 
