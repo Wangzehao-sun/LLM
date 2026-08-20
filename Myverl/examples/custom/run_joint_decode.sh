@@ -145,10 +145,16 @@ LIMIT=${LIMIT:-0}                  # 0 = all rows; small values for a smoke run
 # an environment set up by scripts/setup_env.sh has it. Set ATTN_IMPL=sdpa for the
 # fused PyTorch kernel (no extra install), or =auto to probe and take what loads.
 ATTN_IMPL=${ATTN_IMPL:-flash_attention_2}
-# Steps between all-rows-finished checks. Each one copies to the host and drains the
-# CUDA queue, so checking every step stalls the GPU more than the <=N-1 all-padding
-# steps a coarser check may run (those tokens get trimmed off anyway).
+# Steps between all-rows-finished checks. Each one synchronises with the host, so
+# polling every step stalls the GPU more than the <=N-1 all-padding steps a coarser
+# check may run (those tokens get trimmed anyway). Also the cadence at which finished
+# rows leave the batch.
 EOS_CHECK_EVERY=${EOS_CHECK_EVERY:-16}
+# Drop rows from the batch once they hit EOS. Generation lengths vary enormously, so a
+# batch of 8 typically has only ~a third of its row-steps doing real work, and every
+# carried row still pays its share of the KV read -- the biggest per-step cost at a 10k
+# context. Set to 0 to keep the full batch, which is only useful for isolating this.
+SHRINK_BATCH=${SHRINK_BATCH:-1}
 
 CODE_DIR=${CODE_DIR:-$HOME/LLM}
 LOG_ROOT=${LOG_ROOT:-$HOME/LLM/Train/verl/logs}
@@ -214,6 +220,9 @@ for value in "${SWEEP_LIST[@]}"; do
     fi
     if [ "$TEACHER_DROP_PREFILL" != "0" ]; then
         extra_args+=(--teacher-drop-prefill)
+    fi
+    if [ "$SHRINK_BATCH" = "0" ]; then
+        extra_args+=(--no-shrink-batch)
     fi
     if [ "$LIMIT" -gt 0 ]; then
         extra_args+=(--limit "$LIMIT")
