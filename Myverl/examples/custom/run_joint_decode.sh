@@ -125,7 +125,7 @@ MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-10240}
 # row for a 4B pair at prompt+response 8192. On an 80GB card that puts the limit
 # around 20; past that expect OOM. Raise it while watching nvidia-smi, and halve it
 # for a 7B pair.
-BATCH_SIZE=${BATCH_SIZE:-16}
+BATCH_SIZE=${BATCH_SIZE:-8}
 LIMIT=${LIMIT:-0}                  # 0 = all rows; small values for a smoke run
 
 CODE_DIR=${CODE_DIR:-$HOME/LLM}
