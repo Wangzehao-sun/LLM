@@ -60,6 +60,7 @@ the KV cache and masks are wired correctly.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 from pathlib import Path
@@ -209,6 +210,35 @@ def sample_next(scores: torch.Tensor, temperature: float, top_p: float, top_k: i
 # ---------------------------------------------------------------------------
 # decoding
 # ---------------------------------------------------------------------------
+def last_logit_kwargs(model) -> dict:
+    """Ask the model for the LAST position's logits only, if it supports it.
+
+    Prefill computes logits for every prompt position, and only the last one is
+    ever read. At a 152k vocab that waste dominates the memory profile:
+    [8, 4096, 151936] in bf16 is ~10GB per model, ~20GB for the pair, versus 2.4MB
+    for the single position actually used -- and it scales with --batch-size, so 16
+    rows would throw away ~40GB. Dropping it moves the binding constraint to the KV
+    cache (~2.4GB per row for a 4B pair at 8192), which lifts the usable batch on an
+    80GB card from about 8 to about 20.
+
+    The flag exists for exactly this, but was renamed mid-flight
+    (num_logits_to_keep -> logits_to_keep), and older versions have neither. So
+    inspect the signature instead of guessing, and return {} when it is absent --
+    the maths is identical either way, only the footprint changes.
+    """
+    import inspect
+
+    try:
+        params = inspect.signature(model.forward).parameters
+    except (TypeError, ValueError):
+        return {}
+    for name in ("logits_to_keep", "num_logits_to_keep"):
+        if name in params:
+            return {name: 1}
+    # **kwargs-only signatures cannot be probed; skipping is the safe answer.
+    return {}
+
+
 @torch.no_grad()
 def joint_generate(model_a, model_b, batch_a, batch_b, *, eos_ids, pad_id, args):
     """Decode one batch under both models, fusing per token.
@@ -219,9 +249,10 @@ def joint_generate(model_a, model_b, batch_a, batch_b, *, eos_ids, pad_id, args)
     because both models are fed the same sampled token each step. This is the
     same split the trainer's sr_logprob_prompt uses.
 
-    Returns (responses [B, T] padded with pad_id, lengths [B], n_fallback, n_decided).
-    The last two are teacher-fallback counters for ``--fuse agree`` and stay 0 for
-    the other modes.
+    Returns (responses [B, T] padded with pad_id, lengths [B], fb_rows [B],
+    logp_rows [B]). fb_rows counts teacher-fallback tokens per row and stays 0
+    outside ``--fuse agree``; logp_rows sums log p_student over the emitted tokens,
+    so dividing by lengths gives a per-row mean.
     """
     device = next(model_a.parameters()).device
     ids_a = batch_a["input_ids"].to(device)
@@ -236,9 +267,18 @@ def joint_generate(model_a, model_b, batch_a, batch_b, *, eos_ids, pad_id, args)
     pos_a = (mask_a.cumsum(dim=-1) - 1).clamp(min=0)
     pos_b = (mask_b.cumsum(dim=-1) - 1).clamp(min=0)
 
-    out_a = model_a(input_ids=ids_a, attention_mask=mask_a, position_ids=pos_a, use_cache=True)
-    out_b = model_b(input_ids=ids_b, attention_mask=mask_b, position_ids=pos_b, use_cache=True)
+    # Probed once per batch, not per step: inspect.signature is not free and the
+    # answer cannot change mid-decode.
+    keep_a = last_logit_kwargs(model_a)
+    keep_b = last_logit_kwargs(model_b)
+
+    out_a = model_a(input_ids=ids_a, attention_mask=mask_a, position_ids=pos_a,
+                    use_cache=True, **keep_a)
+    out_b = model_b(input_ids=ids_b, attention_mask=mask_b, position_ids=pos_b,
+                    use_cache=True, **keep_b)
     kv_a, kv_b = out_a.past_key_values, out_b.past_key_values
+    # [:, -1, :] regardless: with the flag the tensor is already [B, 1, V], without
+    # it this is the slice that discards the unused positions.
     last_a, last_b = out_a.logits[:, -1, :], out_b.logits[:, -1, :]
     next_pos_a = pos_a[:, -1:] + 1
     next_pos_b = pos_b[:, -1:] + 1
@@ -247,10 +287,15 @@ def joint_generate(model_a, model_b, batch_a, batch_b, *, eos_ids, pad_id, args)
     lengths = torch.zeros(n_rows, dtype=torch.long, device=device)
     unfinished = torch.ones(n_rows, dtype=torch.bool, device=device)
     eos_tensor = torch.tensor(eos_ids, device=device)
-    # Only meaningful for --fuse agree: how many emitted tokens came from the
-    # teacher fallback rather than from an agreed-upon candidate.
-    n_fallback = 0
-    n_decided = 0
+    # Per-ROW rather than per-batch, so the caller can put these next to each row in
+    # the parquet and the summary can average over questions the same way it
+    # averages scores.
+    #   fb_rows      -- tokens that came from the teacher fallback (agree only)
+    #   logp_rows    -- sum of log p_student for the tokens actually emitted
+    # Both count live rows only: a finished row's tokens are trimmed off later, so
+    # including them would dilute the averages with padding.
+    fb_rows = torch.zeros(n_rows, dtype=torch.long, device=device)
+    logp_rows = torch.zeros(n_rows, dtype=torch.float64, device=device)
 
     for _ in range(args.max_new_tokens):
         if args.fuse == "agree":
@@ -262,10 +307,7 @@ def joint_generate(model_a, model_b, batch_a, batch_b, *, eos_ids, pad_id, args)
                 temperature=args.temperature,
                 top_p=args.top_p,
             )
-            # Count only live rows: finished ones would inflate the rate with tokens
-            # that get trimmed off anyway.
-            n_fallback += int((fell_back & unfinished).sum().item())
-            n_decided += int(unfinished.sum().item())
+            fb_rows += (fell_back & unfinished).long()
         else:
             scores = fuse_logits(last_a, last_b, args.fuse, args.fuse_weight)
             nxt = sample_next(scores, args.temperature, args.top_p, args.top_k)
@@ -273,6 +315,13 @@ def joint_generate(model_a, model_b, batch_a, batch_b, *, eos_ids, pad_id, args)
         # Finished rows emit pad and stop counting, but keep stepping so the batch
         # stays rectangular -- their tokens are trimmed off at the end.
         nxt = torch.where(unfinished.unsqueeze(-1), nxt, torch.full_like(nxt, pad_id))
+        # How confident the STUDENT was in the token that was actually emitted --
+        # read off log p_a, not off the fused/masked scores, so the number means the
+        # same thing in every --fuse mode and stays comparable to a single-model run.
+        # Taken before the row is marked finished, so the EOS token itself counts
+        # (matching how `lengths` counts it).
+        step_logp = F.log_softmax(last_a.float(), dim=-1).gather(-1, nxt).squeeze(-1)
+        logp_rows += torch.where(unfinished, step_logp.double(), torch.zeros_like(logp_rows))
         collected.append(nxt)
         lengths += unfinished.long()
         # nxt is [B, 1] and eos_tensor is [n_eos], so the comparison broadcasts to
@@ -283,6 +332,8 @@ def joint_generate(model_a, model_b, batch_a, batch_b, *, eos_ids, pad_id, args)
 
         mask_a = torch.cat([mask_a, torch.ones_like(nxt)], dim=-1)
         mask_b = torch.cat([mask_b, torch.ones_like(nxt)], dim=-1)
+        # No keep-last kwarg here: these feed a single token, so the logits are
+        # already [B, 1, V] and the flag would be a no-op.
         step_a = model_a(input_ids=nxt, attention_mask=mask_a, position_ids=next_pos_a,
                          past_key_values=kv_a, use_cache=True)
         step_b = model_b(input_ids=nxt, attention_mask=mask_b, position_ids=next_pos_b,
@@ -293,7 +344,7 @@ def joint_generate(model_a, model_b, batch_a, batch_b, *, eos_ids, pad_id, args)
         next_pos_b = next_pos_b + 1
 
     responses = torch.cat(collected, dim=-1) if collected else torch.zeros((n_rows, 0), dtype=torch.long)
-    return responses.cpu(), lengths.cpu(), n_fallback, n_decided
+    return responses.cpu(), lengths.cpu(), fb_rows.cpu(), logp_rows.cpu()
 
 
 # ---------------------------------------------------------------------------
@@ -451,6 +502,21 @@ def main() -> int:
     model_b = AutoModelForCausalLM.from_pretrained(
         args.model_b, torch_dtype=dtype, trust_remote_code=True).to(device).eval()
 
+    # Say which way it went. Silently falling back is the dangerous case: the run
+    # still produces correct output, just with ~20GB of prefill logits it never
+    # reads, which shows up much later as an OOM the moment --batch-size is raised.
+    if rank == 0:
+        keep = last_logit_kwargs(model_a)
+        if keep:
+            print(f"[mem] prefill keeps last logit only ({next(iter(keep))}=1)", flush=True)
+        else:
+            v = getattr(model_a.config, "vocab_size", 0)
+            waste = args.batch_size * args.prompt_length * v * 2 * 2 / 1e9
+            print(f"[mem] this transformers has no logits_to_keep/num_logits_to_keep, so "
+                  f"prefill materialises logits for every position: about {waste:.1f} GB "
+                  f"across both models at --batch-size {args.batch_size}. Output is "
+                  f"unaffected; lower --batch-size if it OOMs.", file=sys.stderr, flush=True)
+
     # Stop on real EOS only. pad_token_id is excluded on purpose: many chat models
     # set pad == eos, but for those that do not, treating pad as a stop signal would
     # end generation the first time the model emits a pad-ish token.
@@ -467,6 +533,8 @@ def main() -> int:
     # [n_rows][n_samples] -- transposed to match main_generation.py's per-row lists.
     texts: list[list[str]] = [[] for _ in range(len(shard))]
     tok_lens: list[list[int]] = [[] for _ in range(len(shard))]
+    fb_frac: list[list[float]] = [[] for _ in range(len(shard))]
+    mean_logp: list[list[float]] = [[] for _ in range(len(shard))]
 
     total_tokens = 0
     fallback_tokens = 0
@@ -476,31 +544,74 @@ def main() -> int:
     if start:
         start.record()
 
+    # One bar, on rank 0 only: four ranks each drawing their own would interleave
+    # into unreadable output, and `tee`ing that to a log file leaves it full of
+    # cursor-movement escapes. The shards differ in length by at most one row, so
+    # rank 0's progress tracks the whole job closely enough. Other ranks print a
+    # line per batch instead (below), which is coarse but keeps their logs plain.
+    n_batches = -(-len(shard) // args.batch_size) * args.n_samples
+    bar = None
+    if rank == 0:
+        from tqdm import tqdm
+
+        bar = tqdm(total=n_batches, desc=f"decode ({args.fuse})", unit="batch")
+
     for sample_idx in range(args.n_samples):
         for begin in range(0, len(shard), args.batch_size):
             stop = min(begin + args.batch_size, len(shard))
             batch_a = render(tok_a, chats_a[begin:stop], args.prompt_length)
             batch_b = render(tok_b, chats_b[begin:stop], args.prompt_length)
-            responses, lengths, n_fb, n_dec = joint_generate(
+            responses, lengths, fb_row, logp_row = joint_generate(
                 model_a, model_b, batch_a, batch_b, eos_ids=eos_ids, pad_id=pad_id, args=args,
             )
-            fallback_tokens += n_fb
-            decided_tokens += n_dec
             for row in range(responses.size(0)):
                 n_tok = int(lengths[row].item())
                 ids = responses[row, :n_tok]
                 texts[begin + row].append(tok_a.decode(ids, skip_special_tokens=True))
                 tok_lens[begin + row].append(n_tok)
+                # Guard the empty-response case: a row that emitted nothing has no
+                # tokens to average over, so report NaN rather than 0/0. NaN also
+                # keeps it out of the summary means instead of dragging them down.
+                n_fb = int(fb_row[row].item())
+                fb_frac[begin + row].append(n_fb / n_tok if n_tok else float("nan"))
+                mean_logp[begin + row].append(
+                    float(logp_row[row].item()) / n_tok if n_tok else float("nan")
+                )
+                fallback_tokens += n_fb
+                decided_tokens += n_tok
                 total_tokens += n_tok
-            print(f"[rank {rank}] sample {sample_idx + 1}/{args.n_samples} "
-                  f"rows {begin}-{stop - 1} done", flush=True)
+            if bar is not None:
+                # tok/s is the number that decides whether this path is fast enough
+                # to be worth keeping, so surface it live rather than only in the
+                # final summary. tqdm's own rate is batches/s, which hides the fact
+                # that batches vary hugely in generated length.
+                bar.update(1)
+                bar.set_postfix(sample=f"{sample_idx + 1}/{args.n_samples}",
+                                tok_s=f"{total_tokens / max(bar.format_dict['elapsed'], 1e-6):.0f}")
+            else:
+                print(f"[rank {rank}] sample {sample_idx + 1}/{args.n_samples} "
+                      f"rows {begin}-{stop - 1} done", flush=True)
 
+    if bar is not None:
+        bar.close()
     if start:
         end.record()
         torch.cuda.synchronize()
         seconds = start.elapsed_time(end) / 1000.0
         print(f"[rank {rank}] {total_tokens:,} tokens in {seconds:.1f}s "
               f"= {total_tokens / max(seconds, 1e-6):.1f} tok/s", flush=True)
+
+    if decided_tokens:
+        # Mean p_student over the tokens actually emitted -- exp of a per-token mean
+        # log-prob, so it is a geometric mean and does not depend on length. Reported
+        # for every mode: it says how natural the emitted text was to the student,
+        # which is exactly what the constraint trades away.
+        # NaN marks a response that emitted nothing, so it has no mean to contribute.
+        finite = [v for row in mean_logp for v in row if not math.isnan(v)]
+        if finite:
+            mean = sum(finite) / len(finite)
+            print(f"[rank {rank}] student mean logp={mean:.4f} "
+                  f"(geometric-mean prob {math.exp(mean):.4f})", flush=True)
 
     if args.fuse == "agree" and decided_tokens:
         # A rate near 1.0 means the two models almost never overlapped under these
@@ -514,6 +625,8 @@ def main() -> int:
               f"student_min_prob={args.agree_student_min_prob})", flush=True)
 
     shard["responses"] = texts
+    shard["fallback_frac"] = fb_frac
+    shard["student_mean_logp"] = mean_logp
     shard["response_lengths"] = tok_lens
 
     if not args.no_score:
