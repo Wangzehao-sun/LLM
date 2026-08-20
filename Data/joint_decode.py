@@ -120,7 +120,8 @@ def agree_select(
     logits_a: torch.Tensor,
     logits_b: torch.Tensor,
     *,
-    top_k: int,
+    student_top_k: int,
+    teacher_top_k: int,
     student_min_prob: float,
     teacher_min_prob: float,
     temperature: float,
@@ -135,9 +136,12 @@ def agree_select(
     differently:
 
       * CONSTRAINT (teacher-led) -- a candidate must be in BOTH models' top-k, and
-        clear ``teacher_min_prob`` under B and ``student_min_prob`` under A. The
-        teacher's floor sets how wide the allowed region is; the student's floor
-        only drops tokens it would itself be very reluctant to emit.
+        clear ``teacher_min_prob`` under B and ``student_min_prob`` under A. The two k's
+        are separate knobs because they mean different things: the teacher's bounds how
+        much of the vocabulary it permits at all, the student's bounds how far down its
+        own ranking it will look for something permitted. The teacher's floor sets how
+        wide the allowed region is; the student's floor only drops tokens it would
+        itself be very reluctant to emit.
       * CHOICE (student-led) -- among the survivors, sample by the STUDENT's
         distribution. Ranking by the teacher instead would collapse this to the
         teacher's own argmax almost every step, leaving the student a veto and no
@@ -169,14 +173,19 @@ def agree_select(
     """
     log_pa = F.log_softmax(logits_a.float(), dim=-1)
     log_pb = F.log_softmax(logits_b.float(), dim=-1)
-    k = min(top_k, log_pa.size(-1))
+    vocab = log_pa.size(-1)
 
     # Membership masks over the FULL vocab, so the intersection is a plain AND
     # rather than a set-of-ids comparison (which would need a loop per row).
+    # The two k's are separate because the roles are: the teacher's sets how much of
+    # the vocabulary it is willing to permit at all, while the student's sets how far
+    # down its own ranking it is willing to look for something permitted. Raising only
+    # the student's therefore lets it reach further for an agreed token instead of
+    # falling back, without widening what the teacher allows.
     in_a = torch.zeros_like(log_pa, dtype=torch.bool)
     in_b = torch.zeros_like(log_pb, dtype=torch.bool)
-    in_a.scatter_(-1, log_pa.topk(k, dim=-1).indices, True)
-    in_b.scatter_(-1, log_pb.topk(k, dim=-1).indices, True)
+    in_a.scatter_(-1, log_pa.topk(min(student_top_k, vocab), dim=-1).indices, True)
+    in_b.scatter_(-1, log_pb.topk(min(teacher_top_k, vocab), dim=-1).indices, True)
 
     # Compare in log space; a floor of 0 becomes -inf, which every finite log-prob
     # clears, so it disables that side's threshold.
@@ -373,7 +382,8 @@ def joint_generate(model_a, model_b, batch_a, batch_b, *, eos_ids, pad_id, args)
         if args.fuse == "agree":
             nxt, fell_back, log_pa = agree_select(
                 last_a, last_b,
-                top_k=args.agree_top_k,
+                student_top_k=args.agree_student_top_k,
+                teacher_top_k=args.agree_teacher_top_k,
                 student_min_prob=args.agree_student_min_prob,
                 teacher_min_prob=args.agree_teacher_min_prob,
                 temperature=args.temperature,
@@ -562,8 +572,17 @@ def parse_args() -> argparse.Namespace:
                    help="Mixing weight on model B. 0 == model A alone. Unused by --fuse agree "
                         "(default: %(default)s)")
     p.add_argument("--agree-top-k", type=int, default=10,
-                   help="--fuse agree: size of each model's candidate set before intersecting "
-                        "(default: %(default)s)")
+                   help="--fuse agree: default candidate-set size for BOTH models before "
+                        "intersecting. Override either side with --agree-student-top-k / "
+                        "--agree-teacher-top-k (default: %(default)s)")
+    p.add_argument("--agree-student-top-k", type=int, default=None,
+                   help="--fuse agree: how far down the STUDENT's own ranking it will look for "
+                        "a permitted token. Raising this alone lets it reach further for an "
+                        "agreed token instead of falling back, without widening what the "
+                        "teacher allows. Defaults to --agree-top-k.")
+    p.add_argument("--agree-teacher-top-k", type=int, default=None,
+                   help="--fuse agree: how much of the vocabulary the TEACHER permits at all. "
+                        "This is the width of the allowed region. Defaults to --agree-top-k.")
     p.add_argument("--agree-teacher-min-prob", type=float, default=0.05,
                    help="--fuse agree: a candidate needs p >= this under the TEACHER (model B). "
                         "This is the knob that sets how wide the allowed region is. 0 disables "
@@ -623,13 +642,20 @@ def main() -> int:
         print(f"[warn] --temperature 0 is deterministic, so --n-samples {args.n_samples} "
               f"just repeats identical work", file=sys.stderr)
     if args.fuse == "agree":
+        # Resolve the per-side k's here rather than at each use, so the rest of the run
+        # (including the log lines) sees the values actually in force.
+        if args.agree_student_top_k is None:
+            args.agree_student_top_k = args.agree_top_k
+        if args.agree_teacher_top_k is None:
+            args.agree_teacher_top_k = args.agree_top_k
         # --top-k is the only sampling flag agree really ignores: the top-k
         # intersection has already narrowed the candidates, so re-cutting the
         # survivor set would be both redundant and confusing. temperature and top_p
         # DO apply, on the student branch and the teacher fallback alike.
         if args.top_k > 0:
             print(f"[warn] --fuse agree ignores --top-k {args.top_k}; the candidate sets are "
-                  f"already cut by --agree-top-k {args.agree_top_k}", file=sys.stderr)
+                  f"already cut by --agree-student-top-k {args.agree_student_top_k} / "
+                  f"--agree-teacher-top-k {args.agree_teacher_top_k}", file=sys.stderr)
         if args.fuse_weight != 0.5:
             print(f"[warn] --fuse agree ignores --fuse-weight {args.fuse_weight}: it constrains "
                   f"and selects rather than blending", file=sys.stderr)
@@ -638,9 +664,11 @@ def main() -> int:
             if not 0.0 <= value <= 1.0:
                 print(f"[fatal] {name} must be in [0, 1], got {value}", file=sys.stderr)
                 return 2
-        if args.agree_top_k < 1:
-            print(f"[fatal] --agree-top-k must be >= 1, got {args.agree_top_k}", file=sys.stderr)
-            return 2
+        for name, value in (("--agree-student-top-k", args.agree_student_top_k),
+                            ("--agree-teacher-top-k", args.agree_teacher_top_k)):
+            if value < 1:
+                print(f"[fatal] {name} must be >= 1, got {value}", file=sys.stderr)
+                return 2
 
     rank = int(os.environ.get("RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -879,12 +907,14 @@ def main() -> int:
     if args.fuse == "agree" and decided_tokens:
         # A rate near 1.0 means the two models almost never overlapped under these
         # settings, so the constraint never bound and the run collapses to whichever
-        # model owns the fallback -- loosen the floors or raise --agree-top-k before
-        # reading anything into the scores.
+        # model owns the fallback. Raising --agree-student-top-k is usually the cheapest
+        # response: it lets the student reach further down its own ranking for a token
+        # the teacher already permits, without widening what the teacher permits.
         rate = fallback_tokens / decided_tokens
         print(f"[rank {rank}] fallback to {args.agree_fallback} on "
               f"{fallback_tokens:,}/{decided_tokens:,} tokens = {rate:.1%} "
-              f"(top_k={args.agree_top_k}, "
+              f"(student_top_k={args.agree_student_top_k}, "
+              f"teacher_top_k={args.agree_teacher_top_k}, "
               f"teacher_min_prob={args.agree_teacher_min_prob}, "
               f"student_min_prob={args.agree_student_min_prob})", flush=True)
 
