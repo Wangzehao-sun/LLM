@@ -35,13 +35,14 @@ export TOKENIZERS_PARALLELISM=true
 # plain single-model greedy run token for token. Keep 0 in the sweep and compare
 # it against main_generation.py on the same eval set before trusting any other row.
 #
-# For FUSE=agree the analogous check is the summary's "fallback" column: near 1.0
-# means the overlap was always empty, the student never chose anything, and the run
-# is just teacher sampling -- so the scores say nothing about the method. Near 0.0
-# with a floor of 0 means the allowed set covers everything, which makes it student
-# sampling instead. The method only does work in between. The "student_prob" column
-# is the other half of the picture: it falls as the constraint pushes the student off
-# its own preferences, so it prices what the constraint cost.
+# For FUSE=agree the analogous check is the summary's "fallback" column: the share of
+# tokens where the constraint left no candidate, so AGREE_FALLBACK decided instead. Near
+# 1.0 means the overlap was almost always empty and the run collapsed to plain decoding
+# by whoever owns the fallback -- so the scores say nothing about the method. Near 0.0
+# with a floor of 0 means the allowed set covers everything, which makes it plain student
+# decoding. The method only does work in between. The "student_prob" column is the other
+# half of the picture: it falls as the constraint pushes the student off its own
+# preferences, so it prices what the constraint cost.
 #
 # Parallelism: torchrun starts one process per GPU and each decodes its own stride
 # of the rows (Data/joint_decode.py shards with iloc[rank::world_size]). The ranks
@@ -102,6 +103,15 @@ AGREE_TOP_K=${AGREE_TOP_K:-20}
 # Only raise this to veto tokens the student is very reluctant to emit -- it
 # already ranks the survivors, so 0 is the natural default.
 AGREE_STUDENT_MIN_PROB=${AGREE_STUDENT_MIN_PROB:-0}
+# Who decides a step where the constraint leaves no candidate. These are two different
+# experiments:
+#   teacher -- it overrides the student exactly where they disagree. The aggressive
+#              reading of "the teacher steers".
+#   student -- the student carries on alone, so the teacher only ever NARROWS its
+#              choices and never overrides. Output stays in the student's voice.
+# It also flips how the 'fallback' column reads: a high rate means the run collapsed
+# to teacher decoding in the first case, to student decoding in the second.
+AGREE_FALLBACK=${AGREE_FALLBACK:-teacher}
 
 # Which prompt column each model sees. prepare_rephrase_eval.py writes both:
 #   prompt          -> the rephrase task (question + expert-reasoning draft)
@@ -138,10 +148,16 @@ LIMIT=${LIMIT:-0}                  # 0 = all rows; small values for a smoke run
 # an environment set up by scripts/setup_env.sh has it. Set ATTN_IMPL=sdpa for the
 # fused PyTorch kernel (no extra install), or =auto to probe and take what loads.
 ATTN_IMPL=${ATTN_IMPL:-flash_attention_2}
-# Steps between all-rows-finished checks. Each one copies to the host and drains the
-# CUDA queue, so checking every step stalls the GPU more than the <=N-1 all-padding
-# steps a coarser check may run (those tokens get trimmed off anyway).
+# Steps between all-rows-finished checks. Each one synchronises with the host, so
+# polling every step stalls the GPU more than the <=N-1 all-padding steps a coarser
+# check may run (those tokens get trimmed anyway). Also the cadence at which finished
+# rows leave the batch.
 EOS_CHECK_EVERY=${EOS_CHECK_EVERY:-16}
+# Drop rows from the batch once they hit EOS. Generation lengths vary enormously, so a
+# batch of 8 typically has only ~a third of its row-steps doing real work, and every
+# carried row still pays its share of the KV read -- the biggest per-step cost at a 10k
+# context. Set to 0 to keep the full batch, which is only useful for isolating this.
+SHRINK_BATCH=${SHRINK_BATCH:-1}
 
 CODE_DIR=${CODE_DIR:-$HOME/LLM}
 LOG_ROOT=${LOG_ROOT:-$HOME/LLM/Train/verl/logs}
@@ -184,16 +200,18 @@ echo "  A: $MODEL_A  (student: picks within the allowed set)"
 echo "  B: $MODEL_B  (teacher: constrains the allowed set)"
 echo "  ${SWEEP_LABEL}s: ${SWEEP_LIST[*]}   (${GPU_NUM}-way data parallel)"
 if [ "$FUSE" = "agree" ]; then
-    echo "  agree_top_k=$AGREE_TOP_K, student_min_prob=$AGREE_STUDENT_MIN_PROB, temperature=$TEMPERATURE"
+    echo "  agree_top_k=$AGREE_TOP_K, student_min_prob=$AGREE_STUDENT_MIN_PROB, temperature=$TEMPERATURE, fallback=$AGREE_FALLBACK"
 fi
 
 cd "$CODE_DIR" || exit 1
 echo "change to dir: $PWD"
 
 for value in "${SWEEP_LIST[@]}"; do
-    # 0.5 -> w0.5 / mp0.5; keeps the label filesystem-safe and sortable.
+    # 0.5 -> w0.5 / mp0.5; keeps the label filesystem-safe and sortable. The fallback
+    # owner is in there because the two settings are different experiments on identical
+    # knobs -- without it, comparing them in one EXP_NAME would overwrite the first run.
     if [ "$FUSE" = "agree" ]; then
-        label="${NAME_A}-x-${NAME_B}-agree-k${AGREE_TOP_K}-tmp${value}"
+        label="${NAME_A}-x-${NAME_B}-agree-k${AGREE_TOP_K}-tmp${value}-fb${AGREE_FALLBACK}"
     else
         label="${NAME_A}-x-${NAME_B}-${FUSE}-w${value}"
     fi
@@ -208,6 +226,9 @@ for value in "${SWEEP_LIST[@]}"; do
     if [ "$TEACHER_DROP_PREFILL" != "0" ]; then
         extra_args+=(--teacher-drop-prefill)
     fi
+    if [ "$SHRINK_BATCH" = "0" ]; then
+        extra_args+=(--no-shrink-batch)
+    fi
     if [ "$LIMIT" -gt 0 ]; then
         extra_args+=(--limit "$LIMIT")
     fi
@@ -218,6 +239,7 @@ for value in "${SWEEP_LIST[@]}"; do
         extra_args+=(--agree-top-k "$AGREE_TOP_K"
                      --agree-teacher-min-prob "$value"
                      --agree-student-min-prob "$AGREE_STUDENT_MIN_PROB"
+                     --agree-fallback "$AGREE_FALLBACK"
                      --temperature "$TEMPERATURE" --top-p "$TOP_P")
     else
         extra_args+=(--fuse-weight "$value"
@@ -251,10 +273,11 @@ for value in "${SWEEP_LIST[@]}"; do
     #   max_score     -- mean of per-question max_score, i.e. pass@N
     #   avg_len       -- mean response length in TOKENS. Compare it against
     #                    MAX_NEW_TOKENS to see whether generations are hitting the cap.
-    #   fallback      -- share of emitted tokens that came from the teacher fallback.
-    #                    0 outside --fuse agree. This is the column that says whether
-    #                    the method did anything: ~1.0 is plain teacher sampling, ~0.0
-    #                    at a zero floor is plain student sampling.
+    #   fallback      -- share of emitted tokens where the constraint left no candidate,
+    #                    so AGREE_FALLBACK decided instead. 0 outside --fuse agree. This
+    #                    is the column that says whether the method did anything: ~1.0 is
+    #                    plain decoding by the fallback owner, ~0.0 at a zero floor is
+    #                    plain student decoding.
     #   student_prob  -- geometric-mean p_student of the emitted tokens. Falls as the
     #                    constraint pushes the student off its own preferences, so read
     #                    it against avg_score to see what the accuracy cost.
@@ -319,11 +342,13 @@ echo "=== joint-decode summary ($SUMMARY) ==="
 column -t "$SUMMARY" 2>/dev/null || cat "$SUMMARY"
 echo
 if [ "$FUSE" = "agree" ]; then
-    echo "reminder: read the 'fallback' column above. Near 1.0 = the overlap was always"
-    echo "  empty, so the student never chose and this is plain teacher sampling; near 0.0"
-    echo "  at tmp0 = the allowed set covers everything, so it is plain student sampling."
-    echo "  Only the middle range actually tests 'teacher steers, student picks' -- tune"
-    echo "  AGREE_TEACHER_MIN_PROBS and AGREE_TOP_K until it lands there."
+    echo "reminder: read the 'fallback' column above -- it is the share of tokens where the"
+    echo "  constraint left no candidate and AGREE_FALLBACK=$AGREE_FALLBACK decided instead."
+    echo "  Near 1.0 = the overlap was almost always empty, so the run collapsed to plain"
+    echo "  $AGREE_FALLBACK decoding; near 0.0 at tmp0 = the allowed set covers everything,"
+    echo "  so it is plain student decoding. Only the middle range actually tests"
+    echo "  'teacher steers, student picks' -- tune AGREE_TEACHER_MIN_PROBS and AGREE_TOP_K"
+    echo "  until it lands there."
     echo "  'student_prob' is the geometric-mean p_student of the emitted tokens: it falls"
     echo "  as the constraint pushes the student off its own preferences, so read it next"
     echo "  to avg_score to see what that constraint bought or cost."

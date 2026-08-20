@@ -125,6 +125,8 @@ def agree_select(
     teacher_min_prob: float,
     temperature: float,
     top_p: float,
+    fallback: str = "teacher",
+    narrow_counter: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Let the teacher constrain the direction and the student pick within it.
 
@@ -140,8 +142,19 @@ def agree_select(
         distribution. Ranking by the teacher instead would collapse this to the
         teacher's own argmax almost every step, leaving the student a veto and no
         say -- which is not the intended division of labour.
-      * FALLBACK -- when nothing survives there is no agreement to honour, so the
-        step defers to the model steering direction: sample from the TEACHER.
+      * FALLBACK -- when nothing survives there is no agreement to honour, and
+        ``fallback`` decides who breaks the tie. These are different experiments, not
+        two spellings of one:
+
+          'teacher' -- defer to the model steering direction. The teacher gets to
+              intervene exactly where the student disagrees with it, which is the
+              aggressive reading of "the teacher steers".
+          'student' -- let the student continue on its own. The teacher then only ever
+              CONSTRAINS, never overrides: agreement narrows the student's choices and
+              nothing else. Text stays in the student's voice throughout, and a run
+              whose fallback rate is high degenerates toward plain student decoding
+              rather than plain teacher decoding -- which also flips how the fallback
+              column should be read.
 
     Sampling, not argmax, in both branches: an argmax fallback would pin every
     disagreeing position to one fixed token, so a sequence's diversity would decay
@@ -150,8 +163,9 @@ def agree_select(
 
     Returns (token ids [B, 1], fell_back [B] bool, log_pa [B, vocab]) so the caller can
     report how often the agreement actually bound anything, and reuse the student's
-    log-probs. A fallback rate near 1.0 means the run is effectively plain teacher
-    decoding and the intersection is doing no work.
+    log-probs. Under ``fallback='teacher'`` a rate near 1.0 means the run is
+    effectively plain teacher decoding; under ``'student'`` it means plain student
+    decoding. Either way the intersection is doing no work.
     """
     log_pa = F.log_softmax(logits_a.float(), dim=-1)
     log_pb = F.log_softmax(logits_b.float(), dim=-1)
@@ -176,27 +190,44 @@ def agree_select(
     )
     fell_back = ~eligible.any(dim=-1)
 
-    # Student chooses inside the allowed set; teacher decides the fallback rows.
-    # Renormalising is not needed -- sample_next softmaxes, and the -inf entries
-    # drop out of it -- but the masked rows must not be all -inf, which is why
-    # fallback rows are routed to the teacher's unmasked distribution instead.
+    # Student chooses inside the allowed set. Renormalising is not needed --
+    # sample_next softmaxes and the -inf entries drop out -- but a row masked to all
+    # -inf would give softmax nothing to sample, which is why the rows with no survivor
+    # are routed to a full, unmasked distribution instead.
     student_scores = log_pa.masked_fill(~eligible, float("-inf"))
-    scores = torch.where(fell_back.unsqueeze(-1), log_pb, student_scores)
+    fallback_scores = log_pb if fallback == "teacher" else log_pa
+    scores = torch.where(fell_back.unsqueeze(-1), fallback_scores, student_scores)
 
     # top_k is already enforced by the intersection above, so only top_p is left to
     # apply here; passing top_k again would re-cut the (already tiny) survivor set.
-    chosen = sample_next(scores, temperature, top_p, -1)
+    chosen = sample_next(scores, temperature, top_p, -1, narrow_counter=narrow_counter)
     # log_pa goes back to the caller so the per-token confidence stat can reuse it
     # instead of recomputing a [B, vocab] log_softmax every step.
     return chosen, fell_back, log_pa
 
 
-def sample_next(scores: torch.Tensor, temperature: float, top_p: float, top_k: int) -> torch.Tensor:
+def sample_next(scores: torch.Tensor, temperature: float, top_p: float, top_k: int,
+                *, top_p_candidates: int = 2048,
+                narrow_counter: torch.Tensor | None = None) -> torch.Tensor:
     """Pick the next token id per row. Mirrors naive_rollout.py:77-88, plus top-p.
 
     ``temperature == 0`` means greedy, which is what makes the output a
     deterministic fingerprint of the weights (the trick smoke_dual_vllm.py:21-24
     relies on).
+
+    The top-p nucleus is taken from the top ``top_p_candidates`` logits instead of a
+    full sort. Sorting the whole vocabulary is the single largest allocation in a step:
+    the index tensor is int64, so at a 152k vocab it is 8 bytes per element -- more than
+    both log_softmax results together -- and a peaked next-token distribution puts the
+    0.95 nucleus in its first few dozen entries, so the rest is sorted only to be thrown
+    away.
+
+    This makes the cap an implicit ``top_k``: the sampled set is
+    ``top_p AND top_p_candidates``, which is the standard way both flags compose.
+    Whenever the candidates do not already cover ``top_p`` the effective nucleus is
+    narrower than asked for, so pass ``narrow_counter`` (a scalar GPU tensor) to have
+    those rows tallied -- accumulated on-device, without the host sync a branch here
+    would cost, and reported once at the end.
     """
     if temperature == 0.0:
         return scores.argmax(dim=-1, keepdim=True)
@@ -206,13 +237,17 @@ def sample_next(scores: torch.Tensor, temperature: float, top_p: float, top_k: i
         kth = torch.topk(scores, min(top_k, scores.size(-1)), dim=-1).values[:, -1:]
         scores = scores.masked_fill(scores < kth, float("-inf"))
     if top_p < 1.0:
-        ordered, order = torch.sort(scores, descending=True, dim=-1)
-        cumulative = ordered.softmax(dim=-1).cumsum(dim=-1)
-        # Shift by one so the token that crosses the threshold is kept: otherwise
-        # top_p smaller than the top token's probability would mask everything.
-        drop = cumulative - ordered.softmax(dim=-1) > top_p
-        ordered = ordered.masked_fill(drop, float("-inf"))
-        scores = torch.empty_like(scores).scatter_(-1, order, ordered)
+        k = min(top_p_candidates, scores.size(-1))
+        top_probs, top_idx = scores.softmax(dim=-1).topk(k, dim=-1)
+        cumulative = top_probs.cumsum(dim=-1)
+        if narrow_counter is not None:
+            narrow_counter += (cumulative[:, -1] < top_p).sum()
+        # Shift by one so the token that crosses the threshold is kept: otherwise a
+        # top_p below the top token's probability would mask everything.
+        keep = cumulative - top_probs <= top_p
+        kept_scores = torch.where(keep, scores.gather(-1, top_idx),
+                                  torch.full_like(top_probs, float("-inf")))
+        scores = torch.full_like(scores, float("-inf")).scatter_(-1, top_idx, kept_scores)
     return torch.multinomial(scores.softmax(dim=-1), num_samples=1)
 
 
@@ -259,9 +294,13 @@ def joint_generate(model_a, model_b, batch_a, batch_b, *, eos_ids, pad_id, args)
     same split the trainer's sr_logprob_prompt uses.
 
     Returns (responses [B, T] padded with pad_id, lengths [B], fb_rows [B],
-    logp_rows [B]). fb_rows counts teacher-fallback tokens per row and stays 0
-    outside ``--fuse agree``; logp_rows sums log p_student over the emitted tokens,
-    so dividing by lengths gives a per-row mean.
+    logp_rows [B], n_narrow). fb_rows counts teacher-fallback tokens per row and stays 0
+    outside ``--fuse agree``; logp_rows sums log p_student over the emitted tokens, so
+    dividing by lengths gives a per-row mean; n_narrow counts row-steps where top-p's
+    nucleus ran past sample_next's candidate cap.
+
+    Rows are dropped from the batch as they finish, so the returned tensors are indexed
+    by the row's ORIGINAL position, not by its position in the shrinking batch.
     """
     device = next(model_a.parameters()).device
     ids_a = batch_a["input_ids"].to(device)
@@ -292,9 +331,7 @@ def joint_generate(model_a, model_b, batch_a, batch_b, *, eos_ids, pad_id, args)
     next_pos_a = pos_a[:, -1:] + 1
     next_pos_b = pos_b[:, -1:] + 1
 
-    collected = []
     lengths = torch.zeros(n_rows, dtype=torch.long, device=device)
-    unfinished = torch.ones(n_rows, dtype=torch.bool, device=device)
     eos_tensor = torch.tensor(eos_ids, device=device)
     # Per-ROW rather than per-batch, so the caller can put these next to each row in
     # the parquet and the summary can average over questions the same way it
@@ -305,8 +342,34 @@ def joint_generate(model_a, model_b, batch_a, batch_b, *, eos_ids, pad_id, args)
     # including them would dilute the averages with padding.
     fb_rows = torch.zeros(n_rows, dtype=torch.long, device=device)
     logp_rows = torch.zeros(n_rows, dtype=torch.float64, device=device)
+    # Rows where top_p's nucleus ran past the candidate cap, so sampling was narrower
+    # than requested. Kept on-device and read once at the end -- checking per step would
+    # reintroduce exactly the host sync the EOS check was loosened to avoid.
+    narrow = torch.zeros((), dtype=torch.long, device=device)
 
+    # Finished rows are DROPPED from the batch instead of being carried along emitting
+    # padding. Length varies enormously between rows -- a batch of 8 typically has ~33%
+    # of its row-steps doing real work -- and every carried row still costs its share of
+    # the KV read, which by 10k tokens is the largest term in a step. Dropping them
+    # shrinks that read as the batch drains.
+    #
+    # Two things follow. Rows are written into a buffer indexed by ORIGINAL row, since
+    # the batch no longer lines up with the caller's rows; and `alive_idx` maps current
+    # batch position -> original row so the per-row stats stay attributable.
+    out_tokens = torch.full((n_rows, args.max_new_tokens), pad_id,
+                            dtype=torch.long, device=device)
+    alive_idx = torch.arange(n_rows, device=device)
+    alive = torch.ones(n_rows, dtype=torch.bool, device=device)
+    # batch_select_indices is a DynamicCache method (transformers uses it for
+    # contrastive search); the base Cache class does not define it, so a model handing
+    # back some other cache type must keep the full batch rather than crash.
+    can_shrink = (args.shrink_batch
+                  and hasattr(kv_a, "batch_select_indices")
+                  and hasattr(kv_b, "batch_select_indices"))
+
+    steps_run = 0
     for step in range(args.max_new_tokens):
+        steps_run = step + 1
         if args.fuse == "agree":
             nxt, fell_back, log_pa = agree_select(
                 last_a, last_b,
@@ -315,16 +378,19 @@ def joint_generate(model_a, model_b, batch_a, batch_b, *, eos_ids, pad_id, args)
                 teacher_min_prob=args.agree_teacher_min_prob,
                 temperature=args.temperature,
                 top_p=args.top_p,
+                fallback=args.agree_fallback,
+                narrow_counter=narrow,
             )
-            fb_rows += (fell_back & unfinished).long()
+            fb_rows.index_add_(0, alive_idx, (fell_back & alive).long())
         else:
             scores = fuse_logits(last_a, last_b, args.fuse, args.fuse_weight)
-            nxt = sample_next(scores, args.temperature, args.top_p, args.top_k)
+            nxt = sample_next(scores, args.temperature, args.top_p, args.top_k,
+                              narrow_counter=narrow)
             log_pa = None
 
-        # Finished rows emit pad and stop counting, but keep stepping so the batch
-        # stays rectangular -- their tokens are trimmed off at the end.
-        nxt = torch.where(unfinished.unsqueeze(-1), nxt, torch.full_like(nxt, pad_id))
+        # A row that finished since the last shrink is still in the batch, so it still
+        # has to be masked out here; the shrink only removes it at the next checkpoint.
+        nxt = torch.where(alive.unsqueeze(-1), nxt, torch.full_like(nxt, pad_id))
         # How confident the STUDENT was in the token that was actually emitted --
         # read off log p_a, not off the fused/masked scores, so the number means the
         # same thing in every --fuse mode and stays comparable to a single-model run.
@@ -334,17 +400,34 @@ def joint_generate(model_a, model_b, batch_a, batch_b, *, eos_ids, pad_id, args)
         if log_pa is None:
             log_pa = F.log_softmax(last_a.float(), dim=-1)
         step_logp = log_pa.gather(-1, nxt).squeeze(-1)
-        logp_rows += torch.where(unfinished, step_logp.double(), torch.zeros_like(logp_rows))
-        collected.append(nxt)
-        lengths += unfinished.long()
+        logp_rows.index_add_(0, alive_idx,
+                             torch.where(alive, step_logp.double(),
+                                         torch.zeros_like(step_logp, dtype=torch.float64)))
+        out_tokens[alive_idx, step] = nxt.squeeze(-1)
+        lengths.index_add_(0, alive_idx, alive.long())
         # nxt is [B, 1] and eos_tensor is [n_eos], so the comparison broadcasts to
         # [B, n_eos] and any(-1) collapses back to [B].
-        unfinished = unfinished & ~(nxt == eos_tensor).any(dim=-1)
-        # `.any()` copies to the host, which drains the CUDA queue and leaves the GPU
-        # idle while the CPU catches up. Checking every step therefore costs more than
-        # the handful of all-padding steps a coarser check may run before noticing.
-        if step % args.eos_check_every == 0 and not unfinished.any():
-            break
+        alive = alive & ~(nxt == eos_tensor).any(dim=-1)
+
+        # One host sync serves both the stop test and the shrink, at a cadence chosen so
+        # neither pays for its own. `.any()` copies to the host, which drains the CUDA
+        # queue and idles the GPU, so doing it every step costs more than the handful of
+        # all-padding steps a coarser check may run before noticing.
+        if step % args.eos_check_every == 0:
+            n_alive = int(alive.sum().item())
+            if n_alive == 0:
+                break
+            if can_shrink and n_alive < alive.numel():
+                keep = alive.nonzero(as_tuple=True)[0]
+                kv_a.batch_select_indices(keep)
+                kv_b.batch_select_indices(keep)
+                mask_a, mask_b = mask_a[keep], mask_b[keep]
+                next_pos_a, next_pos_b = next_pos_a[keep], next_pos_b[keep]
+                last_a, last_b = last_a[keep], last_b[keep]
+                nxt = nxt[keep]
+                alive_idx = alive_idx[keep]
+                # Every survivor is alive by construction after the drop.
+                alive = torch.ones(keep.numel(), dtype=torch.bool, device=device)
 
         mask_a = torch.cat([mask_a, torch.ones_like(nxt)], dim=-1)
         mask_b = torch.cat([mask_b, torch.ones_like(nxt)], dim=-1)
@@ -359,8 +442,8 @@ def joint_generate(model_a, model_b, batch_a, batch_b, *, eos_ids, pad_id, args)
         next_pos_a = next_pos_a + 1
         next_pos_b = next_pos_b + 1
 
-    responses = torch.cat(collected, dim=-1) if collected else torch.zeros((n_rows, 0), dtype=torch.long)
-    return responses.cpu(), lengths.cpu(), fb_rows.cpu(), logp_rows.cpu()
+    return (out_tokens[:, :steps_run].cpu(), lengths.cpu(), fb_rows.cpu(),
+            logp_rows.cpu(), int(narrow.item()))
 
 
 # ---------------------------------------------------------------------------
@@ -490,6 +573,13 @@ def parse_args() -> argparse.Namespace:
                         "Defaults to 0 -- the student already ranks the survivors, so this only "
                         "needs raising to exclude tokens it is very reluctant to emit "
                         "(default: %(default)s)")
+    p.add_argument("--agree-fallback", default="teacher", choices=("teacher", "student"),
+                   help="--fuse agree: who decides a step where no candidate survives the "
+                        "constraint. 'teacher' lets it override the student exactly where they "
+                        "disagree; 'student' lets the student carry on, so the teacher only ever "
+                        "narrows its choices and never overrides. This also flips what a high "
+                        "fallback rate means -- teacher decoding in the first case, student "
+                        "decoding in the second (default: %(default)s)")
     p.add_argument("--n-samples", type=int, default=1, help="Samples per question (default: %(default)s)")
     p.add_argument("--temperature", type=float, default=0.6, help="0 == greedy (default: %(default)s)")
     p.add_argument("--top-p", type=float, default=0.95)
@@ -517,8 +607,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eos-check-every", type=int, default=16,
                    help="Steps between all-rows-finished checks. Each check syncs GPU->CPU, "
                         "which stalls the pipeline, so testing every step costs more than the "
-                        "few extra steps a coarser check may run. Raise to sync less "
-                        "(default: %(default)s)")
+                        "few extra steps a coarser check may run. Also the cadence at which "
+                        "finished rows are dropped (default: %(default)s)")
+    p.add_argument("--no-shrink-batch", dest="shrink_batch", action="store_false",
+                   help="Keep finished rows in the batch instead of dropping them. They emit "
+                        "padding that is thrown away, but still pay their share of the KV read "
+                        "-- the largest cost per step at long contexts. Only useful to isolate "
+                        "the shrink when comparing.")
     return p.parse_args()
 
 
@@ -695,6 +790,7 @@ def main() -> int:
     total_tokens = 0
     fallback_tokens = 0
     decided_tokens = 0
+    narrow_steps = 0
     start = torch.cuda.Event(enable_timing=True) if torch.cuda.is_available() else None
     end = torch.cuda.Event(enable_timing=True) if torch.cuda.is_available() else None
     if start:
@@ -717,9 +813,10 @@ def main() -> int:
             stop = min(begin + args.batch_size, len(shard))
             batch_a = render(tok_a, chats_a[begin:stop], args.prompt_length)
             batch_b = render(tok_b, chats_b[begin:stop], args.prompt_length)
-            responses, lengths, fb_row, logp_row = joint_generate(
+            responses, lengths, fb_row, logp_row, n_narrow = joint_generate(
                 model_a, model_b, batch_a, batch_b, eos_ids=eos_ids, pad_id=pad_id, args=args,
             )
+            narrow_steps += n_narrow
             for row in range(responses.size(0)):
                 n_tok = int(lengths[row].item())
                 ids = responses[row, :n_tok]
@@ -769,14 +866,25 @@ def main() -> int:
             print(f"[rank {rank}] student mean logp={mean:.4f} "
                   f"(geometric-mean prob {math.exp(mean):.4f})", flush=True)
 
+    if narrow_steps:
+        # The top-p nucleus ran past the candidate cap on these row-steps, so sampling
+        # was effectively top_p AND top-2048 rather than top_p alone. Normal in small
+        # amounts on flat distributions; a large share means the cap, not top_p, is
+        # setting the sampling width.
+        print(f"[rank {rank}] top_p nucleus exceeded the {2048}-candidate cap on "
+              f"{narrow_steps:,} row-steps ({narrow_steps / max(decided_tokens, 1):.2%} "
+              f"of emitted tokens): those were sampled from top_p AND top-2048",
+              file=sys.stderr, flush=True)
+
     if args.fuse == "agree" and decided_tokens:
         # A rate near 1.0 means the two models almost never overlapped under these
-        # settings, so the student never got to choose and the run is really just
-        # teacher sampling -- loosen the floors or raise --agree-top-k before
+        # settings, so the constraint never bound and the run collapses to whichever
+        # model owns the fallback -- loosen the floors or raise --agree-top-k before
         # reading anything into the scores.
         rate = fallback_tokens / decided_tokens
-        print(f"[rank {rank}] teacher fallback on {fallback_tokens:,}/{decided_tokens:,} "
-              f"tokens = {rate:.1%} (top_k={args.agree_top_k}, "
+        print(f"[rank {rank}] fallback to {args.agree_fallback} on "
+              f"{fallback_tokens:,}/{decided_tokens:,} tokens = {rate:.1%} "
+              f"(top_k={args.agree_top_k}, "
               f"teacher_min_prob={args.agree_teacher_min_prob}, "
               f"student_min_prob={args.agree_student_min_prob})", flush=True)
 
