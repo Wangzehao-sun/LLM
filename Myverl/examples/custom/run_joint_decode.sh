@@ -128,6 +128,21 @@ MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-10240}
 BATCH_SIZE=${BATCH_SIZE:-8}
 LIMIT=${LIMIT:-0}                  # 0 = all rows; small values for a smoke run
 
+# --- throughput knobs ------------------------------------------------------
+# Attention kernel, the single biggest lever here: "eager" rebuilds the whole
+# [B, heads, 1, kv_len] score matrix every step and layer, which at an 8k context
+# across two models is the same order of traffic as the weights themselves.
+#
+# Defaults to flash_attention_2 and FAILS if it is unavailable, rather than quietly
+# using something slower -- flash-attn is already in Myverl/setup.py's GPU extra, so
+# an environment set up by scripts/setup_env.sh has it. Set ATTN_IMPL=sdpa for the
+# fused PyTorch kernel (no extra install), or =auto to probe and take what loads.
+ATTN_IMPL=${ATTN_IMPL:-flash_attention_2}
+# Steps between all-rows-finished checks. Each one copies to the host and drains the
+# CUDA queue, so checking every step stalls the GPU more than the <=N-1 all-padding
+# steps a coarser check may run (those tokens get trimmed off anyway).
+EOS_CHECK_EVERY=${EOS_CHECK_EVERY:-16}
+
 CODE_DIR=${CODE_DIR:-$HOME/LLM}
 LOG_ROOT=${LOG_ROOT:-$HOME/LLM/Train/verl/logs}
 EXP_NAME=${EXP_NAME:-joint_$(date +%m%d_%H%M)}
@@ -225,6 +240,8 @@ for value in "${SWEEP_LIST[@]}"; do
         --prompt-length "$PROMPT_LENGTH" \
         --max-new-tokens "$MAX_NEW_TOKENS" \
         --batch-size "$BATCH_SIZE" \
+        --attn-impl "$ATTN_IMPL" \
+        --eos-check-every "$EOS_CHECK_EVERY" \
         "${extra_args[@]}" 2>&1 | tee "$log_path"
 
     # Recompute the metrics from the written parquets rather than scraping the log:
