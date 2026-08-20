@@ -65,6 +65,11 @@ export TOKENIZERS_PARALLELISM=true
 #   MODEL_A=... MODEL_B=... FUSE=agree AGREE_TOP_K=20 \
 #       AGREE_TEACHER_MIN_PROBS=0.05 bash run_joint_decode.sh
 #
+#   # let the student reach further for an agreed token without widening the teacher's
+#   # allowed set -- the cheapest way to cut a high fallback rate
+#   MODEL_A=... MODEL_B=... FUSE=agree \
+#       AGREE_STUDENT_TOP_K=50 AGREE_TEACHER_TOP_K=10 bash run_joint_decode.sh
+#
 #   # a single weight, greedy -- the degenerate-case check
 #   MODEL_A=... MODEL_B=... WEIGHTS=0 TEMPERATURE=0 LIMIT=8 bash run_joint_decode.sh
 #
@@ -100,6 +105,13 @@ FUSE=${FUSE:-linear}               # linear | contrastive | max | agree
 # student's pick differs from the teacher's. So the sweep runs over it.
 AGREE_TEACHER_MIN_PROBS=${AGREE_TEACHER_MIN_PROBS:-0,0.02,0.05,0.1}
 AGREE_TOP_K=${AGREE_TOP_K:-10}
+# Per-side overrides, both defaulting to AGREE_TOP_K. They mean different things: the
+# teacher's bounds how much of the vocabulary it permits at all, the student's bounds how
+# far down its own ranking it will look for something permitted. So raising only the
+# student's is the cheapest way to cut the fallback rate -- it reaches further for an
+# agreed token without widening what the teacher allows.
+AGREE_STUDENT_TOP_K=${AGREE_STUDENT_TOP_K:-}
+AGREE_TEACHER_TOP_K=${AGREE_TEACHER_TOP_K:-}
 # Only raise this to veto tokens the student is very reluctant to emit -- it
 # already ranks the survivors, so 0 is the natural default.
 AGREE_STUDENT_MIN_PROB=${AGREE_STUDENT_MIN_PROB:-0}
@@ -207,7 +219,7 @@ echo "  A: $MODEL_A  (student: picks within the allowed set)"
 echo "  B: $MODEL_B  (teacher: constrains the allowed set)"
 echo "  ${SWEEP_LABEL}s: ${SWEEP_LIST[*]}   (${GPU_NUM}-way data parallel)"
 if [ "$FUSE" = "agree" ]; then
-    echo "  agree_top_k=$AGREE_TOP_K, student_min_prob=$AGREE_STUDENT_MIN_PROB, temperature=$TEMPERATURE, fallback=$AGREE_FALLBACK"
+    echo "  student_top_k=${AGREE_STUDENT_TOP_K:-$AGREE_TOP_K}, teacher_top_k=${AGREE_TEACHER_TOP_K:-$AGREE_TOP_K}, student_min_prob=$AGREE_STUDENT_MIN_PROB, temperature=$TEMPERATURE, fallback=$AGREE_FALLBACK"
 fi
 
 cd "$CODE_DIR" || exit 1
@@ -218,7 +230,10 @@ for value in "${SWEEP_LIST[@]}"; do
     # owner is in there because the two settings are different experiments on identical
     # knobs -- without it, comparing them in one EXP_NAME would overwrite the first run.
     if [ "$FUSE" = "agree" ]; then
-        label="${NAME_A}-x-${NAME_B}-agree-k${AGREE_TOP_K}-tmp${value}-fb${AGREE_FALLBACK}"
+        # The per-side k's go in the label because two runs differing only in them would
+        # otherwise share an output directory and the second would overwrite the first.
+        k_tag="k${AGREE_STUDENT_TOP_K:-$AGREE_TOP_K}.${AGREE_TEACHER_TOP_K:-$AGREE_TOP_K}"
+        label="${NAME_A}-x-${NAME_B}-agree-${k_tag}-tmp${value}-fb${AGREE_FALLBACK}"
     else
         label="${NAME_A}-x-${NAME_B}-${FUSE}-w${value}"
     fi
@@ -248,6 +263,14 @@ for value in "${SWEEP_LIST[@]}"; do
                      --agree-student-min-prob "$AGREE_STUDENT_MIN_PROB"
                      --agree-fallback "$AGREE_FALLBACK"
                      --temperature "$TEMPERATURE" --top-p "$TOP_P")
+        # Empty means "inherit AGREE_TOP_K"; joint_decode.py resolves that, so only pass
+        # the flag when it was actually set.
+        if [ -n "$AGREE_STUDENT_TOP_K" ]; then
+            extra_args+=(--agree-student-top-k "$AGREE_STUDENT_TOP_K")
+        fi
+        if [ -n "$AGREE_TEACHER_TOP_K" ]; then
+            extra_args+=(--agree-teacher-top-k "$AGREE_TEACHER_TOP_K")
+        fi
     else
         extra_args+=(--fuse-weight "$value"
                      --temperature "$TEMPERATURE" --top-p "$TOP_P" --top-k "$TOP_K")
@@ -354,7 +377,9 @@ if [ "$FUSE" = "agree" ]; then
     echo "  Near 1.0 = the overlap was almost always empty, so the run collapsed to plain"
     echo "  $AGREE_FALLBACK decoding; near 0.0 at tmp0 = the allowed set covers everything,"
     echo "  so it is plain student decoding. Only the middle range actually tests"
-    echo "  'teacher steers, student picks' -- tune AGREE_TEACHER_MIN_PROBS and AGREE_TOP_K"
+    echo "  'teacher steers, student picks' -- tune AGREE_TEACHER_MIN_PROBS, or raise"
+    echo "  AGREE_STUDENT_TOP_K to let the student reach further for an agreed token"
+    echo "  without widening what the teacher permits."
     echo "  until it lands there."
     echo "  'student_prob' is the geometric-mean p_student of the emitted tokens: it falls"
     echo "  as the constraint pushes the student off its own preferences, so read it next"
