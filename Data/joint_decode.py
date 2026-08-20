@@ -209,6 +209,35 @@ def sample_next(scores: torch.Tensor, temperature: float, top_p: float, top_k: i
 # ---------------------------------------------------------------------------
 # decoding
 # ---------------------------------------------------------------------------
+def last_logit_kwargs(model) -> dict:
+    """Ask the model for the LAST position's logits only, if it supports it.
+
+    Prefill computes logits for every prompt position, and only the last one is
+    ever read. At a 152k vocab that waste dominates the memory profile:
+    [8, 4096, 151936] in bf16 is ~10GB per model, ~20GB for the pair, versus 2.4MB
+    for the single position actually used -- and it scales with --batch-size, so 16
+    rows would throw away ~40GB. Dropping it moves the binding constraint to the KV
+    cache (~2.4GB per row for a 4B pair at 8192), which lifts the usable batch on an
+    80GB card from about 8 to about 20.
+
+    The flag exists for exactly this, but was renamed mid-flight
+    (num_logits_to_keep -> logits_to_keep), and older versions have neither. So
+    inspect the signature instead of guessing, and return {} when it is absent --
+    the maths is identical either way, only the footprint changes.
+    """
+    import inspect
+
+    try:
+        params = inspect.signature(model.forward).parameters
+    except (TypeError, ValueError):
+        return {}
+    for name in ("logits_to_keep", "num_logits_to_keep"):
+        if name in params:
+            return {name: 1}
+    # **kwargs-only signatures cannot be probed; skipping is the safe answer.
+    return {}
+
+
 @torch.no_grad()
 def joint_generate(model_a, model_b, batch_a, batch_b, *, eos_ids, pad_id, args):
     """Decode one batch under both models, fusing per token.
@@ -236,9 +265,18 @@ def joint_generate(model_a, model_b, batch_a, batch_b, *, eos_ids, pad_id, args)
     pos_a = (mask_a.cumsum(dim=-1) - 1).clamp(min=0)
     pos_b = (mask_b.cumsum(dim=-1) - 1).clamp(min=0)
 
-    out_a = model_a(input_ids=ids_a, attention_mask=mask_a, position_ids=pos_a, use_cache=True)
-    out_b = model_b(input_ids=ids_b, attention_mask=mask_b, position_ids=pos_b, use_cache=True)
+    # Probed once per batch, not per step: inspect.signature is not free and the
+    # answer cannot change mid-decode.
+    keep_a = last_logit_kwargs(model_a)
+    keep_b = last_logit_kwargs(model_b)
+
+    out_a = model_a(input_ids=ids_a, attention_mask=mask_a, position_ids=pos_a,
+                    use_cache=True, **keep_a)
+    out_b = model_b(input_ids=ids_b, attention_mask=mask_b, position_ids=pos_b,
+                    use_cache=True, **keep_b)
     kv_a, kv_b = out_a.past_key_values, out_b.past_key_values
+    # [:, -1, :] regardless: with the flag the tensor is already [B, 1, V], without
+    # it this is the slice that discards the unused positions.
     last_a, last_b = out_a.logits[:, -1, :], out_b.logits[:, -1, :]
     next_pos_a = pos_a[:, -1:] + 1
     next_pos_b = pos_b[:, -1:] + 1
@@ -283,6 +321,8 @@ def joint_generate(model_a, model_b, batch_a, batch_b, *, eos_ids, pad_id, args)
 
         mask_a = torch.cat([mask_a, torch.ones_like(nxt)], dim=-1)
         mask_b = torch.cat([mask_b, torch.ones_like(nxt)], dim=-1)
+        # No keep-last kwarg here: these feed a single token, so the logits are
+        # already [B, 1, V] and the flag would be a no-op.
         step_a = model_a(input_ids=nxt, attention_mask=mask_a, position_ids=next_pos_a,
                          past_key_values=kv_a, use_cache=True)
         step_b = model_b(input_ids=nxt, attention_mask=mask_b, position_ids=next_pos_b,
@@ -450,6 +490,21 @@ def main() -> int:
     print(f"[rank {rank}] loading B={args.model_b}", flush=True)
     model_b = AutoModelForCausalLM.from_pretrained(
         args.model_b, torch_dtype=dtype, trust_remote_code=True).to(device).eval()
+
+    # Say which way it went. Silently falling back is the dangerous case: the run
+    # still produces correct output, just with ~20GB of prefill logits it never
+    # reads, which shows up much later as an OOM the moment --batch-size is raised.
+    if rank == 0:
+        keep = last_logit_kwargs(model_a)
+        if keep:
+            print(f"[mem] prefill keeps last logit only ({next(iter(keep))}=1)", flush=True)
+        else:
+            v = getattr(model_a.config, "vocab_size", 0)
+            waste = args.batch_size * args.prompt_length * v * 2 * 2 / 1e9
+            print(f"[mem] this transformers has no logits_to_keep/num_logits_to_keep, so "
+                  f"prefill materialises logits for every position: about {waste:.1f} GB "
+                  f"across both models at --batch-size {args.batch_size}. Output is "
+                  f"unaffected; lower --batch-size if it OOMs.", file=sys.stderr, flush=True)
 
     # Stop on real EOS only. pad_token_id is excluded on purpose: many chat models
     # set pad == eos, but for those that do not, treating pad as a stop signal would

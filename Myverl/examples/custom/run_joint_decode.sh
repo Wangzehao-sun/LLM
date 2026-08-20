@@ -118,6 +118,12 @@ PROMPT_LENGTH=${PROMPT_LENGTH:-4096}      # rephrase prompts carry a draft, so l
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-4096}
 # Far smaller than the vLLM path's 256: there is no request-level scheduling here,
 # so the longest row in a batch holds up every other row in it.
+#
+# Memory, not that long tail, is the hard ceiling. Both models' weights are fixed
+# (~16GB for a 4B pair) but KV cache grows linearly with this -- roughly 2.4GB per
+# row for a 4B pair at prompt+response 8192. On an 80GB card that puts the limit
+# around 20; past that expect OOM. Raise it while watching nvidia-smi, and halve it
+# for a 7B pair.
 BATCH_SIZE=${BATCH_SIZE:-8}
 LIMIT=${LIMIT:-0}                  # 0 = all rows; small values for a smoke run
 
