@@ -98,7 +98,7 @@ FUSE=${FUSE:-agree}               # linear | contrastive | max | agree
 # distributions the top-k sets overlap almost completely, so k stops mattering
 # above ~10 while the floor still moves both the fallback rate and how often the
 # student's pick differs from the teacher's. So the sweep runs over it.
-AGREE_TEACHER_MIN_PROBS=${AGREE_TEACHER_MIN_PROBS:-0.1}
+AGREE_TEACHER_MIN_PROBS=${AGREE_TEACHER_MIN_PROBS:-0.05}
 AGREE_TOP_K=${AGREE_TOP_K:-20}
 # Only raise this to veto tokens the student is very reluctant to emit -- it
 # already ranks the survivors, so 0 is the natural default.
@@ -111,7 +111,7 @@ AGREE_STUDENT_MIN_PROB=${AGREE_STUDENT_MIN_PROB:-0}
 #              choices and never overrides. Output stays in the student's voice.
 # It also flips how the 'fallback' column reads: a high rate means the run collapsed
 # to teacher decoding in the first case, to student decoding in the second.
-AGREE_FALLBACK=${AGREE_FALLBACK:-teacher}
+AGREE_FALLBACK=${AGREE_FALLBACK:-student}
 
 # Which prompt column each model sees. prepare_rephrase_eval.py writes both:
 #   prompt          -> the rephrase task (question + expert-reasoning draft)
@@ -122,11 +122,11 @@ PROMPT_KEY=${PROMPT_KEY:-question_prompt}
 PROMPT_KEY_B=${PROMPT_KEY_B:-prompt}
 
 N_SAMPLES=${N_SAMPLES:-1}          # samples per question; >1 to see sampling variance
-TEMPERATURE=${TEMPERATURE:-0.6}
+TEMPERATURE=${TEMPERATURE:-1}
 TOP_P=${TOP_P:-0.95}
 TOP_K=${TOP_K:--1}
 PROMPT_LENGTH=${PROMPT_LENGTH:-4096}      # rephrase prompts carry a draft, so longer than a bare question
-MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-10240}
+MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-8192}
 # Far smaller than the vLLM path's 256: there is no request-level scheduling here,
 # so the longest row in a batch holds up every other row in it.
 #
@@ -135,7 +135,7 @@ MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-10240}
 # row for a 4B pair at prompt+response 8192. On an 80GB card that puts the limit
 # around 20; past that expect OOM. Raise it while watching nvidia-smi, and halve it
 # for a 7B pair.
-BATCH_SIZE=${BATCH_SIZE:-8}
+BATCH_SIZE=${BATCH_SIZE:-32}
 LIMIT=${LIMIT:-0}                  # 0 = all rows; small values for a smoke run
 
 # --- throughput knobs ------------------------------------------------------
