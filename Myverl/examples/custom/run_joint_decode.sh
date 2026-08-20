@@ -190,6 +190,9 @@ for value in "${SWEEP_LIST[@]}"; do
     if [ -n "$PROMPT_KEY_B" ]; then
         extra_args+=(--prompt-key-b "$PROMPT_KEY_B")
     fi
+    if [ "$TEACHER_DROP_PREFILL" != "0" ]; then
+        extra_args+=(--teacher-drop-prefill)
+    fi
     if [ "$LIMIT" -gt 0 ]; then
         extra_args+=(--limit "$LIMIT")
     fi
