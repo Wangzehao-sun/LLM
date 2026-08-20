@@ -148,9 +148,10 @@ def agree_select(
     with each fallback and ``--n-samples > 1`` would stop meaning anything.
     ``temperature == 0`` still gives greedy behaviour on both paths.
 
-    Returns (token ids [B, 1], fell_back [B] bool) so the caller can report how
-    often the agreement actually bound anything. A rate near 1.0 means the run is
-    effectively plain teacher decoding and the intersection is doing no work.
+    Returns (token ids [B, 1], fell_back [B] bool, log_pa [B, vocab]) so the caller can
+    report how often the agreement actually bound anything, and reuse the student's
+    log-probs. A fallback rate near 1.0 means the run is effectively plain teacher
+    decoding and the intersection is doing no work.
     """
     log_pa = F.log_softmax(logits_a.float(), dim=-1)
     log_pb = F.log_softmax(logits_b.float(), dim=-1)
@@ -185,7 +186,9 @@ def agree_select(
     # top_k is already enforced by the intersection above, so only top_p is left to
     # apply here; passing top_k again would re-cut the (already tiny) survivor set.
     chosen = sample_next(scores, temperature, top_p, -1)
-    return chosen, fell_back
+    # log_pa goes back to the caller so the per-token confidence stat can reuse it
+    # instead of recomputing a [B, vocab] log_softmax every step.
+    return chosen, fell_back, log_pa
 
 
 def sample_next(scores: torch.Tensor, temperature: float, top_p: float, top_k: int) -> torch.Tensor:
@@ -303,9 +306,9 @@ def joint_generate(model_a, model_b, batch_a, batch_b, *, eos_ids, pad_id, args)
     fb_rows = torch.zeros(n_rows, dtype=torch.long, device=device)
     logp_rows = torch.zeros(n_rows, dtype=torch.float64, device=device)
 
-    for _ in range(args.max_new_tokens):
+    for step in range(args.max_new_tokens):
         if args.fuse == "agree":
-            nxt, fell_back = agree_select(
+            nxt, fell_back, log_pa = agree_select(
                 last_a, last_b,
                 top_k=args.agree_top_k,
                 student_min_prob=args.agree_student_min_prob,
@@ -317,6 +320,7 @@ def joint_generate(model_a, model_b, batch_a, batch_b, *, eos_ids, pad_id, args)
         else:
             scores = fuse_logits(last_a, last_b, args.fuse, args.fuse_weight)
             nxt = sample_next(scores, args.temperature, args.top_p, args.top_k)
+            log_pa = None
 
         # Finished rows emit pad and stop counting, but keep stepping so the batch
         # stays rectangular -- their tokens are trimmed off at the end.
@@ -325,15 +329,21 @@ def joint_generate(model_a, model_b, batch_a, batch_b, *, eos_ids, pad_id, args)
         # read off log p_a, not off the fused/masked scores, so the number means the
         # same thing in every --fuse mode and stays comparable to a single-model run.
         # Taken before the row is marked finished, so the EOS token itself counts
-        # (matching how `lengths` counts it).
-        step_logp = F.log_softmax(last_a.float(), dim=-1).gather(-1, nxt).squeeze(-1)
+        # (matching how `lengths` counts it). agree_select already normalised log p_a,
+        # so reuse it rather than paying for a second [B, vocab] log_softmax per step.
+        if log_pa is None:
+            log_pa = F.log_softmax(last_a.float(), dim=-1)
+        step_logp = log_pa.gather(-1, nxt).squeeze(-1)
         logp_rows += torch.where(unfinished, step_logp.double(), torch.zeros_like(logp_rows))
         collected.append(nxt)
         lengths += unfinished.long()
         # nxt is [B, 1] and eos_tensor is [n_eos], so the comparison broadcasts to
         # [B, n_eos] and any(-1) collapses back to [B].
         unfinished = unfinished & ~(nxt == eos_tensor).any(dim=-1)
-        if not unfinished.any():
+        # `.any()` copies to the host, which drains the CUDA queue and leaves the GPU
+        # idle while the CPU catches up. Checking every step therefore costs more than
+        # the handful of all-padding steps a coarser check may run before noticing.
+        if step % args.eos_check_every == 0 and not unfinished.any():
             break
 
         mask_a = torch.cat([mask_a, torch.ones_like(nxt)], dim=-1)
@@ -496,6 +506,19 @@ def parse_args() -> argparse.Namespace:
                         "summarize/grpo scripts use (default: %(default)s)")
     p.add_argument("--no-score", action="store_true",
                    help="Skip scoring (no test_score column). Use when the reward fn is unavailable.")
+    p.add_argument("--attn-impl", default="flash_attention_2",
+                   choices=("flash_attention_2", "sdpa", "eager", "auto"),
+                   help="Attention kernel. Defaults to flash_attention_2 and FAILS if it is "
+                        "unavailable rather than downgrading quietly -- a slower run that looks "
+                        "identical is the outcome worth avoiding. 'auto' probes "
+                        "flash_attention_2 -> sdpa -> eager instead. eager rebuilds the full "
+                        "score matrix every step and is much slower; pin it only to compare "
+                        "(default: %(default)s)")
+    p.add_argument("--eos-check-every", type=int, default=16,
+                   help="Steps between all-rows-finished checks. Each check syncs GPU->CPU, "
+                        "which stalls the pipeline, so testing every step costs more than the "
+                        "few extra steps a coarser check may run. Raise to sync less "
+                        "(default: %(default)s)")
     return p.parse_args()
 
 
@@ -566,15 +589,64 @@ def main() -> int:
 
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    # Plain .to(device), NOT device_map="auto": each rank owns exactly one GPU here,
-    # and letting accelerate shard a model across all of them would collide with
-    # the other ranks' models.
+
+    # flash-attn is a CUDA kernel and requires fp16/bf16, so it cannot serve a CPU
+    # debug run. Downgrade rather than fail there: on CPU the point is to exercise the
+    # logic, not the throughput, so the substitution costs nothing that matters.
+    attn_impl = args.attn_impl
+    if device == "cpu" and attn_impl == "flash_attention_2":
+        print("[warn] flash_attention_2 needs CUDA and fp16/bf16; using eager on CPU",
+              file=sys.stderr, flush=True)
+        attn_impl = "eager"
+
+    # The attention kernel is the single biggest throughput lever here. "eager"
+    # materialises a [B, heads, 1, kv_len] score matrix per layer per step, which at 36
+    # layers across two models with an 8k context is ~0.6GB of extra traffic per step
+    # against ~8GB for the weights -- the same order of magnitude, so it can cost close
+    # to a factor of two. flash_attention_2 and sdpa use a fused kernel instead.
+    #
+    # Default to flash_attention_2 EXPLICITLY rather than probing, because a silent
+    # downgrade is the bad outcome: the run still works and still looks right, just
+    # slower, with nothing in the output saying why. Ask for --attn-impl auto to get the
+    # probing behaviour, or pin sdpa/eager to compare.
+    def load(path: str, tag: str):
+        wanted = ([attn_impl] if attn_impl != "auto"
+                  else ["flash_attention_2", "sdpa", "eager"])
+        for impl in wanted:
+            try:
+                model = AutoModelForCausalLM.from_pretrained(
+                    path, torch_dtype=dtype, trust_remote_code=True,
+                    attn_implementation=impl,
+                )
+                if rank == 0:
+                    print(f"[rank {rank}] {tag} attn_implementation={impl}", flush=True)
+                # Plain .to(device), NOT device_map="auto": each rank owns exactly one
+                # GPU here, and letting accelerate shard a model across all of them
+                # would collide with the other ranks' models.
+                return model.to(device).eval()
+            except (ValueError, ImportError, RuntimeError) as error:
+                if impl == wanted[-1]:
+                    if impl == "flash_attention_2":
+                        print(
+                            f"[fatal] {tag}: flash_attention_2 could not be used "
+                            f"({type(error).__name__}: {error}).\n"
+                            f"  install it with `pip install flash-attn --no-build-isolation` "
+                            f"(it is already in Myverl/setup.py's GPU extra), or run with "
+                            f"ATTN_IMPL=sdpa to use the fused PyTorch kernel instead.\n"
+                            f"  Not falling back silently: sdpa is slower, and a run that "
+                            f"quietly used it would look identical to one that did not.",
+                            file=sys.stderr, flush=True,
+                        )
+                    raise
+                if rank == 0:
+                    print(f"[rank {rank}] {tag} attn_implementation={impl} unavailable "
+                          f"({type(error).__name__}), trying next", flush=True)
+        raise AssertionError("unreachable")
+
     print(f"[rank {rank}] loading A={args.model_a}", flush=True)
-    model_a = AutoModelForCausalLM.from_pretrained(
-        args.model_a, torch_dtype=dtype, trust_remote_code=True).to(device).eval()
+    model_a = load(args.model_a, "A")
     print(f"[rank {rank}] loading B={args.model_b}", flush=True)
-    model_b = AutoModelForCausalLM.from_pretrained(
-        args.model_b, torch_dtype=dtype, trust_remote_code=True).to(device).eval()
+    model_b = load(args.model_b, "B")
 
     # Say which way it went. Silently falling back is the dangerous case: the run
     # still produces correct output, just with ~20GB of prefill logits it never
