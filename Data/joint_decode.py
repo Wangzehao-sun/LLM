@@ -55,6 +55,12 @@ Usage:
 ``--fuse-weight 0`` reduces exactly to model A alone; with ``--temperature 0`` it
 must reproduce A's greedy output token for token, which is the sanity check that
 the KV cache and masks are wired correctly.
+
+Prompt rendering follows ``main_generation.py:128-171``, including the prefill case
+where the last message is an assistant turn the model must RESUME rather than answer
+afresh. On such a set ``--teacher-drop-prefill`` hides that partial answer from model
+B, so the teacher guides from the question alone while the student still continues
+its own text.
 """
 
 from __future__ import annotations
@@ -350,18 +356,80 @@ def joint_generate(model_a, model_b, batch_a, batch_b, *, eos_ids, pad_id, args)
 # ---------------------------------------------------------------------------
 # prompts
 # ---------------------------------------------------------------------------
+def ends_with_assistant(chat) -> bool:
+    """True when the last message is an assistant turn, i.e. this row is a prefill."""
+    return bool(len(chat)) and chat[-1].get("role") == "assistant"
+
+
 def render(tokenizer, chats, max_length):
-    """Left-pad a batch of chat prompts, the way main_generation.py:138-147 does."""
-    return tokenizer.apply_chat_template(
-        chats,
-        add_generation_prompt=True,
+    """Tokenise a batch of chat prompts, matching main_generation.py:128-171.
+
+    A prompt whose last message is an ASSISTANT turn is a prefill: the model must
+    RESUME writing that message, not start a new one. The two template flags that
+    control this are mutually exclusive in transformers (passing both raises):
+
+      add_generation_prompt=True   -> ...assistant\\nPREFIX<|im_end|>\\n<|im_start|>assistant\\n
+                                      the prefix is closed as a finished turn and the
+                                      model answers again from scratch.
+      continue_final_message=True  -> ...assistant\\nPREFIX
+                                      no end-of-turn token, so generation resumes
+                                      inside the prefix. This is what prefill means.
+
+    Built by Data/prepare_prefill_continue.py. Getting it wrong does not raise -- the
+    model just silently re-answers instead of continuing, which quietly voids the
+    experiment.
+
+    The flag is per-CALL but the decision is per-ROW, so a batch mixing prefilled and
+    plain prompts cannot use one call. Each row is rendered to text with its own flag
+    and the batch is tokenised afterwards -- same padding/truncation, same result for
+    the all-plain case.
+    """
+    n_prefill = sum(ends_with_assistant(chat) for chat in chats)
+    if n_prefill == 0:
+        return tokenizer.apply_chat_template(
+            chats,
+            add_generation_prompt=True,
+            padding=True,
+            truncation=True,
+            max_length=max_length,
+            return_tensors="pt",
+            return_dict=True,
+            tokenize=True,
+        )
+    rendered = [
+        tokenizer.apply_chat_template(
+            chat,
+            tokenize=False,
+            **({"continue_final_message": True} if ends_with_assistant(chat)
+               else {"add_generation_prompt": True}),
+        )
+        for chat in chats
+    ]
+    # add_special_tokens=False: the rendered text already carries every control token
+    # the template needs, so letting the tokenizer add BOS again would duplicate it.
+    return tokenizer(
+        rendered,
+        add_special_tokens=False,
         padding=True,
         truncation=True,
         max_length=max_length,
         return_tensors="pt",
-        return_dict=True,
-        tokenize=True,
     )
+
+
+def strip_trailing_assistant(chats):
+    """Drop a trailing assistant turn, so this side sees the question without the prefix.
+
+    For prefill eval sets the prefix is a student attempt spliced in as the last
+    message. Handing it to the teacher would let it read what the student already
+    wrote -- fine for the student, which is supposed to continue its own text, but it
+    makes the teacher's guidance conditional on the very thing being judged.
+
+    Dropping the turn here rather than reading a different column keeps this working
+    for any prefill parquet, including ones with no bare-question column, and keeps
+    both sides on the same `--prompt-key`.
+    """
+    return [chat[:-1] if ends_with_assistant(chat) else chat for chat in chats]
 
 
 def as_chat(cell):
@@ -385,6 +453,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--prompt-key-b", default=None,
                    help="Prompt column for model B. Defaults to --prompt-key, i.e. both models see the "
                         "same prompt and the fusion is purely a model difference.")
+    p.add_argument("--teacher-drop-prefill", action="store_true",
+                   help="Drop a trailing assistant turn from MODEL B's prompt only. On a "
+                        "prefill eval set (Data/prepare_prefill_continue.py) that turn is the "
+                        "student's own partial answer: the student should resume it, but giving "
+                        "it to the teacher makes the teacher's guidance conditional on the text "
+                        "being judged. No effect on prompts that do not end in an assistant turn.")
     p.add_argument("--fuse", default="linear", choices=("linear", "contrastive", "max", "agree"),
                    help="How to combine the two models. linear/contrastive/max blend the "
                         "distributions and then sample; 'agree' lets the teacher (model B) "
@@ -529,6 +603,16 @@ def main() -> int:
 
     chats_a = [as_chat(c) for c in shard[args.prompt_key]]
     chats_b = [as_chat(c) for c in shard[prompt_key_b]]
+
+    n_prefill = sum(ends_with_assistant(c) for c in chats_a)
+    if args.teacher_drop_prefill:
+        chats_b = strip_trailing_assistant(chats_b)
+    if rank == 0 and n_prefill:
+        # Worth stating either way: whether the teacher can see the student's partial
+        # answer changes what the run measures, and neither choice raises.
+        seen = "does NOT see" if args.teacher_drop_prefill else "SEES"
+        print(f"[prefill] {n_prefill}/{len(chats_a)} rows end with an assistant turn; "
+              f"student resumes it, teacher {seen} it", flush=True)
 
     # [n_rows][n_samples] -- transposed to match main_generation.py's per-row lists.
     texts: list[list[str]] = [[] for _ in range(len(shard))]
