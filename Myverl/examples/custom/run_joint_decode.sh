@@ -103,15 +103,15 @@ FUSE=${FUSE:-agree}               # linear | contrastive | max | agree
 # distributions the top-k sets overlap almost completely, so k stops mattering
 # above ~10 while the floor still moves both the fallback rate and how often the
 # student's pick differs from the teacher's. So the sweep runs over it.
-AGREE_TEACHER_MIN_PROBS=${AGREE_TEACHER_MIN_PROBS:-0,0.02,0.05,0.1}
+AGREE_TEACHER_MIN_PROBS=${AGREE_TEACHER_MIN_PROBS:-0.05}
 AGREE_TOP_K=${AGREE_TOP_K:-10}
 # Per-side overrides, both defaulting to AGREE_TOP_K. They mean different things: the
 # teacher's bounds how much of the vocabulary it permits at all, the student's bounds how
 # far down its own ranking it will look for something permitted. So raising only the
 # student's is the cheapest way to cut the fallback rate -- it reaches further for an
 # agreed token without widening what the teacher allows.
-AGREE_STUDENT_TOP_K=${AGREE_STUDENT_TOP_K:-}
-AGREE_TEACHER_TOP_K=${AGREE_TEACHER_TOP_K:-}
+AGREE_STUDENT_TOP_K=${AGREE_STUDENT_TOP_K:-50}
+AGREE_TEACHER_TOP_K=${AGREE_TEACHER_TOP_K:-8}
 # Only raise this to veto tokens the student is very reluctant to emit -- it
 # already ranks the survivors, so 0 is the natural default.
 AGREE_STUDENT_MIN_PROB=${AGREE_STUDENT_MIN_PROB:-0}
@@ -133,7 +133,7 @@ AGREE_FALLBACK=${AGREE_FALLBACK:-student}
 PROMPT_KEY=${PROMPT_KEY:-question_prompt}
 PROMPT_KEY_B=${PROMPT_KEY_B:-prompt}
 
-N_SAMPLES=${N_SAMPLES:-1}          # samples per question; >1 to see sampling variance
+N_SAMPLES=${N_SAMPLES:-4}          # samples per question; >1 to see sampling variance
 TEMPERATURE=${TEMPERATURE:-1}
 TOP_P=${TOP_P:-0.95}
 TOP_K=${TOP_K:--1}
