@@ -203,7 +203,7 @@ echo "model names for labels: A=$NAME_A  B=$NAME_B"
 SWEEP_DIR=${LOG_ROOT}/${EXP_NAME}
 mkdir -p "$SWEEP_DIR"
 SUMMARY="${SWEEP_DIR}/summary.tsv"
-printf 'label\tavg_score\tmax_score\tavg_len_tokens\tlen_ok\tlen_bad\tfallback\tstudent_prob\toutput_dir\n' > "$SUMMARY"
+printf 'label\tavg_score\tmax_score\tavg_len_tokens\tlen_ok\tlen_bad\tfallback\tkeep_ratio\tstudent_prob\toutput_dir\n' > "$SUMMARY"
 
 # The swept variable depends on the mode: a mixing weight for the blending modes,
 # a min-prob floor for the selection mode.
@@ -315,6 +315,12 @@ for value in "${SWEEP_LIST[@]}"; do
     #                    is the column that says whether the method did anything: ~1.0 is
     #                    plain decoding by the fallback owner, ~0.0 at a zero floor is
     #                    plain student decoding.
+    #   keep_ratio    -- mean Z_t, the share of the STUDENT's probability mass the
+    #                    teacher left standing at each step (sum of p_student over the
+    #                    eligible set). The most direct measure of how hard the
+    #                    constraint bites: 1.0 means the teacher permitted everything the
+    #                    student cared about, near 0 means the student is being pushed
+    #                    onto tokens it thought unlikely. Fallback steps count as 0.
     #   student_prob  -- geometric-mean p_student of the emitted tokens. Falls as the
     #                    constraint pushes the student off its own preferences, so read
     #                    it against avg_score to see what the accuracy cost.
@@ -327,7 +333,7 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 files = sorted(glob.glob(f"{sys.argv[1]}/*.parquet"))
-means, maxes, lengths, fbs, logps = [], [], [], [], []
+means, maxes, lengths, fbs, logps, keeps = [], [], [], [], [], []
 len_ok, len_bad = [], []
 missing_lengths = False
 
@@ -352,7 +358,8 @@ for path in files:
     # would otherwise fall back to characters, which reads ~3x larger).
     present = set(pq.read_schema(path).names)
     columns = ["test_score"] + [c for c in ("response_lengths", "fallback_frac",
-                                            "student_mean_logp") if c in present]
+                                            "student_mean_logp",
+                                            "teacher_keep_ratio") if c in present]
     if "response_lengths" not in present:
         missing_lengths = True
     df = pd.read_parquet(path, columns=columns)
@@ -375,9 +382,11 @@ for path in files:
         fbs.extend(v for row in df["fallback_frac"] for v in row if _usable(v))
     if "student_mean_logp" in df:
         logps.extend(v for row in df["student_mean_logp"] for v in row if _usable(v))
+    if "teacher_keep_ratio" in df:
+        keeps.extend(v for row in df["teacher_keep_ratio"] for v in row if _usable(v))
 
 if not means:
-    print("NA\tNA\tNA\tNA\tNA\tNA\tNA")
+    print("NA\tNA\tNA\tNA\tNA\tNA\tNA\tNA")
 else:
     def _mean_len(vals):
         # NA rather than 0 when a bucket is empty: an all-correct run has no wrong
@@ -388,15 +397,16 @@ else:
     ok_len = _mean_len(len_ok)
     bad_len = _mean_len(len_bad)
     fb = f"{sum(fbs) / len(fbs):.4f}" if fbs else "NA"
+    kr = f"{sum(keeps) / len(keeps):.4f}" if keeps else "NA"
     # exp of the mean per-token log-prob: a geometric mean, so it is not skewed by
     # response length the way a plain mean of probabilities would be.
     sp = f"{math.exp(sum(logps) / len(logps)):.4f}" if logps else "NA"
     print(f"{sum(means) / len(means):.4f}\t{sum(maxes) / len(maxes):.4f}\t{avg_len}\t"
-          f"{ok_len}\t{bad_len}\t{fb}\t{sp}")
+          f"{ok_len}\t{bad_len}\t{fb}\t{kr}\t{sp}")
 PYEOF
 )
     printf '%s\t%s\t%s\n' "$label" "$metrics" "$out_dir" >> "$SUMMARY"
-    echo "=== [$label] score/max/len/len_ok/len_bad/fallback/student_prob: $metrics ==="
+    echo "=== [$label] score/max/len/len_ok/len_bad/fallback/keep_ratio/student_prob: $metrics ==="
 done
 
 echo
