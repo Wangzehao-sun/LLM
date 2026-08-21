@@ -196,7 +196,7 @@ echo "model names for labels: A=$NAME_A  B=$NAME_B"
 SWEEP_DIR=${LOG_ROOT}/${EXP_NAME}
 mkdir -p "$SWEEP_DIR"
 SUMMARY="${SWEEP_DIR}/summary.tsv"
-printf 'label\tavg_score\tmax_score\tavg_len_tokens\tfallback\tstudent_prob\toutput_dir\n' > "$SUMMARY"
+printf 'label\tavg_score\tmax_score\tavg_len_tokens\tlen_ok\tlen_bad\tfallback\tkeep_ratio\tstudent_prob\toutput_dir\n' > "$SUMMARY"
 
 # The swept variable depends on the mode: a mixing weight for the blending modes,
 # a min-prob floor for the selection mode.
@@ -296,11 +296,24 @@ for value in "${SWEEP_LIST[@]}"; do
     #   max_score     -- mean of per-question max_score, i.e. pass@N
     #   avg_len       -- mean response length in TOKENS. Compare it against
     #                    MAX_NEW_TOKENS to see whether generations are hitting the cap.
+    #   len_ok        -- mean length of CORRECT responses
+    #   len_bad       -- mean length of WRONG responses. Split out because the two
+    #                    usually differ sharply and the combined mean hides it: wrong
+    #                    answers are often the ones that ran to the cap without
+    #                    converging, so len_bad near MAX_NEW_TOKENS with len_ok well
+    #                    below it says the failures are non-termination rather than bad
+    #                    reasoning -- a different problem with a different fix.
     #   fallback      -- share of emitted tokens where the constraint left no candidate,
     #                    so AGREE_FALLBACK decided instead. 0 outside --fuse agree. This
     #                    is the column that says whether the method did anything: ~1.0 is
     #                    plain decoding by the fallback owner, ~0.0 at a zero floor is
     #                    plain student decoding.
+    #   keep_ratio    -- mean Z_t, the share of the STUDENT's probability mass the
+    #                    teacher left standing at each step (sum of p_student over the
+    #                    eligible set). The most direct measure of how hard the
+    #                    constraint bites: 1.0 means the teacher permitted everything the
+    #                    student cared about, near 0 means the student is being pushed
+    #                    onto tokens it thought unlikely. Fallback steps count as 0.
     #   student_prob  -- geometric-mean p_student of the emitted tokens. Falls as the
     #                    constraint pushes the student off its own preferences, so read
     #                    it against avg_score to see what the accuracy cost.
@@ -313,12 +326,23 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 files = sorted(glob.glob(f"{sys.argv[1]}/*.parquet"))
-means, maxes, lengths, fbs, logps = [], [], [], [], []
+means, maxes, lengths, fbs, logps, keeps = [], [], [], [], [], []
+len_ok, len_bad = [], []
 missing_lengths = False
 
 
 def _usable(v):
     return v is not None and not math.isnan(v)
+
+
+def _correct(score):
+    """Match main_generation's notion of a passing score: truthy, or >= 1 numerically."""
+    if isinstance(score, bool):
+        return score
+    try:
+        return float(score) >= 1.0
+    except (TypeError, ValueError):
+        return bool(score)
 
 
 for path in files:
@@ -327,7 +351,8 @@ for path in files:
     # would otherwise fall back to characters, which reads ~3x larger).
     present = set(pq.read_schema(path).names)
     columns = ["test_score"] + [c for c in ("response_lengths", "fallback_frac",
-                                            "student_mean_logp") if c in present]
+                                            "student_mean_logp",
+                                            "teacher_keep_ratio") if c in present]
     if "response_lengths" not in present:
         missing_lengths = True
     df = pd.read_parquet(path, columns=columns)
@@ -337,6 +362,12 @@ for path in files:
     if "response_lengths" in df:
         for row in df["response_lengths"]:
             lengths.extend(int(n) for n in row)
+        # scores_per_response and response_lengths are per-sample lists in the same
+        # order, so they pair by index -- no extra column needed. zip() also guards the
+        # case where one is shorter, which would otherwise misalign silently.
+        for score, row in zip(df["test_score"], df["response_lengths"]):
+            for ok, n in zip(score["scores_per_response"], row):
+                (len_ok if _correct(ok) else len_bad).append(int(n))
     # NaN marks a response that emitted no tokens, so there was nothing to average
     # over. Arrow stores those as nulls, which read back as None rather than NaN, so
     # both have to be filtered -- math.isnan(None) is a TypeError, not False.
@@ -344,20 +375,31 @@ for path in files:
         fbs.extend(v for row in df["fallback_frac"] for v in row if _usable(v))
     if "student_mean_logp" in df:
         logps.extend(v for row in df["student_mean_logp"] for v in row if _usable(v))
+    if "teacher_keep_ratio" in df:
+        keeps.extend(v for row in df["teacher_keep_ratio"] for v in row if _usable(v))
 
 if not means:
-    print("NA\tNA\tNA\tNA\tNA")
+    print("NA\tNA\tNA\tNA\tNA\tNA\tNA\tNA")
 else:
-    avg_len = f"{sum(lengths) / len(lengths):.0f}" if lengths and not missing_lengths else "NA"
+    def _mean_len(vals):
+        # NA rather than 0 when a bucket is empty: an all-correct run has no wrong
+        # responses to measure, and 0 would read as "the wrong ones were empty".
+        return f"{sum(vals) / len(vals):.0f}" if vals and not missing_lengths else "NA"
+
+    avg_len = _mean_len(lengths)
+    ok_len = _mean_len(len_ok)
+    bad_len = _mean_len(len_bad)
     fb = f"{sum(fbs) / len(fbs):.4f}" if fbs else "NA"
+    kr = f"{sum(keeps) / len(keeps):.4f}" if keeps else "NA"
     # exp of the mean per-token log-prob: a geometric mean, so it is not skewed by
     # response length the way a plain mean of probabilities would be.
     sp = f"{math.exp(sum(logps) / len(logps)):.4f}" if logps else "NA"
-    print(f"{sum(means) / len(means):.4f}\t{sum(maxes) / len(maxes):.4f}\t{avg_len}\t{fb}\t{sp}")
+    print(f"{sum(means) / len(means):.4f}\t{sum(maxes) / len(maxes):.4f}\t{avg_len}\t"
+          f"{ok_len}\t{bad_len}\t{fb}\t{kr}\t{sp}")
 PYEOF
 )
     printf '%s\t%s\t%s\n' "$label" "$metrics" "$out_dir" >> "$SUMMARY"
-    echo "=== [$label] avg_score / max_score / avg_len / fallback / student_prob: $metrics ==="
+    echo "=== [$label] score/max/len/len_ok/len_bad/fallback/keep_ratio/student_prob: $metrics ==="
 done
 
 echo
