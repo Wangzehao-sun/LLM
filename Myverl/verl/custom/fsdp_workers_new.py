@@ -98,22 +98,24 @@ def get_sharding_strategy(device_mesh):
 #   * "se_rollout_ref" appears ONLY in _REF_ROLES. It is inference-only by construction --
 #     update_actor / generate_sequences / compute_log_prob / save_checkpoint all assert
 #     _is_actor or _is_rollout, none of which it has. Do not "fix" this by adding it here.
-#   * "rephraser_logprob" is the frozen second model, and it appears in NEITHER _ACTOR_ROLES
-#     NOR _ROLLOUT_ROLES. Both omissions are load-bearing:
-#       - not an actor  -> no optimizer; update_actor and save_checkpoint (both
-#         `assert self._is_actor`) reject it, so freezing is structural rather than a
-#         convention we happen to follow.
-#       - not a rollout -> no vLLM engine. vLLM's sleep mode is built on a PROCESS-GLOBAL
-#         CuMemAllocator with hardcoded "weights"/"kv_cache" tags, so a second engine in
-#         the same process would have its memory freed by the first one's sleep(). SGLang
-#         has the same problem via torch_memory_saver. Computing log-probs needs no engine
-#         at all -- it is one forward pass, the same path critic/reward scoring takes,
-#         which is why those can already coexist. Candidate GENERATION, which does need an
-#         engine, is done offline instead (Data/aggregate_sr_responses.py).
+#   * The frozen rephraser comes in TWO variants, and the difference is not cosmetic -- it
+#     is dictated by which resource pool the worker lands in:
+#       - "rephraser_rollout"  (own pool, hence own Ray actor process): may hold a vLLM
+#         engine, so it generates candidates online AND computes their log-probs.
+#       - "rephraser_logprob"  (shares the reasoner's pool, hence its process): must NOT
+#         hold an engine. vLLM's sleep mode is built on a PROCESS-GLOBAL CuMemAllocator
+#         with hardcoded "weights"/"kv_cache" tags, so a second engine in the same process
+#         would have its memory freed by the first one's sleep() (SGLang has the identical
+#         problem via torch_memory_saver). Log-probs need no engine at all -- one forward
+#         pass, the same path critic/reward scoring takes, which is why THOSE can already
+#         coexist. Candidates come from Data/aggregate_sr_responses.py instead.
+#     Both are in _FROZEN_LM_ROLES and NEITHER is in _ACTOR_ROLES: no optimizer, and
+#     update_actor / save_checkpoint (both `assert self._is_actor`) reject them. Freezing is
+#     therefore structural, not a convention we happen to follow.
 _ACTOR_ROLES = ("actor", "actor_rollout", "actor_rollout_ref")
-_ROLLOUT_ROLES = ("rollout", "actor_rollout", "actor_rollout_ref")
+_ROLLOUT_ROLES = ("rollout", "actor_rollout", "actor_rollout_ref", "rephraser_rollout")
 _REF_ROLES = ("ref", "actor_rollout_ref", "se_rollout_ref")
-_FROZEN_LM_ROLES = ("rephraser_logprob",)
+_FROZEN_LM_ROLES = ("rephraser_logprob", "rephraser_rollout")
 _ALL_ROLES = tuple(dict.fromkeys(_ACTOR_ROLES + _ROLLOUT_ROLES + _REF_ROLES + _FROZEN_LM_ROLES))
 
 
