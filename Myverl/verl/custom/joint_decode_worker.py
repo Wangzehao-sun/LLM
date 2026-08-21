@@ -45,7 +45,7 @@ from verl.custom.joint_decode_core import joint_generate
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils import hf_tokenizer
-from verl.utils.device import get_device_name, get_nccl_backend, get_torch_device
+from verl.utils.device import get_device_id, get_device_name, get_nccl_backend, get_torch_device
 from verl.utils.fs import copy_to_local
 
 logger = logging.getLogger(__file__)
@@ -110,7 +110,7 @@ class JointDecodeWorker(Worker):
             # No FSDP wrap and no device_map: one whole model per rank, on that rank's
             # own GPU. device_map='auto' would shard it across visible devices and
             # collide with the data-parallel split the dispatch layer already does.
-            return model.to(get_torch_device().current_device()).eval()
+            return model.to(get_device_id()).eval()
         raise RuntimeError(
             f"could not load {tag} from {path} with any of {wanted}:\n  " + "\n  ".join(errors)
         )
@@ -174,7 +174,7 @@ class JointDecodeWorker(Worker):
         decodes whatever rows it is handed.
         """
         cfg = self.config
-        device = get_torch_device().current_device()
+        device = get_device_id()
         width = int(data.meta_info["max_response_length"])
 
         student = {
