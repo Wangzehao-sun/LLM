@@ -165,11 +165,12 @@ def agree_select(
     with each fallback and ``--n-samples > 1`` would stop meaning anything.
     ``temperature == 0`` still gives greedy behaviour on both paths.
 
-    Returns (token ids [B, 1], fell_back [B] bool, log_pa [B, vocab]) so the caller can
-    report how often the agreement actually bound anything, and reuse the student's
-    log-probs. Under ``fallback='teacher'`` a rate near 1.0 means the run is
-    effectively plain teacher decoding; under ``'student'`` it means plain student
-    decoding. Either way the intersection is doing no work.
+    Returns (token ids [B, 1], fell_back [B] bool, log_pa [B, vocab], z_t [B]) so the
+    caller can report how often the agreement actually bound anything, reuse the
+    student's log-probs, and track how much student mass survived the constraint. Under
+    ``fallback='teacher'`` a fallback rate near 1.0 means the run is effectively plain
+    teacher decoding; under ``'student'`` it means plain student decoding. Either way the
+    intersection is doing no work.
     """
     log_pa = F.log_softmax(logits_a.float(), dim=-1)
     log_pb = F.log_softmax(logits_b.float(), dim=-1)
@@ -199,6 +200,16 @@ def agree_select(
     )
     fell_back = ~eligible.any(dim=-1)
 
+    # Z_t: how much of the STUDENT's probability mass the teacher left standing, i.e.
+    # sum of p_a over the eligible set. This is the renormaliser in
+    # mu_t(v) = p_a(v) * 1[v in F_t] / Z_t, and the most direct measure of how hard the
+    # constraint is biting -- 1.0 means the teacher permitted everything the student
+    # cared about, near 0 means it kept only tokens the student thought unlikely.
+    # Read off the mask rather than the sampled token, so it describes the constraint
+    # itself and not the draw. Fallback rows get 0: nothing survived, so no mass did.
+    z_t = torch.where(eligible, log_pa.exp(), torch.zeros_like(log_pa)).sum(dim=-1)
+    z_t = torch.where(fell_back, torch.zeros_like(z_t), z_t)
+
     # Student chooses inside the allowed set. Renormalising is not needed --
     # sample_next softmaxes and the -inf entries drop out -- but a row masked to all
     # -inf would give softmax nothing to sample, which is why the rows with no survivor
@@ -212,7 +223,7 @@ def agree_select(
     chosen = sample_next(scores, temperature, top_p, -1, narrow_counter=narrow_counter)
     # log_pa goes back to the caller so the per-token confidence stat can reuse it
     # instead of recomputing a [B, vocab] log_softmax every step.
-    return chosen, fell_back, log_pa
+    return chosen, fell_back, log_pa, z_t
 
 
 def sample_next(scores: torch.Tensor, temperature: float, top_p: float, top_k: int,
@@ -303,10 +314,11 @@ def joint_generate(model_a, model_b, batch_a, batch_b, *, eos_ids, pad_id, args)
     same split the trainer's sr_logprob_prompt uses.
 
     Returns (responses [B, T] padded with pad_id, lengths [B], fb_rows [B],
-    logp_rows [B], n_narrow). fb_rows counts teacher-fallback tokens per row and stays 0
-    outside ``--fuse agree``; logp_rows sums log p_student over the emitted tokens, so
-    dividing by lengths gives a per-row mean; n_narrow counts row-steps where top-p's
-    nucleus ran past sample_next's candidate cap.
+    logp_rows [B], z_rows [B], n_narrow). fb_rows counts teacher-fallback tokens per row
+    and stays 0 outside ``--fuse agree``; logp_rows sums log p_student over the emitted
+    tokens and z_rows sums the surviving student mass, so dividing either by lengths
+    gives a per-row mean; n_narrow counts row-steps where top-p's nucleus ran past
+    sample_next's candidate cap.
 
     Rows are dropped from the batch as they finish, so the returned tensors are indexed
     by the row's ORIGINAL position, not by its position in the shrinking batch.
@@ -351,6 +363,10 @@ def joint_generate(model_a, model_b, batch_a, batch_b, *, eos_ids, pad_id, args)
     # including them would dilute the averages with padding.
     fb_rows = torch.zeros(n_rows, dtype=torch.long, device=device)
     logp_rows = torch.zeros(n_rows, dtype=torch.float64, device=device)
+    # Sum of Z_t over emitted tokens, so dividing by lengths gives the mean share of
+    # student mass the teacher permitted. Fallback steps contribute 0, which is the
+    # honest reading -- nothing survived there.
+    z_rows = torch.zeros(n_rows, dtype=torch.float64, device=device)
     # Rows where top_p's nucleus ran past the candidate cap, so sampling was narrower
     # than requested. Kept on-device and read once at the end -- checking per step would
     # reintroduce exactly the host sync the EOS check was loosened to avoid.
@@ -380,7 +396,7 @@ def joint_generate(model_a, model_b, batch_a, batch_b, *, eos_ids, pad_id, args)
     for step in range(args.max_new_tokens):
         steps_run = step + 1
         if args.fuse == "agree":
-            nxt, fell_back, log_pa = agree_select(
+            nxt, fell_back, log_pa, z_t = agree_select(
                 last_a, last_b,
                 student_top_k=args.agree_student_top_k,
                 teacher_top_k=args.agree_teacher_top_k,
@@ -392,6 +408,9 @@ def joint_generate(model_a, model_b, batch_a, batch_b, *, eos_ids, pad_id, args)
                 narrow_counter=narrow,
             )
             fb_rows.index_add_(0, alive_idx, (fell_back & alive).long())
+            z_rows.index_add_(0, alive_idx,
+                              torch.where(alive, z_t.double(),
+                                          torch.zeros_like(z_t, dtype=torch.float64)))
         else:
             scores = fuse_logits(last_a, last_b, args.fuse, args.fuse_weight)
             nxt = sample_next(scores, args.temperature, args.top_p, args.top_k,
@@ -453,7 +472,7 @@ def joint_generate(model_a, model_b, batch_a, batch_b, *, eos_ids, pad_id, args)
         next_pos_b = next_pos_b + 1
 
     return (out_tokens[:, :steps_run].cpu(), lengths.cpu(), fb_rows.cpu(),
-            logp_rows.cpu(), int(narrow.item()))
+            logp_rows.cpu(), z_rows.cpu(), int(narrow.item()))
 
 
 # ---------------------------------------------------------------------------
@@ -814,6 +833,7 @@ def main() -> int:
     tok_lens: list[list[int]] = [[] for _ in range(len(shard))]
     fb_frac: list[list[float]] = [[] for _ in range(len(shard))]
     mean_logp: list[list[float]] = [[] for _ in range(len(shard))]
+    mean_z: list[list[float]] = [[] for _ in range(len(shard))]
 
     total_tokens = 0
     fallback_tokens = 0
@@ -841,7 +861,7 @@ def main() -> int:
             stop = min(begin + args.batch_size, len(shard))
             batch_a = render(tok_a, chats_a[begin:stop], args.prompt_length)
             batch_b = render(tok_b, chats_b[begin:stop], args.prompt_length)
-            responses, lengths, fb_row, logp_row, n_narrow = joint_generate(
+            responses, lengths, fb_row, logp_row, z_row, n_narrow = joint_generate(
                 model_a, model_b, batch_a, batch_b, eos_ids=eos_ids, pad_id=pad_id, args=args,
             )
             narrow_steps += n_narrow
@@ -857,6 +877,9 @@ def main() -> int:
                 fb_frac[begin + row].append(n_fb / n_tok if n_tok else float("nan"))
                 mean_logp[begin + row].append(
                     float(logp_row[row].item()) / n_tok if n_tok else float("nan")
+                )
+                mean_z[begin + row].append(
+                    float(z_row[row].item()) / n_tok if n_tok else float("nan")
                 )
                 fallback_tokens += n_fb
                 decided_tokens += n_tok
@@ -917,10 +940,19 @@ def main() -> int:
               f"teacher_top_k={args.agree_teacher_top_k}, "
               f"teacher_min_prob={args.agree_teacher_min_prob}, "
               f"student_min_prob={args.agree_student_min_prob})", flush=True)
+        # Z_t averaged over emitted tokens: the share of the student's probability mass
+        # the teacher left standing. Near 1.0 the constraint is nominal; near 0 the
+        # student is being pushed onto tokens it thought unlikely, which is what
+        # student_prob then pays for.
+        finite_z = [v for row in mean_z for v in row if not math.isnan(v)]
+        if finite_z:
+            print(f"[rank {rank}] teacher_keep_ratio (mean Z_t) = "
+                  f"{sum(finite_z) / len(finite_z):.4f}", flush=True)
 
     shard["responses"] = texts
     shard["fallback_frac"] = fb_frac
     shard["student_mean_logp"] = mean_logp
+    shard["teacher_keep_ratio"] = mean_z
     shard["response_lengths"] = tok_lens
 
     if not args.no_score:
