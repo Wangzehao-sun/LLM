@@ -71,6 +71,7 @@ from verl.trainer.ppo.ray_trainer import (
     reduce_metrics
 )
 from verl.custom.new_vllm_rollout import _pre_process_inputs_right_pad, _pre_process_inputs
+from verl.custom import joint_sr
 import re
 
 
@@ -435,7 +436,121 @@ class NewRayPPOTrainer(RayPPOTrainer):
         self._validate_config()
         self._validate_rephraser_config()
         self._validate_sr_offline_config()
+        self._validate_joint_config()
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+
+    def _validate_joint_config(self):
+        """Reject joint-decoding configurations that cannot do what they claim.
+
+        Every check here guards a failure that is otherwise SILENT -- a model loaded for
+        nothing, a candidate source that never runs, or a per-step cost that stalls the
+        run. A no-op unless ``joint_decode.enable=True``.
+        """
+        joint_cfg = self.config.get("joint_decode", {})
+        if not joint_cfg.get("enable", False):
+            return
+
+        rollout_cfg = self.config.actor_rollout_ref.rollout
+
+        # Joint-decoded candidates reach the loss ONLY through summarize replacement.
+        # With SR off, two models are loaded and never asked for anything.
+        sr_mode = rollout_cfg.get("summarize_replace", False)
+        if sr_mode is False or sr_mode == "off":
+            raise ValueError(
+                "joint_decode.enable=True but rollout.summarize_replace is off, so the "
+                "joint decoder would never be called and its two models would occupy GPU "
+                "memory for nothing. Set "
+                "+actor_rollout_ref.rollout.summarize_replace=wrong_only (recommended) or "
+                "=True."
+            )
+
+        # Two candidate sources, one splice slot. Whichever branch ran second would win,
+        # so the other model's work is silently discarded.
+        if rollout_cfg.get("sr_use_offline", False):
+            raise ValueError(
+                "joint_decode.enable=True conflicts with rollout.sr_use_offline=True: both "
+                "produce the SR candidate, and only one can be spliced. Pick one -- drop "
+                "sr_use_offline to decode online, or drop joint_decode.enable to use the "
+                "pre-generated column."
+            )
+
+        for key in ("student_model_path", "teacher_model_path"):
+            if not joint_cfg.get(key):
+                raise ValueError(f"joint_decode.enable=True requires joint_decode.{key}")
+
+        # The teacher's long prompt comes from summarize_input_ids, which the dataset only
+        # builds when use_summarize is on.
+        if joint_cfg.get("teacher_prompt", "long") == "long" and not self.config.data.get("use_summarize", False):
+            raise ValueError(
+                "joint_decode.teacher_prompt='long' needs data.use_summarize=True: the long "
+                "prompt is summarize_input_ids, pre-rendered offline by "
+                "Data/prepare_summarize_prompts.py. Either enable it, or set "
+                "+joint_decode.teacher_prompt=short to have the teacher steer from the bare "
+                "question."
+            )
+
+        # K is forced to 1 (one joint decode per question), so a configured K>1 is a
+        # setting that silently does nothing.
+        k = int(rollout_cfg.get("summarize_replace_k", 1))
+        if k > 1:
+            print(
+                f"[joint_decode] summarize_replace_k={k} is ignored: this path decodes ONE "
+                f"candidate per question. Generating K would multiply an already expensive "
+                f"step by K."
+            )
+
+        # A temperature mismatch is the one error here that produces no symptom other than
+        # a wrong gradient. compute_log_prob scales the NUMERATOR's logits by
+        # rollout.temperature; the density recorded while sampling uses this one. If they
+        # differ, off_ratio carries a systematic factor that nothing else reports.
+        joint_temp = float(joint_cfg.get("temperature", 1.0))
+        rollout_temp = float(rollout_cfg.get("temperature", 1.0))
+        if abs(joint_temp - rollout_temp) > 1e-6:
+            print(
+                f"[joint_decode] WARNING: joint_decode.temperature={joint_temp} != "
+                f"rollout.temperature={rollout_temp}. The loss computes its numerator at the "
+                f"ROLLOUT temperature, while the denominator is recorded at the joint one, so "
+                f"off_ratio will carry a systematic factor from the gap. Match them unless "
+                f"that is intentional."
+            )
+
+        # Cost, printed because it is the number that decides whether this is viable at
+        # all. There is no paged attention and no CUDA graph here, and each token costs two
+        # forward passes, so the step time is essentially this product.
+        max_q = int(joint_cfg.get("max_questions_per_step", 0))
+        batch = max(1, int(joint_cfg.get("batch_size", 8)))
+        n_gpus = max(1, int(joint_cfg.get("n_gpus_per_node", 0)) or self.config.trainer.n_gpus_per_node)
+        train_bsz = self.config.data.train_batch_size
+        worst_q = max_q if max_q else train_bsz
+        waves = -(-worst_q // (batch * n_gpus))
+        print(
+            f"[joint_decode] up to {worst_q} question(s)/step over {n_gpus} GPU(s) at "
+            f"batch_size={batch} = {waves} sequential wave(s) x "
+            f"{joint_cfg.get('max_new_tokens')} tokens, two model forwards per token. "
+            f"student={joint_cfg.get('student_model_path')} "
+            f"teacher={joint_cfg.get('teacher_model_path')}"
+        )
+        if sr_mode == "all":
+            print(
+                f"[joint_decode] WARNING: summarize_replace='all' sends every question here "
+                f"({train_bsz}/step)"
+                + (f", capped to {max_q} by max_questions_per_step -- so most questions get no "
+                   f"replacement." if max_q else
+                   " with NO cap. At these lengths that is unlikely to finish; "
+                   "'wrong_only' is what makes this path affordable.")
+            )
+
+        # sr_logprob_prompt selects which prompt the DENSITY is computed under, but this
+        # path does not compute a density afterwards at all -- it records the real one
+        # while sampling. Saying so prevents a wasted experiment.
+        if rollout_cfg.get("sr_logprob_prompt", "long") != "long":
+            print(
+                "[joint_decode] rollout.sr_logprob_prompt is ignored on this path: the "
+                "denominator is the density the token was actually drawn from (recorded by "
+                "the sampler, including the 1/Z_t renormalisation no later forward pass "
+                "could recover). Use joint_decode.student_prompt to choose which prompt the "
+                "student decodes under."
+            )
 
     def _validate_sr_offline_config(self):
         """Check the offline-SR wiring at startup, not mid-step.
@@ -540,28 +655,44 @@ class NewRayPPOTrainer(RayPPOTrainer):
             return
 
         rollout_cfg = self.config.actor_rollout_ref.rollout
+        rp_own_pool = self.config.rephraser.get("n_gpus_per_node", 0) > 0
 
-        # 1. The rephraser is a logprob-only worker: it has no vLLM engine, so its ONLY job
-        #    is supplying log pi_phi(y|x_long) for candidates that were generated offline.
-        #    Without sr_use_offline there is nothing for it to score -- the candidates would
-        #    be generated on the fly by the reasoner, whose log-probs the reasoner can
-        #    compute itself. A whole model's weights for nothing.
-        if not rollout_cfg.get("sr_use_offline", False):
+        # 1. What the rephraser CAN do follows from its resource pool, because a separate
+        #    pool means a separate Ray actor process:
+        #      own pool    -- may hold a vLLM engine, so it generates candidates online.
+        #                     sr_use_offline is then optional (and off by default).
+        #      shared pool -- must not hold an engine (two engines in one process free each
+        #                     other's memory via the process-global CuMemAllocator), so it
+        #                     can only score candidates someone else produced. Without
+        #                     sr_use_offline there is nothing for it to score: the reasoner
+        #                     would generate them and can compute its own log-probs, making
+        #                     this worker a whole model's weights for nothing.
+        if not rp_own_pool and not rollout_cfg.get("sr_use_offline", False):
             raise ValueError(
-                "rephraser.enable=True requires rollout.sr_use_offline=True. The rephraser "
-                "worker has no vLLM engine (see _FROZEN_LM_ROLES in fsdp_workers_new.py) and "
-                "exists solely to compute the proposal density for candidates produced "
+                "rephraser.enable=True with rephraser.n_gpus_per_node=0 requires "
+                "rollout.sr_use_offline=True. Sharing the reasoner's pool means sharing its "
+                "process, where a second vLLM engine cannot live (see _FROZEN_LM_ROLES in "
+                "fsdp_workers_new.py), so this worker can only score candidates generated "
                 "offline by Data/aggregate_sr_responses.py. Either set "
-                "+actor_rollout_ref.rollout.sr_use_offline=True, or drop rephraser.enable."
+                "+actor_rollout_ref.rollout.sr_use_offline=True, or give the rephraser its "
+                "own pool with +rephraser.n_gpus_per_node=N so it can generate online."
+            )
+        if rp_own_pool:
+            print(
+                f"[rephraser] own pool ({self.config.rephraser.n_gpus_per_node} GPU/node): it "
+                f"holds its own vLLM engine, so candidates are generated online"
+                + (" -- but sr_use_offline=True, so the pre-generated column is used instead "
+                   "and the engine only scores it." if rollout_cfg.get("sr_use_offline", False)
+                   else ".")
             )
 
-        # 2. Offline candidates only reach the loss through the summarize-replacement path.
+        # 2. Candidates only reach the loss through the summarize-replacement path.
         sr_mode = rollout_cfg.get("summarize_replace", False)
         if sr_mode is False or sr_mode == "off":
             raise ValueError(
                 "rephraser.enable=True but rollout.summarize_replace is off, so the rephraser "
-                "would never be asked for a log-prob while still holding a full model in "
-                "memory. Set +actor_rollout_ref.rollout.summarize_replace=True (or 'wrong_only')."
+                "would never be used while still holding a full model in memory. Set "
+                "+actor_rollout_ref.rollout.summarize_replace=True (or 'wrong_only')."
             )
 
         # 3. summarize_loss_on_rollout_prompt=True computes the loss on the SAME long prompt
@@ -595,18 +726,25 @@ class NewRayPPOTrainer(RayPPOTrainer):
                 "yet. Set +data.collect_failures=False."
             )
 
-        # 5. _validate_summarize needs to GENERATE under the summarize prompt, which the
-        #    logprob-only rephraser cannot do. It returns {} in this mode rather than
-        #    silently reporting the reasoner's accuracy under a name that says rephraser.
+        # 5. val_summarize/* measures accuracy under the summarize prompt, so it needs to
+        #    GENERATE from the rephraser. Only the own-pool variant can. With a shared pool
+        #    the metric is skipped rather than silently reporting the reasoner's accuracy
+        #    under a name that says rephraser.
         #    Keyed on the CONFIG, not on summarize_val_dataloader: this method runs before
         #    _create_dataloader, so that attribute does not exist yet.
         if self.config.data.get("summarize_val_files", None):
-            print(
-                "[rephraser] val_summarize/* is DISABLED: measuring it needs generation under "
-                "the summarize prompt, and the rephraser worker is logprob-only. Evaluate the "
-                "rephraser offline instead (sweep_sft_checkpoints.sh + "
-                "Data/prepare_rephrase_eval.py)."
-            )
+            if rp_own_pool:
+                print(
+                    "[rephraser] val_summarize/* measures the REPHRASER (it has its own engine), "
+                    "while _validate() keeps measuring the reasoner."
+                )
+            else:
+                print(
+                    "[rephraser] val_summarize/* is DISABLED: measuring it needs generation under "
+                    "the summarize prompt, and a shared-pool rephraser is logprob-only. Give it "
+                    "its own pool (+rephraser.n_gpus_per_node=N), or evaluate offline "
+                    "(sweep_sft_checkpoints.sh + Data/prepare_rephrase_eval.py)."
+                )
 
         # 6. async_rollout_manager is wired to the reasoner only.
         if rollout_cfg.get("mode", "sync") != "sync":
@@ -617,16 +755,25 @@ class NewRayPPOTrainer(RayPPOTrainer):
             )
 
         # 5. The IS story only holds for reshapes that actually consume old_log_probs.
-        #    'p_div_p_0.1' overwrites off_ratio outright and discards the proposal density;
-        #    'dynamic_clip'/'vanilla' skip the off_old_log_probs -> old_log_probs swap, which
-        #    leaves the reasoner's short-prompt value in place and collapses the ratio to ~1.
+        #    'dynamic_clip'/'vanilla' skip the off_old_log_probs -> old_log_probs swap
+        #    (new_ray_trainer.py:3298), which leaves the reasoner's short-prompt value in
+        #    place and collapses the ratio to ~1 -- a silently wrong gradient, so reject.
+        #
+        #    'p_div_p_0.1' is NOT rejected: the swap does run, and discarding the ratio in
+        #    favour of the LUFFY-style weight off_ratio = p/(p+0.1) (new_core_alg.py:604) is
+        #    a deliberate algorithmic choice, not a misconfiguration. Note it makes the
+        #    rephraser's density reach the loss through NO path -- pi_phi(y|x_long) is left
+        #    with only non-gradient uses (target_probs, candidate selection), so a
+        #    single-model run gives an identical gradient for one model less of memory.
+        #    Keep the second model only when the comparison against 'clip' is the point.
         reshape = self.config.actor_rollout_ref.actor.policy_loss.get("off_policy_reshape", "clip")
-        if reshape in ("dynamic_clip", "vanilla", "p_div_p_0.1"):
+        if reshape in ("dynamic_clip", "vanilla"):
             raise ValueError(
                 f"rephraser.enable=True is incompatible with off_policy_reshape={reshape!r}: "
-                f"the proposal density pi_phi(y|x_long) would not reach the loss, so the "
-                f"importance ratio degenerates. Use 'clip' (or batch_mean_norm / "
-                f"group_ess_weight)."
+                f"the off_old_log_probs -> old_log_probs swap is skipped, so the off rows "
+                f"train with an importance ratio of ~1 and the proposal density "
+                f"pi_phi(y|x_long) never reaches the loss. Use 'clip' (or p_div_p_0.1 / "
+                f"batch_mean_norm / group_ess_weight)."
             )
 
         # Not an error: a different rephraser model is the intended setup. But the two models
@@ -806,10 +953,33 @@ class NewRayPPOTrainer(RayPPOTrainer):
                     self.config.get("actor_rollout_rephraser", OmegaConf.create()),
                 )
                 print(f"Using rephraser config, model.path={rp_config.model.path}")
+                # The role name encodes whether this worker may hold a vLLM engine, and that
+                # follows from the pool: its own pool means its own process, so an engine is
+                # safe; the shared pool means the reasoner's process, where a second engine
+                # would be freed by the first one's sleep(). See _FROZEN_LM_ROLES in
+                # fsdp_workers_new.py. Both variants stay frozen (neither is an actor).
+                rp_own_pool = self.config.get("rephraser", {}).get("n_gpus_per_node", 0) > 0
+                rp_role = "rephraser_rollout" if rp_own_pool else "rephraser_logprob"
+                print(
+                    f"[rephraser] role={rp_role} "
+                    f"({'own pool: generates online' if rp_own_pool else 'shared pool: log-probs only'})"
+                )
                 self.resource_pool_to_cls[resource_pool_rp]["rephraser"] = RayClassWithInitArgs(
                     cls=self.role_worker_mapping[Role.ActorRolloutRephraser],
                     config=rp_config,
-                    role="rephraser_logprob",
+                    role=rp_role,
+                )
+
+            # Joint decoding: two frozen models that decode together, fusing per token,
+            # to produce the summarize-replacement candidate. Unlike the rephraser this
+            # is NOT an actor_rollout worker -- it takes only its own config node and has
+            # no `role` argument, because there is nothing for a role to select between
+            # (no optimizer, no vLLM engine, no FSDP wrap). See joint_decode_worker.py.
+            if Role.JointDecode in self.role_worker_mapping:
+                resource_pool_jd = self.resource_pool_manager.get_resource_pool(Role.JointDecode)
+                self.resource_pool_to_cls[resource_pool_jd]["joint_decode"] = RayClassWithInitArgs(
+                    cls=self.role_worker_mapping[Role.JointDecode],
+                    config=self.config.joint_decode,
                 )
 
         else:
@@ -885,6 +1055,17 @@ class NewRayPPOTrainer(RayPPOTrainer):
             self.rephraser_wg = all_wg["rephraser"]
             self.rephraser_wg.init_model()
             print("Frozen rephraser initialized (rollout + log-prob only, no optimizer).")
+
+        # Joint decoder. Same reasoning for the ordering as the rephraser, and more
+        # acutely so: this worker loads two unsharded models, so letting it allocate
+        # before the reasoner's vLLM engine sizes its kv cache would make that estimate
+        # see less free memory than it does today. Set to None unconditionally -- the SR
+        # path tests the attribute rather than the config.
+        self.joint_decode_wg = None
+        if "joint_decode" in all_wg:
+            self.joint_decode_wg = all_wg["joint_decode"]
+            self.joint_decode_wg.init_model()
+            print("Joint decoder initialized (two frozen models, per-token fusion).")
 
 
         # create async rollout manager and request scheduler
@@ -1467,6 +1648,8 @@ class NewRayPPOTrainer(RayPPOTrainer):
                 "summarize_replace=True 需要 data.use_summarize=True (缺 summarize_input_ids)"
             )
         # proposal 密度 log π(y|x_long) 的来源模型。在线模式下它也负责生成候选。
+        # 联合解码这条路两者都不用它（密度由采样器给出），下面 debug/sr_joint=1 时这个
+        # 指标应当忽略。
         if logp_wg is None:
             logp_wg = self.actor_rollout_wg
         metrics['debug/sr_logp_role'] = 1 if logp_wg is getattr(self, 'rephraser_wg', None) else 0
@@ -1562,6 +1745,28 @@ class NewRayPPOTrainer(RayPPOTrainer):
         sr_offline = self.config.actor_rollout_ref.rollout.get('sr_use_offline', False)
         if sr_offline:
             K = 1
+        # 联合解码：候选由两个冻结模型逐 token 融合产出（teacher 约束方向、student 选词），
+        # 密度在采样时就一并记下，所以下面第 4 步的 compute_log_prob 可以整段跳过。
+        # 与离线模式同理压成 K=1：一题只解一条，K>1 会让行数对不上。
+        #
+        # 题数上限必须在 W 之前应用：每步成本与 W 成正比（无 paged attention、每 token 两次
+        # forward），而 wrong_only 下 W 是"本步答错了几道"这个数据决定的量。
+        #
+        # 以 config 为准、再断言 worker 在：反过来（只看 worker 在不在）会让一次 worker
+        # 创建失败静默退化成在线生成 —— 训练照跑、指标照出，只是候选来源与配置说的不是
+        # 一回事，这种失败没有任何地方会报。
+        sr_joint = self.config.get('joint_decode', {}).get('enable', False)
+        if sr_joint:
+            assert self.joint_decode_wg is not None, (
+                "joint_decode.enable=True 但 joint_decode worker 不存在。init_workers 只在 "
+                "Role.JointDecode 进了 role_worker_mapping 时才建它，而那由 main_ppo_new.py "
+                "读同一个 enable 决定 —— 两处不一致说明 config 没被 _load_joint_decode_config "
+                "合进来（例如换了 entry point）。"
+            )
+            K = 1
+            all_q = joint_sr.select_questions(
+                all_q, int(self.config.joint_decode.get('max_questions_per_step', 0)), metrics,
+            )
         W = len(all_q)
         # 展平成 [W*K, L_long]：行 r = w_idx*K + k -> 第 all_q[w_idx] 题的第 k 条候选。
         long_rows = []
@@ -1581,8 +1786,45 @@ class NewRayPPOTrainer(RayPPOTrainer):
         cand_gen.meta_info['is_se'] = False
         cand_gen.meta_info['is_extra'] = False
 
+        # 原始短 question prompt（每题一条，去掉 n 份 interleave 复制）。三处共用：
+        # 联合解码时当 student 侧的 prompt、sr_logprob_prompt='short' 时当 logprob 的
+        # prompt 段、以及第 6 步建 off 行时当 loss-time prompt。三处必须是**同一个张量**，
+        # 否则 loss 与分母的 prompt 会错开。
+        #
+        # 在分支之前算：联合解码要把它作为输入传下去（student 在 loss 用的那个 prompt 下选词），
+        # 而另两条路只在第 4 步之后才用到。
+        short_prompts = gen_batch.batch['input_ids'][::n]      # [B, L_short]
+        wq_idx = torch.tensor(all_q, device=short_prompts.device)
+        # 每题短 prompt 重复 K 次，与 W*K 候选对齐。
+        short_wk = short_prompts[wq_idx].repeat_interleave(K, dim=0).to(device)  # [W*K, L_short]
+
+        # 联合解码：候选由 joint_decode worker 逐 token 融合两个冻结模型产出，密度随采样一并
+        # 返回，所以第 4 步整段跳过（详见 joint_sr.py：这条路的密度是真正的 μ_t，含 1/Z_t
+        # 归一化，事后拿模型重算是拿不到的）。
+        sr_joint_logq = None
+        if sr_joint:
+            with marked_timer("sr_joint_gen", timing_raw, color="cyan"):
+                cand_out, sr_joint_logq = joint_sr.generate(
+                    joint_decode_wg=self.joint_decode_wg,
+                    student_prompts=(
+                        short_wk if self.config.joint_decode.get('student_prompt', 'short') == 'short'
+                        else long_prompt
+                    ),
+                    teacher_prompts=(
+                        long_prompt if self.config.joint_decode.get('teacher_prompt', 'long') == 'long'
+                        else short_wk
+                    ),
+                    pad_token_id=pad_token_id,
+                    max_response_length=self.config.data.max_response_length,
+                    attention_mask_dtype=gen_batch_output.batch['attention_mask'].dtype,
+                    make_masks=generate_masks_from_input_ids,
+                    meta_info=cand_gen.meta_info,
+                    metrics=metrics,
+                )
+            cand_resp = cand_out.batch['responses']               # [W, w]
+            sr_missing = None
         # 离线 SR：候选取自数据集列，不 generate。
-        if sr_offline:
+        elif sr_offline:
             if 'sr_response_ids' not in batch.batch:
                 raise ValueError(
                     "sr_use_offline=True 但 batch 里没有 'sr_response_ids'。该列由 "
@@ -1620,8 +1862,9 @@ class NewRayPPOTrainer(RayPPOTrainer):
             cand_out.meta_info = deepcopy(cand_gen.meta_info)
         else:
             # 在线模式：候选由 logp_wg 自己 generate，所以采样分布与下面算的密度天然同源。
-            # 注意此时 logp_wg 必须能 generate —— rephraser worker 是 logprob-only 角色
-            # （无 vLLM 引擎），所以在线模式下 logp_wg 只能是 reasoner。
+            # 前提是 logp_wg 能 generate —— rephraser 有独立资源池（独立进程）时它是
+            # rephraser_rollout 角色、带 vLLM 引擎；共享池时是 logprob-only，只能靠离线候选。
+            # _validate_rephraser_config 已在启动时按角色把这两种组合分开。
             #
             # pad 到该 worker 的 dp world_size：两个池卡数可以不同，而 auto-padding 默认关闭
             # （protocol.py:45-58），dispatch 按 world_size 直接 chunk。summarize_replace=
@@ -1636,14 +1879,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
             cand_resp = cand_out.batch['responses']               # [W*K, w]
             sr_missing = None
         metrics['debug/sr_offline'] = 1 if sr_offline else 0
-
-        # 原始短 question prompt（每题一条，去掉 n 份 interleave 复制）。同时供两处使用：
-        # 下面 sr_logprob_prompt='short' 时当 logprob 的 prompt 段，以及第 6 步建 off 行时
-        # 当 loss-time prompt。两处必须是**同一个张量**，否则 loss 与分母的 prompt 会错开。
-        short_prompts = gen_batch.batch['input_ids'][::n]      # [B, L_short]
-        wq_idx = torch.tensor(all_q, device=short_prompts.device)
-        # 每题短 prompt 重复 K 次，与 W*K 候选对齐。
-        short_wk = short_prompts[wq_idx].repeat_interleave(K, dim=0).to(device)  # [W*K, L_short]
+        metrics['debug/sr_joint'] = 1 if sr_joint else 0
 
         # --- 4. 候选的 logprob（off_old_log_probs / target_probs 来源）= IS 比值的分母 q ---
         #
@@ -1668,43 +1904,53 @@ class NewRayPPOTrainer(RayPPOTrainer):
             )
         metrics['debug/sr_logprob_prompt_short'] = 1 if sr_logp_prompt == 'short' else 0
 
-        logp_in = cand_out
-        if sr_logp_prompt == 'short':
-            # 只重建 logprob 用的这一份结构；cand_out 本身保持长 prompt 不动，因为第 5 步
-            # 的 compute_reward 和轨迹过滤读的是它的 responses（与 prompt 无关），而
-            # 第 6 步的 off 行由 _build_hybrid_off_policy_output 独立构造。
-            short_input_ids = torch.cat([short_wk, cand_resp], dim=-1)
-            short_attn, short_pos = generate_masks_from_input_ids(
-                short_input_ids, pad_token_id, cand_out.batch['attention_mask'].dtype,
-            )
-            logp_in = DataProto.from_single_dict({
-                'prompts': short_wk,
-                'responses': cand_resp,
-                'input_ids': short_input_ids,
-                'attention_mask': short_attn,
-                'position_ids': short_pos,
-            })
-            logp_in.meta_info = deepcopy(cand_out.meta_info)
+        # 联合解码这条路整段跳过：密度在采样那一刻就已经算好了，而且**只有采样器算得出**。
+        # agree 是从截断并重归一化后的 student 分布 μ_t(v) = p_a(v)·1[v∈F_t]/Z_t 里采的；
+        # 事后拿任何模型 forward 一遍只能得到 log p_a(v)，缺了 −log Z_t 那一项，会把分母
+        # 系统性地低估、把 off_ratio 系统性地放大 1/Z_t 倍（离线 sweep 里 Z_t≈0.55，即约
+        # 1.8 倍，约束越紧越严重）。sr_logprob_prompt 因此对这条路无意义 ——
+        # student 在哪个 prompt 下解码由 joint_decode.student_prompt 决定，
+        # _validate_joint_config 会在启动时把这件事说清楚。
+        if sr_joint:
+            cand_log_prob = sr_joint_logq                     # [W, w]
+        else:
+            logp_in = cand_out
+            if sr_logp_prompt == 'short':
+                # 只重建 logprob 用的这一份结构；cand_out 本身保持长 prompt 不动，因为第 5 步
+                # 的 compute_reward 和轨迹过滤读的是它的 responses（与 prompt 无关），而
+                # 第 6 步的 off 行由 _build_hybrid_off_policy_output 独立构造。
+                short_input_ids = torch.cat([short_wk, cand_resp], dim=-1)
+                short_attn, short_pos = generate_masks_from_input_ids(
+                    short_input_ids, pad_token_id, cand_out.batch['attention_mask'].dtype,
+                )
+                logp_in = DataProto.from_single_dict({
+                    'prompts': short_wk,
+                    'responses': cand_resp,
+                    'input_ids': short_input_ids,
+                    'attention_mask': short_attn,
+                    'position_ids': short_pos,
+                })
+                logp_in.meta_info = deepcopy(cand_out.meta_info)
 
-        #     离线模式下这一步**省不掉**：候选文本可以预存，但密度必须由产出候选的那个模型
-        #     算 —— 所以离线 + rephraser worker 的组合正是为此存在。好在这只是一次 forward
-        #     （无自回归、无 KV cache），和 critic/reward 打分同一条路，比 generate 便宜一个
-        #     量级；也正因为不需要引擎，它才能与 reasoner 的 vLLM 引擎共存（引擎才是
-        #     CuMemAllocator 单例冲突的来源）。
-        #
-        #     pad 的理由同上面的 generate：这条路也走 DP_COMPUTE_PROTO dispatch，按
-        #     logp_wg.world_size 直接 chunk。注意 pad 的是 logp_in —— sr_logprob_prompt=
-        #     'short' 时它是另建的那份结构，pad cand_out 不会影响真正被送进去的张量。
-        with marked_timer("sr_logprob", timing_raw, color="cyan"):
-            logp_in_padded, lp_pad_size = pad_dataproto_to_divisor(logp_in, logp_wg.world_size)
-            _lp = logp_wg.compute_log_prob(logp_in_padded)
-            _lp = unpad_dataproto(_lp, pad_size=lp_pad_size)
-            cand_log_prob = _lp.batch.pop('old_log_probs')    # [W*K, w]
-            if 'entropys' in _lp.batch.keys():
-                _lp.batch.pop('entropys')
-            del _lp, logp_in_padded
-        if logp_in is not cand_out:
-            del logp_in
+            #     离线模式下这一步**省不掉**：候选文本可以预存，但密度必须由产出候选的那个模型
+            #     算 —— 所以离线 + logprob-only rephraser 的组合正是为此存在。好在这只是一次
+            #     forward（无自回归、无 KV cache），和 critic/reward 打分同一条路，比 generate
+            #     便宜一个量级；也正因为不需要引擎，logprob-only 变体才能与 reasoner 的 vLLM
+            #     引擎共进程（引擎才是 CuMemAllocator 单例冲突的来源）。
+            #
+            #     pad 的理由同上面的 generate：这条路也走 DP_COMPUTE_PROTO dispatch，按
+            #     logp_wg.world_size 直接 chunk。注意 pad 的是 logp_in —— sr_logprob_prompt=
+            #     'short' 时它是另建的那份结构，pad cand_out 不会影响真正被送进去的张量。
+            with marked_timer("sr_logprob", timing_raw, color="cyan"):
+                logp_in_padded, lp_pad_size = pad_dataproto_to_divisor(logp_in, logp_wg.world_size)
+                _lp = logp_wg.compute_log_prob(logp_in_padded)
+                _lp = unpad_dataproto(_lp, pad_size=lp_pad_size)
+                cand_log_prob = _lp.batch.pop('old_log_probs')    # [W*K, w]
+                if 'entropys' in _lp.batch.keys():
+                    _lp.batch.pop('entropys')
+                del _lp, logp_in_padded
+            if logp_in is not cand_out:
+                del logp_in
 
         # --- 5. 候选打分 + 轨迹过滤（按 W*K 展平，每行一条候选）---
         # ground-truth 展平到 W*K：每题 GT 重复 K 次（与候选行一一对应）。
@@ -1735,7 +1981,16 @@ class NewRayPPOTrainer(RayPPOTrainer):
         # 宽度一致性：generate 把 response 右填充到 max_response_length，
         # _build_hybrid 也 pad 到 max(max_response_length, w)，与 on 批 resp_width 相同。
         # 离线模式同样成立：dataset 把 sr_response_ids 右填充到恰好 max_response_length，
-        # 所以那个 max() 取回同一个值。
+        # 所以那个 max() 取回同一个值。联合解码也一样：worker 按 meta_info 里传过去的
+        # max_response_length 分配输出缓冲，并把超出的部分截掉。
+        #
+        # 断言这一点而不是只在注释里说：cand_log_prob 在联合解码这条路上是 worker 返回的
+        # 张量（不是 compute_log_prob 的输出），宽度对不上时下面这行会广播或报形状错，
+        # 而错在哪一步就看不出来了。
+        assert cand_log_prob.shape == off_batch.batch['responses'].shape, (
+            f"密度 {tuple(cand_log_prob.shape)} 与 off 行 response "
+            f"{tuple(off_batch.batch['responses'].shape)} 宽度不一致；IS 比值会算在错的位置上"
+        )
         off_batch.batch['target_probs'] = torch.exp(cand_log_prob)
         off_batch.batch['off_old_log_probs'] = cand_log_prob
 
@@ -1856,16 +2111,25 @@ class NewRayPPOTrainer(RayPPOTrainer):
         存成 JSONL（含 input/output/score + reward_model/data_source/uid/target），
         路径 <rollout_data_dir>/summarize_val/，可直接喂给 Data/visualize_rollouts.py。
 
-        **rephraser.enable=True 时本函数直接返回 {}。** 它需要在 summarize prompt 下
-        generate，而 rephraser worker 是 logprob-only 角色（没有 vLLM 引擎，见
-        fsdp_workers_new.py 的 _FROZEN_LM_ROLES 注释）。用 reasoner 生成会让这个指标偷偷
-        变成「θ 在 summarize prompt 下的准确率」，与它的名字不符 —— 宁可不报。
-        rephraser 的能力改为离线评测：sweep_sft_checkpoints.sh + Data/prepare_rephrase_eval.py。
+        **rephraser 有独立资源池时，本函数衡量的是 rephraser（φ）** —— 它才是在 summarize
+        prompt 下工作的模型，且独立进程让它能持有自己的 vLLM 引擎。reasoner 的能力由继承的
+        `_validate()` 单独报告，二者互不混淆。
+
+        **rephraser 共享 reasoner 的池时，本函数直接返回 {}。** 那种配置下它是 logprob-only
+        （同进程放不下第二个引擎，见 fsdp_workers_new.py 的 _FROZEN_LM_ROLES 注释），
+        没法 generate；改用 reasoner 生成会让这个指标偷偷变成「θ 在 summarize prompt 下的
+        准确率」，与它的名字不符 —— 宁可不报。此时用离线评测：
+        sweep_sft_checkpoints.sh + Data/prepare_rephrase_eval.py。
         """
         if getattr(self, "summarize_val_dataloader", None) is None:
             return {}
+        # 在 summarize prompt 下工作、且能 generate 的模型。独立池 -> rephraser；
+        # 共享池 -> 它不能 generate，跳过；无 rephraser -> reasoner（单模型时的原行为）。
+        val_wg = self.actor_rollout_wg
         if getattr(self, "rephraser_wg", None) is not None:
-            return {}
+            if self.config.rephraser.get("n_gpus_per_node", 0) <= 0:
+                return {}
+            val_wg = self.rephraser_wg
         pad_token_id = self.tokenizer.pad_token_id
         success_value = 1
         fail_value = 0
@@ -1916,10 +2180,10 @@ class NewRayPPOTrainer(RayPPOTrainer):
             # pad 到 dp world_size 整除（SR 训练路径靠 batch 恰好可整除才免 pad；
             # val 的 batch/GPU 数任意，必须 pad，与父类 _validate 同款）。
             cand_gen_padded, pad_size = pad_dataproto_to_divisor(
-                cand_gen, self.actor_rollout_wg.world_size
+                cand_gen, val_wg.world_size
             )
             if not self.async_rollout_mode:
-                cand_out_padded = self.actor_rollout_wg.generate_sequences(cand_gen_padded)
+                cand_out_padded = val_wg.generate_sequences(cand_gen_padded)
             else:
                 self.async_rollout_manager.wake_up()
                 cand_out_padded = self.async_rollout_manager.generate_sequences(cand_gen_padded)
@@ -1941,14 +2205,23 @@ class NewRayPPOTrainer(RayPPOTrainer):
             resp_tok_sum += int(resp_valid.sum().item())
 
             # ---- entropy（forward-only compute_log_prob 的副产物）----
-            _lp = self.actor_rollout_wg.compute_log_prob(cand_out)
+            # 与上面的 generate 一样要 pad：这条路同样走 DP_COMPUTE_PROTO dispatch，按
+            # world_size 直接 chunk，而 B*K 除不尽卡数时就会断言失败（drop_last=False，
+            # 末批行数任意；summarize_val_k 也不必是卡数的倍数）。unpad 后 entropys 的
+            # 行数才与 resp_valid 对齐 —— 否则 ent_mask 与 entropys 形状不匹配。
+            lp_in_padded, lp_pad_size = pad_dataproto_to_divisor(
+                cand_out, val_wg.world_size
+            )
+            _lp = unpad_dataproto(
+                val_wg.compute_log_prob(lp_in_padded), pad_size=lp_pad_size
+            )
             if 'entropys' in _lp.batch.keys():
                 entropys = _lp.batch['entropys']                  # [B*K, w]
                 ent_mask = resp_valid.to(entropys.dtype)
                 # 用与训练一致的 agg_loss 聚合，再乘 token 数还原成 sum，末尾统一除总 token。
                 _ent_mean = agg_loss(loss_mat=entropys, loss_mask=ent_mask, loss_agg_mode=loss_agg_mode)
                 ent_sum += float(_ent_mean.detach().item()) * int(ent_mask.sum().item())
-            del _lp
+            del _lp, lp_in_padded
 
             # ---- solve_* 分组统计（每题 K 条候选）----
             rw = cand_reward_sum.view(B, K)                       # [B, K]

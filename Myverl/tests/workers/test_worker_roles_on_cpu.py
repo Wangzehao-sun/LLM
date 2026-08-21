@@ -105,48 +105,48 @@ class TestRoleFlags(unittest.TestCase):
         """
         self.assertEqual(self.flags("se_rollout_ref"), (False, False, True, False))
 
-    def test_frozen_rephraser_computes_logprobs_but_neither_trains_nor_generates(self):
+    def test_neither_rephraser_variant_can_train(self):
         """The load-bearing assertion of the whole split.
 
-        Both omissions matter. Not an actor -> no optimizer, so update_actor and
-        save_checkpoint reject it. Not a rollout -> no vLLM engine, and THAT is what lets
-        it coexist with the reasoner at all: vLLM's sleep mode uses a process-global
-        CuMemAllocator with hardcoded "weights"/"kv_cache" tags, so a second engine in the
-        same process would have its memory freed by the first one's sleep(). Log-probs need
-        no engine -- one forward pass, the same path critic/reward scoring already takes.
+        Not an actor -> no optimizer is built, and update_actor / save_checkpoint (both
+        `assert self._is_actor`) reject it. So freezing holds for BOTH variants regardless
+        of which resource pool they land in -- it is structural, not a convention.
         """
-        is_actor, is_rollout, is_ref, is_frozen = self.flags("rephraser_logprob")
-        self.assertTrue(is_frozen, "the rephraser must be flagged frozen so compute_log_prob admits it")
-        self.assertFalse(
-            is_actor,
-            "rephraser_logprob must NOT be in _ACTOR_ROLES -- that is what makes update_actor "
-            "and save_checkpoint reject it. Freezing is structural, not a convention.",
-        )
-        self.assertFalse(
-            is_rollout,
-            "rephraser_logprob must NOT be in _ROLLOUT_ROLES: a second vLLM engine in one "
-            "process shares a global CuMemAllocator and the engines free each other's memory. "
-            "Candidate generation is done offline precisely to avoid needing an engine here.",
-        )
-        self.assertFalse(is_ref, "the rephraser is not a reference policy; a third copy of the weights is pointless")
+        for role in ("rephraser_logprob", "rephraser_rollout"):
+            is_actor, _is_rollout, is_ref, is_frozen = self.flags(role)
+            self.assertTrue(is_frozen, f"{role} must be flagged frozen so compute_log_prob admits it")
+            self.assertFalse(
+                is_actor,
+                f"{role} must NOT be in _ACTOR_ROLES -- that is what makes update_actor and "
+                f"save_checkpoint reject it. Freezing is structural, not a convention.",
+            )
+            self.assertFalse(is_ref, f"{role} is not a reference policy; a third copy of the weights is pointless")
 
     def test_all_roles_covers_every_flag_list(self):
         """The __init__ assert uses _ALL_ROLES, so a role missing from it is unusable."""
         union = set(self.const["_ACTOR_ROLES"]) | set(self.const["_ROLLOUT_ROLES"]) | set(self.const["_REF_ROLES"]) | set(self.const["_FROZEN_LM_ROLES"])
         self.assertEqual(set(self.const["_ALL_ROLES"]), union)
 
-    def test_frozen_roles_are_disjoint_from_rollout_roles(self):
-        """A frozen LM must NOT be a rollout: that is what keeps it off the vLLM engine.
+    def test_the_two_rephraser_variants_differ_only_in_rollout(self):
+        """The engine-holding variant is the one with its own pool; the other must not be.
 
-        The inverse of what an earlier revision asserted. The rephraser used to generate
-        candidates online, which required an engine -- until it turned out two engines
-        cannot share a process. Generation moved offline and the role lost _is_rollout;
-        putting it back would reintroduce the allocator conflict.
+        Both are frozen and neither is an actor, so the only difference is _is_rollout ==
+        may hold a vLLM engine. Which variant a run gets is decided by
+        rephraser.n_gpus_per_node, because a separate pool means a separate Ray actor
+        process -- and a second engine in the SAME process would have its memory freed by
+        the first one's sleep() (process-global CuMemAllocator, hardcoded tags).
         """
-        self.assertEqual(set(self.const["_FROZEN_LM_ROLES"]) & set(self.const["_ROLLOUT_ROLES"]), set())
+        rollout_variant = self.flags("rephraser_rollout")
+        logprob_variant = self.flags("rephraser_logprob")
+        #                       actor, rollout, ref,   frozen
+        self.assertEqual(rollout_variant, (False, True, False, True))
+        self.assertEqual(logprob_variant, (False, False, False, True))
 
     def test_frozen_and_actor_are_disjoint(self):
-        """The two are contradictory: frozen means no optimizer, actor means one exists."""
+        """The two are contradictory: frozen means no optimizer, actor means one exists.
+
+        This is what keeps BOTH rephraser variants unable to train, regardless of pool.
+        """
         self.assertEqual(set(self.const["_FROZEN_LM_ROLES"]) & set(self.const["_ACTOR_ROLES"]), set())
 
 
@@ -256,10 +256,14 @@ class TestRephraserPlumbing(unittest.TestCase):
         src = TRAINER_FILE.read_text(encoding="utf-8")
         block = src.split("if Role.ActorRolloutRephraser in self.role_worker_mapping:", 1)
         self.assertEqual(len(block), 2, "the rephraser registration block is missing")
-        block = block[1][:1200]
+        # Bounded by the next top-level branch rather than a character count, so adding
+        # lines inside the block does not silently push assertions out of the window.
+        block = block[1].split("\n        else:", 1)[0]
         self.assertIn("deepcopy(self.config.actor_rollout_ref)", block)
         self.assertIn("actor_rollout_rephraser", block)
-        self.assertIn('role="rephraser_logprob"', block)
+        # The role is chosen from the pool, not hardcoded: own pool -> may hold an engine.
+        self.assertIn('"rephraser_rollout" if rp_own_pool else "rephraser_logprob"', block)
+        self.assertIn('n_gpus_per_node", 0) > 0', block)
 
     def test_rephraser_wg_is_always_defined(self):
         """The routing sites read `self.rephraser_wg or ...`, so it must always exist."""
@@ -279,10 +283,10 @@ class TestRephraserPlumbing(unittest.TestCase):
         for node in ast.walk(tree):
             if isinstance(node, ast.FunctionDef) and node.name == "_summarize_replace_normal_step":
                 body = ast.get_source_segment(src, node) or ""
-                self.assertIn("logp_wg.compute_log_prob(logp_in)", body)
-                # Online fallback (no rephraser worker) still generates through the same
-                # handle, so sampling and density share a source by construction.
-                self.assertIn("logp_wg.generate_sequences(cand_gen)", body)
+                self.assertIn("logp_wg.compute_log_prob(logp_in_padded)", body)
+                # Whichever model generates also supplies the density, so sampling and
+                # density share a source by construction.
+                self.assertIn("logp_wg.generate_sequences(cand_gen_padded)", body)
                 self.assertNotIn(
                     "self.actor_rollout_wg.compute_log_prob",
                     body,
@@ -316,6 +320,40 @@ class TestRephraserPlumbing(unittest.TestCase):
                 return
         self.fail("_summarize_replace_normal_step not found")
 
+    def test_rephraser_dispatch_is_padded_to_its_own_world_size(self):
+        """With its own pool the rephraser has a DIFFERENT world_size than the reasoner.
+
+        Dispatch chunks a DataProto by ``worker_group.world_size`` and auto-padding is OFF
+        by default (protocol.py's DataProtoConfig), so a batch that is not divisible simply
+        fails in chunk(). And it will not be divisible: with
+        summarize_replace='wrong_only', W is "how many questions the reasoner got entirely
+        wrong" -- an arbitrary integer that divides nothing.
+
+        Both dispatches must therefore be padded, and to logp_wg's world_size, not the
+        reasoner's. Uses the same pad_dataproto_to_divisor/unpad_dataproto pair
+        _validate_summarize already uses.
+        """
+        src = TRAINER_FILE.read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "_summarize_replace_normal_step":
+                body = ast.get_source_segment(src, node) or ""
+                self.assertIn("pad_dataproto_to_divisor(cand_gen, logp_wg.world_size)", body)
+                self.assertIn("pad_dataproto_to_divisor(logp_in, logp_wg.world_size)", body)
+                # Padding without unpadding would leave duplicated rows in the batch that
+                # gets spliced back into gen_batch_output -- silently training on copies.
+                self.assertEqual(
+                    body.count("unpad_dataproto("), 2,
+                    "each padded dispatch needs its matching unpad",
+                )
+                self.assertNotIn(
+                    "self.actor_rollout_wg.world_size", body,
+                    "pad to the rephraser's world_size; the reasoner's pool may be a "
+                    "different size entirely",
+                )
+                return
+        self.fail("_summarize_replace_normal_step not found")
+
     def test_short_logprob_prompt_reuses_the_loss_time_prompt_tensor(self):
         """sr_logprob_prompt='short' must use the SAME tensor the loss is computed under.
 
@@ -339,7 +377,7 @@ class TestRephraserPlumbing(unittest.TestCase):
                     "tensor the loss uses",
                 )
                 # Built before the log-prob call, and fed to the loss rows after it.
-                pre, sep, post = body.partition("logp_wg.compute_log_prob(logp_in)")
+                pre, sep, post = body.partition("logp_wg.compute_log_prob(logp_in_padded)")
                 self.assertTrue(sep, "the log-prob call moved")
                 self.assertIn("short_wk = short_prompts[wq_idx]", pre)
                 self.assertIn("'prompts': short_wk", pre, "the short branch must use short_wk")

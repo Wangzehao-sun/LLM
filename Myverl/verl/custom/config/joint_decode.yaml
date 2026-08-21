@@ -1,0 +1,167 @@
+# Joint decoding as the source of the summarize-replacement (SR) candidate.
+#
+# Two frozen models decode TOGETHER, one token at a time: the teacher constrains which
+# tokens are allowed (both models' top-k, both above a probability floor) and the student
+# picks among the survivors. The resulting response replaces one of the n GRPO rollouts,
+# and the density it was really sampled from becomes the importance ratio's denominator.
+#
+# This file holds every knob. It is loaded EXPLICITLY by the trainer rather than composed
+# through Hydra's `defaults:`, which is what keeps ppo_trainer.yaml unmodified -- with
+# `enable: False` (the default) no worker is created and every existing script behaves
+# byte-identically. Override from the command line with `+joint_decode.<key>=<value>`;
+# those win over the values here.
+#
+# See examples/custom/train_hype_summarize_joint.sh for a working invocation, and
+# verl/custom/joint_decode_core.py for what the fusion rules actually compute.
+
+# False creates no worker and adds no GPU cost. The feature is entirely inert.
+enable: False
+
+# ---------------------------------------------------------------------------
+# models: both FROZEN, both loaded from a path
+# ---------------------------------------------------------------------------
+
+# The model whose voice the output is in, and whose distribution the loss's denominator
+# is measured under. Usually the same architecture as the actor.
+#
+# NOT the live actor. The actor's weights live in FSDP shards in another worker, so
+# joining it to this loop would mean re-materialising them into an HF module every step.
+# That is a change to the training framework, which this feature is scoped out of. The
+# consequence is that the proposal distribution is FIXED across training -- the same
+# assumption the offline-SR path already documents and relies on.
+student_model_path: null
+
+# The model that steers. Reads the long summarize prompt by default, so it guides from
+# information the student does not have.
+teacher_model_path: null
+
+# Must be identical between the two -- per-token fusion compares logits index by index,
+# so a vocabulary mismatch makes every step meaningless with no error raised. init_model
+# checks this and refuses to start.
+trust_remote_code: True
+
+# ---------------------------------------------------------------------------
+# resource pool
+# ---------------------------------------------------------------------------
+
+# GPUs per node for this worker's OWN pool, on top of trainer.n_gpus_per_node.
+#
+#   > 0  -- its own pool, hence its own process. This is the DEFAULT-recommended setting:
+#           two unsharded bf16 models (~16GB for a 4B pair, before the KV cache) would
+#           otherwise compete with the reasoner's vLLM engine, whose arena is reserved up
+#           front and cannot yield.
+#   == 0 -- shares the reasoner's pool and process. Cheaper in GPUs and workable for a
+#           small model, but the memory above is taken from the same budget vLLM already
+#           reserved via gpu_memory_utilization, so that must be lowered to match.
+#
+# CUDA_VISIBLE_DEVICES must expose the GPUs of every pool; trainer.n_gpus_per_node counts
+# the reasoner's only.
+n_gpus_per_node: 0
+
+# ---------------------------------------------------------------------------
+# fusion rule
+# ---------------------------------------------------------------------------
+
+# agree       -- teacher constrains the token set, student chooses inside it. This is the
+#                method; the other three are baselines kept because the core supports
+#                them for free.
+# linear      -- geometric mixture of the two distributions (weight = fuse_weight).
+# contrastive -- extrapolate along teacher-minus-student (proxy tuning / DExperts).
+# max         -- elementwise max, then renormalise.
+fuse: agree
+
+# Only read by linear/contrastive. 0.0 reduces exactly to the student alone, which is the
+# degenerate case worth keeping available: with temperature 0 it must reproduce the
+# student's greedy output token for token.
+fuse_weight: 0.5
+
+# How far down the STUDENT's own ranking it may look for a token the teacher permits.
+# Raising this lets it reach further instead of falling back, WITHOUT widening what the
+# teacher allows -- usually the cheapest response to a high fallback rate.
+agree_student_top_k: 10
+
+# How much of the vocabulary the TEACHER permits at all. This is the knob that sets how
+# tightly the constraint binds.
+agree_teacher_top_k: 10
+
+# Probability floors, applied on top of the top-k intersection. 0 disables a side.
+# The teacher's floor sets how wide the allowed region is; the student's only drops
+# tokens it would itself be very reluctant to emit.
+agree_teacher_min_prob: 0.05
+agree_student_min_prob: 0.0
+
+# Who decides when the intersection comes out EMPTY. These are different experiments,
+# not two spellings of one:
+#   teacher -- the teacher overrides exactly where the student disagrees with it.
+#              A fallback rate near 1.0 means the run is plain teacher decoding.
+#   student -- the teacher only ever CONSTRAINS, never overrides. The text stays in the
+#              student's voice, and a high fallback rate degenerates toward plain student
+#              decoding instead. Also flips how the fallback metric should be read.
+# Both branches SAMPLE (at `temperature`) rather than take an argmax: an argmax fallback
+# would pin every disagreeing position to one fixed token, so diversity would decay with
+# each fallback.
+agree_fallback: teacher
+
+# ---------------------------------------------------------------------------
+# sampling
+# ---------------------------------------------------------------------------
+
+# Should normally MATCH actor_rollout_ref.rollout.temperature. The loss's numerator is
+# computed at that temperature (compute_log_prob divides logits by it), so a mismatch
+# puts a systematic bias into off_ratio that nothing downstream reports.
+temperature: 1.0
+
+top_p: 1.0
+
+# -1 disables. Under `fuse: agree` the intersection already bounds the candidate set, so
+# this is redundant there and left off.
+top_k: -1
+
+# ---------------------------------------------------------------------------
+# throughput
+# ---------------------------------------------------------------------------
+
+# Cap on generated tokens. The per-step cost is
+#   ceil(W / (batch_size * n_gpus)) * max_new_tokens
+# sequential two-model forwards, where W is the number of questions this step. There is
+# no paged attention and no CUDA graph here, so that product is the whole story.
+max_new_tokens: 4096
+
+# Rows decoded concurrently per rank. Bounded by memory, not by the question count: two
+# unsharded models plus their KV caches at these lengths is what binds.
+batch_size: 8
+
+# Hard cap on questions per step, applied AFTER wrong_only narrows the set. This exists
+# because the cost above is linear in W and W is data-dependent -- a step where most
+# rollouts failed would otherwise stall the run. What gets dropped is logged, never
+# silently truncated.
+#
+# 0 = no cap. Only sensible with wrong_only; summarize_replace=all sends every question
+# here and is not viable at these lengths.
+max_questions_per_step: 16
+
+# auto tries flash_attention_2, then sdpa, then eager, and says which it got. Pin it to
+# fail loudly instead if a specific backend is required.
+attn_impl: auto
+
+# How often to check whether every row has finished, and to drop finished rows from the
+# batch. Each check is a host sync that drains the CUDA queue, so doing it every step
+# costs more than the few all-padding steps a coarser cadence may run.
+eos_check_every: 16
+
+# Drop finished rows from the batch mid-decode. Response lengths vary enormously, and a
+# carried-but-finished row still pays its share of the KV read, which dominates a step at
+# these lengths.
+shrink_batch: True
+
+# ---------------------------------------------------------------------------
+# which prompt each side reads
+# ---------------------------------------------------------------------------
+
+# short -- the original question, the same prompt the loss uses.
+# long  -- the pre-rendered summarize prompt (data.use_summarize must be on).
+#
+# The default pairing is the method: the teacher steers from the information-richer long
+# prompt while the student chooses under the short one the gradient will be taken at.
+student_prompt: short
+teacher_prompt: long

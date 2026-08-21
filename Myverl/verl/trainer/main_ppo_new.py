@@ -25,6 +25,39 @@ from omegaconf import OmegaConf
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.reward import load_reward_manager
 
+
+def _load_joint_decode_config(config):
+    """Merge verl/custom/config/joint_decode.yaml into ``config.joint_decode``.
+
+    Joint decoding's knobs live in their own file, not in ppo_trainer.yaml. The point is
+    that ppo_trainer.yaml stays UNMODIFIED by this feature: nothing changes for any
+    existing script, and the whole subsystem is one file plus one flag.
+
+    That rules out a Hydra ``defaults:`` entry (which would mean editing ppo_trainer.yaml
+    to list it), so the file is loaded explicitly and merged with whatever the user passed
+    as ``+joint_decode.*``. Merge order puts the CLI last, so overrides win.
+
+    The result is written back into ``config`` under ``joint_decode``, so the trainer can
+    read ``self.config.joint_decode.*`` like any other node instead of being handed a
+    second config object to thread around.
+
+    Returns the merged node. Absent file plus absent overrides yields ``enable: False``,
+    which is the inert path.
+    """
+    from pathlib import Path
+
+    from omegaconf import open_dict
+
+    defaults_path = Path(__file__).resolve().parent.parent / "custom" / "config" / "joint_decode.yaml"
+    defaults = OmegaConf.load(defaults_path) if defaults_path.exists() else OmegaConf.create()
+    merged = OmegaConf.merge(defaults, config.get("joint_decode", OmegaConf.create()))
+    # struct mode is on by default for a Hydra config, so a new top-level key has to be
+    # added through open_dict.
+    with open_dict(config):
+        config.joint_decode = merged
+    return merged
+
+
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
 def main(config):
     run_ppo(config)
@@ -160,12 +193,73 @@ class TaskRunner:
             mapping[Role.ActorRolloutSE] = global_pool_id
         # Frozen rephraser: a SECOND model that rolls out the long summarize prompt and
         # supplies the proposal density for the importance ratio, but is never updated.
-        # Shares the global pool -- the two roles are strictly serial within a step, so
-        # splitting GPUs would buy no concurrency while breaking every world_size
-        # assumption. Default False keeps every existing script byte-identical.
+        #
+        # rephraser.n_gpus_per_node decides which of two very different setups you get:
+        #
+        #   > 0  -- its OWN resource pool, hence its own Ray actor process, hence its own
+        #           vLLM engine. This is what makes online generation possible at all:
+        #           vLLM's sleep mode is built on a process-global CuMemAllocator whose
+        #           tags are the hardcoded strings "weights"/"kv_cache", so two engines in
+        #           one process free each other's memory (SGLang has the same problem via
+        #           torch_memory_saver, and change_current_allocator can only be called
+        #           once per process -- switching backends does not help). Separate pools
+        #           mean separate processes, which is the pattern vLLM itself recommends.
+        #   == 0 -- shares the global pool, so it CANNOT hold an engine. Log-probs only,
+        #           with candidates pre-generated offline by
+        #           Data/aggregate_sr_responses.py.
+        #
+        # Default 0 keeps every existing script byte-identical: the spec stays a single
+        # pool and every role still maps to it.
         if config.get("rephraser", {}).get("enable", False):
             role_worker_mapping[Role.ActorRolloutRephraser] = ray.remote(actor_rollout_cls)
-            mapping[Role.ActorRolloutRephraser] = global_pool_id
+            rephraser_gpus = config.rephraser.get("n_gpus_per_node", 0)
+            if rephraser_gpus > 0:
+                rephraser_pool_id = "rephraser_pool"
+                resource_pool_spec[rephraser_pool_id] = [rephraser_gpus] * config.trainer.nnodes
+                mapping[Role.ActorRolloutRephraser] = rephraser_pool_id
+                print(
+                    f"[rephraser] dedicated pool {rephraser_pool_id!r}: {rephraser_gpus} GPU(s) x "
+                    f"{config.trainer.nnodes} node(s), on top of the reasoner's "
+                    f"{config.trainer.n_gpus_per_node}. CUDA_VISIBLE_DEVICES must expose all of "
+                    f"them; trainer.n_gpus_per_node counts the reasoner's only."
+                )
+            else:
+                mapping[Role.ActorRolloutRephraser] = global_pool_id
+
+        # Joint decoding: two FROZEN models that decode together, fusing per token, to
+        # produce the summarize-replacement candidate. Its knobs live in their own file
+        # (verl/custom/config/joint_decode.yaml) rather than in ppo_trainer.yaml, and are
+        # loaded here so that file's defaults exist before anything reads them. CLI
+        # `+joint_decode.<key>=` overrides layer on top and win.
+        #
+        # Resolving it into `config` (rather than passing it around separately) is what
+        # lets the trainer read `self.config.joint_decode.*` like any other node. With
+        # `enable: False` -- the default, and the value when the node is absent entirely
+        # -- nothing below runs and the resource spec is untouched.
+        joint_cfg = _load_joint_decode_config(config)
+        if joint_cfg.get("enable", False):
+            from verl.custom.joint_decode_worker import JointDecodeWorker
+
+            role_worker_mapping[Role.JointDecode] = ray.remote(JointDecodeWorker)
+            joint_gpus = joint_cfg.get("n_gpus_per_node", 0)
+            if joint_gpus > 0:
+                joint_pool_id = "joint_decode_pool"
+                resource_pool_spec[joint_pool_id] = [joint_gpus] * config.trainer.nnodes
+                mapping[Role.JointDecode] = joint_pool_id
+                print(
+                    f"[joint_decode] dedicated pool {joint_pool_id!r}: {joint_gpus} GPU(s) x "
+                    f"{config.trainer.nnodes} node(s), on top of the reasoner's "
+                    f"{config.trainer.n_gpus_per_node}. CUDA_VISIBLE_DEVICES must expose all of "
+                    f"them; trainer.n_gpus_per_node counts the reasoner's only."
+                )
+            else:
+                mapping[Role.JointDecode] = global_pool_id
+                print(
+                    "[joint_decode] sharing the reasoner's pool: two unsharded bf16 models plus "
+                    "their KV caches come out of the same budget vLLM already reserved via "
+                    "gpu_memory_utilization, so lower that to match or expect an OOM at the "
+                    "first joint step."
+                )
         # Load the reward manager for training and validation.
         reward_fn = load_reward_manager(config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {}))
         val_reward_fn = load_reward_manager(config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {}))
