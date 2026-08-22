@@ -52,6 +52,7 @@ from verl.utils.fsdp_utils import (
     apply_fsdp2,
     fsdp2_load_full_state_dict,
     fsdp_version,
+    get_fsdp_full_state_dict,
     get_fsdp_wrap_policy,
     get_init_weight_context_manager,
     init_fn,
@@ -888,8 +889,6 @@ class NewActorRolloutRefWorker(Worker, DistProfilerExtension):
         """
         from transformers import AutoConfig, AutoModelForCausalLM
 
-        inner = getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
-
         if getattr(self, "_student_module", None) is None:
             # from_config, NOT from_pretrained: every parameter is about to be overwritten from
             # the actor, so reading the checkpoint off disk would be wasted I/O -- and stale,
@@ -929,8 +928,18 @@ class NewActorRolloutRefWorker(Worker, DistProfilerExtension):
         # Refresh EVERY step: the actor's weights change with each update, and a stale mirror
         # would silently decode against an old policy -- which would also break the
         # off_ratio == Z_t identity that is this path's only end-to-end check.
-        with FSDP.summon_full_params(self.actor_module_fsdp, writeback=False):
-            self._student_module.load_state_dict(inner.state_dict(), strict=True, assign=False)
+        #
+        # get_fsdp_full_state_dict rather than summon_full_params + state_dict(). The hand-rolled
+        # version returns DTensors, and copy_ refuses to mix them with plain tensors
+        # ("got mixed torch.Tensor and DTensor"). This helper sets FULL_STATE_DICT for the read,
+        # which is what makes the tensors whole and plain, and it handles FSDP1 and FSDP2.
+        #
+        # rank0_only=False: every rank decodes its own shard of the questions, so every rank
+        # needs the full weights, not just rank 0. offload_to_cpu=False keeps the round trip on
+        # the GPU -- the mirror lives there and this runs once per step, not per token.
+        full_sd = get_fsdp_full_state_dict(self.actor_module_fsdp, offload_to_cpu=False, rank0_only=False)
+        self._student_module.load_state_dict(full_sd, strict=True, assign=False)
+        del full_sd
         return self._student_module
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
