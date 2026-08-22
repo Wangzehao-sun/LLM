@@ -320,13 +320,22 @@ def joint_generate(model_a, model_b, batch_a, batch_b, *, eos_ids, pad_id, args)
     same split the trainer's sr_logprob_prompt uses.
 
     Returns (responses [B, T] padded with pad_id, lengths [B], fb_rows [B],
-    logp_rows [B], z_rows [B], logq [B, T], n_narrow). fb_rows counts teacher-fallback
+    logp_rows [B], z_rows [B], log_z [B, T], n_narrow). fb_rows counts teacher-fallback
     tokens per row and stays 0 outside ``fuse='agree'``; logp_rows sums log p_student
     over the emitted tokens and z_rows sums the surviving student mass, so dividing
-    either by lengths gives a per-row mean; logq holds the PER-TOKEN log density each
-    token was drawn from (0 past a row's end), which is what the trainer needs as the
-    importance ratio's denominator; n_narrow counts row-steps where top-p's nucleus ran
-    past sample_next's candidate cap.
+    either by lengths gives a per-row mean; log_z holds the PER-TOKEN
+    ``log Z_t = log p_t - log mu_t``, the cost of the teacher's constraint, which the
+    trainer multiplies the off-policy loss by AFTER clipping (0 past a row's end, so
+    exp() gives a neutral factor of 1 there); n_narrow counts row-steps where top-p's
+    nucleus ran past sample_next's candidate cap.
+
+    NOTE that log_z is a coefficient, NOT the importance ratio's denominator. The
+    denominator is the actor's own ``old_log_probs``, which the trainer already computes:
+    the student here IS the actor, so no substitution is needed and the framework's
+    ``ratio = pi_theta / p_t`` comes out right untouched. Keeping Z_t outside the ratio is
+    what keeps the PPO clip acting on the policy shift alone -- folded in, a Z_t of 0.2
+    would inflate the ratio fivefold and saturate the clip on nearly every token, for
+    reasons having nothing to do with how far the policy has moved.
 
     Rows are dropped from the batch as they finish, so the returned tensors are indexed
     by the row's ORIGINAL position, not by its position in the shrinking batch.
@@ -396,13 +405,13 @@ def joint_generate(model_a, model_b, batch_a, batch_b, *, eos_ids, pad_id, args)
     # batch position -> original row so the per-row stats stay attributable.
     out_tokens = torch.full((n_rows, args.max_new_tokens), pad_id,
                             dtype=torch.long, device=device)
-    # Per-token densities, laid out like out_tokens so index i of one names index i of
-    # the other. This is the alignment the trainer's importance ratio rests on, and it
-    # holds by construction: both are written in the same statement from the same
-    # sampled token. 0 past a row's end -- an unemitted token has no density, and 0
-    # keeps it inert in the masked sums downstream. Cheap in absolute terms: 128 rows x
-    # 14336 tokens in fp32 is 7.3MB, three orders below the KV cache.
-    out_logq = torch.zeros((n_rows, args.max_new_tokens), dtype=torch.float32, device=device)
+    # Per-token log Z_t, laid out like out_tokens so index i of one names index i of the
+    # other. That alignment is what the loss's Z_t coefficient rests on, and it holds by
+    # construction: both are written in the same statement from the same sampled token.
+    # 0 past a row's end -- exp(0) = 1, so an unemitted token contributes a neutral factor
+    # rather than a spurious one, and the masked sums downstream ignore it anyway. Cheap:
+    # 128 rows x 14336 tokens in fp32 is 7.3MB, three orders below the KV cache.
+    out_log_z = torch.zeros((n_rows, args.max_new_tokens), dtype=torch.float32, device=device)
     alive_idx = torch.arange(n_rows, device=device)
     alive = torch.ones(n_rows, dtype=torch.bool, device=device)
     # batch_select_indices is a DynamicCache method (transformers uses it for
@@ -440,23 +449,36 @@ def joint_generate(model_a, model_b, batch_a, batch_b, *, eos_ids, pad_id, args)
             log_q = sampled_log_prob(scores, nxt, args.temperature)
             log_pa = None
 
-        # Written before `nxt` is overwritten with padding below, so it is the density
-        # of the token actually chosen. Dead rows are zeroed rather than trusted: their
-        # `nxt` is about to become pad_id, whose density means nothing.
-        out_logq[alive_idx, step] = torch.where(alive, log_q, torch.zeros_like(log_q))
+        # log p_t of the token actually chosen, read off the STUDENT's own distribution --
+        # not off the fused/masked scores, so it means the same thing in every fuse mode and
+        # stays comparable to a single-model run. Taken while `nxt` is still the real sampled
+        # token (before the padding overwrite below) and before the row is marked finished, so
+        # the EOS token itself counts, matching how `lengths` counts it. agree_select already
+        # normalised log p_a, so reuse it rather than paying a second [B, vocab] log_softmax.
+        if log_pa is None:
+            log_pa = F.log_softmax(last_a.float(), dim=-1)
+        step_logp = log_pa.gather(-1, nxt).squeeze(-1)
+
+        # log Z_t, the token-level cost of the teacher's constraint:
+        #
+        #     Z_t = p_t(y_t) / mu_t(y_t)
+        #
+        # where p_t is the student's untruncated probability and mu_t the density actually
+        # sampled from. Taken as a DIFFERENCE rather than derived per branch, which is what
+        # keeps it correct in every case without a special case for any:
+        #   * eligible step        -> log Z_t = the truncation's log-normaliser, as intended.
+        #   * fallback='student'   -> mu_t IS p_t, so this is exactly 0 (Z_t = 1).
+        #   * fallback='teacher'   -> mu_t is the teacher's distribution, so this is
+        #                             log p_student - log p_teacher, whatever that happens to
+        #                             be. Deriving it by branch, I first wrote 0 here, which is
+        #                             wrong in both fallback modes.
+        # This is what the loss multiplies the off-policy term by, AFTER clipping.
+        log_z = step_logp - log_q
+        out_log_z[alive_idx, step] = torch.where(alive, log_z, torch.zeros_like(log_z))
 
         # A row that finished since the last shrink is still in the batch, so it still
         # has to be masked out here; the shrink only removes it at the next checkpoint.
         nxt = torch.where(alive.unsqueeze(-1), nxt, torch.full_like(nxt, pad_id))
-        # How confident the STUDENT was in the token that was actually emitted --
-        # read off log p_a, not off the fused/masked scores, so the number means the
-        # same thing in every fuse mode and stays comparable to a single-model run.
-        # Taken before the row is marked finished, so the EOS token itself counts
-        # (matching how `lengths` counts it). agree_select already normalised log p_a,
-        # so reuse it rather than paying for a second [B, vocab] log_softmax per step.
-        if log_pa is None:
-            log_pa = F.log_softmax(last_a.float(), dim=-1)
-        step_logp = log_pa.gather(-1, nxt).squeeze(-1)
         logp_rows.index_add_(0, alive_idx,
                              torch.where(alive, step_logp.double(),
                                          torch.zeros_like(step_logp, dtype=torch.float64)))
@@ -500,5 +522,5 @@ def joint_generate(model_a, model_b, batch_a, batch_b, *, eos_ids, pad_id, args)
         next_pos_b = next_pos_b + 1
 
     return (out_tokens[:, :steps_run].cpu(), lengths.cpu(), fb_rows.cpu(),
-            logp_rows.cpu(), z_rows.cpu(), out_logq[:, :steps_run].cpu(),
+            logp_rows.cpu(), z_rows.cpu(), out_log_z[:, :steps_run].cpu(),
             int(narrow.item()))

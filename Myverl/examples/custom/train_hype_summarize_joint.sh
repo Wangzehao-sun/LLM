@@ -23,17 +23,24 @@ set -x
 # arithmetic to get wrong: trainer.n_gpus_per_node is the whole story. The student must be
 # the live actor, and only the process holding its FSDP module can read its logits per token.
 #
-# WHAT THIS PATH BUYS. The importance ratio's denominator is the density the token was
-# ACTUALLY drawn from, recorded as it was sampled:
+# HOW IT REACHES THE LOSS. Because the student IS the actor, the density the candidate was
+# sampled from is the actor's own, which compute_log_prob already produces. So nothing is
+# substituted for old_log_probs and the importance ratio r_t = pi_theta(y_t)/p_t(y_t) comes out
+# of the framework untouched. What the sampler contributes is the one quantity no later forward
+# pass can recover -- Z_t = p_t/mu_t, the token-level cost of the teacher's constraint, where
 #
 #     mu_t(v) = p_actor(v) * 1[v in F_t] / Z_t
 #
-# The 1/Z_t is the part no later forward pass can recover -- asking any model for
-# log p_actor(v) afterwards misses -log Z_t and inflates off_ratio by 1/Z_t (roughly 1.8x at
-# the keep ratio of 0.55 the offline sweeps saw, worse as the constraint tightens). Only the
-# sampler knows that number, which is why this is a decoder and not a scorer. Token alignment
-# is likewise exact: the ids and their densities are written in the same statement from the
-# same draw, unlike the offline path which stores text and re-tokenises.
+# is the truncated, renormalised distribution actually sampled from. It multiplies the
+# off-policy term AFTER clipping:
+#
+#     L_off = -Z_t * min( r_t * A_t , clip(r_t, 1-eps, 1+eps) * A_t )
+#
+# Keeping Z_t outside the ratio is the point: folded in, a Z_t of 0.2 inflates the ratio
+# fivefold and saturates the clip on nearly every token, discarding gradient for reasons that
+# have nothing to do with how far the policy has moved. Token alignment is exact -- the ids and
+# their Z_t are written in the same statement from the same draw, unlike the offline path which
+# stores text and re-tokenises.
 #
 # WHAT IT COSTS. There is no paged attention and no CUDA graph here, and every token costs
 # two forward passes. Per step:
@@ -60,23 +67,25 @@ set -x
 #       effectively plain single-model decoding; raise AGREE_STUDENT_TOP_K first (it lets
 #       the actor reach further down its own ranking without widening what the teacher
 #       permits).
-#   batch/sr_joint_keep_ratio    -- Z_t, the share of the actor's mass the teacher left
-#       standing. The continuous version of the above, and it sees what fallback cannot:
-#       keep_ratio 0.2 with zero fallback means the constraint bites hard at every single
-#       step without ever failing outright.
-#   actor/off_ratio_ess          -- as always. The denominator is a truncated distribution,
-#       so watch it from step 1.
+#   batch/sr_joint_keep_ratio    -- Z_t as measured at sampling time from the eligibility mask:
+#       the share of the actor's mass the teacher left standing. The continuous version of the
+#       above, and it sees what fallback cannot: keep_ratio 0.2 with zero fallback means the
+#       constraint bites hard at every single step without ever failing outright.
+#   actor/off_z_mean             -- the Z_t actually multiplied into the loss. Differs from
+#       keep_ratio on fallback steps (keep_ratio records 0 there by its own diagnostic
+#       convention; the loss uses the real p_student/p_teacher), so the two separate as the
+#       fallback rate rises. This is the one that affects the gradient.
+#   actor/off_ratio_ess          -- as always. Watch it from step 1.
 #
 # THE CHECK THAT VALIDATES EVERYTHING, and it needs no special configuration. Because the
-# student IS the actor, the loss's numerator and the recorded denominator are the same model,
-# same prompt, same temperature -- so before the first optimizer step they differ only by the
-# truncation:
+# student IS the actor and no optimizer step has intervened, the loss's numerator and
+# denominator are the same model, same prompt, same temperature -- so on step 1
 #
-#     off_ratio = exp(log pi_theta - log mu_t) = Z_t
+#     actor/off_ratio  must sit at 1.0  on the off rows
 #
-# So actor/off_ratio on the off rows must EQUAL batch/sr_joint_keep_ratio (exactly, at
-# temperature 1). Check that on step 1. A mismatch means a token misalignment, a temperature
-# mismatch, or a wrong normaliser -- nothing else in the pipeline would report any of them.
+# with Z_t appearing separately in actor/off_z_mean rather than inside the ratio. A ratio that
+# is not ~1 there means a token misalignment or a temperature mismatch; nothing else in the
+# pipeline reports either.
 #
 # Usage:
 #   TEACHER_PATH=/home/data/shared/<sft-teacher> \

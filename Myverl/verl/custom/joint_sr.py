@@ -11,35 +11,45 @@ The student is the model being TRAINED, not a frozen copy, which is why the deco
 the actor's own worker rather than in a worker of its own: only that process holds the
 actor's FSDP module.
 
-WHAT IS DIFFERENT ABOUT THIS SOURCE. The other two paths produce candidate TEXT and then
-have to ask a model what density that text had:
+WHAT THIS SOURCE HANDS BACK, and why it is not a density. The other two candidate sources
+produce candidate TEXT and then have to ask a model what density that text had, which gets
+substituted for ``old_log_probs`` so the importance ratio picks it up:
 
   * online  -- ``logp_wg.generate_sequences`` then ``logp_wg.compute_log_prob``
   * offline -- a parquet column, re-tokenised by the dataset, then ``compute_log_prob``
 
-Joint decoding measures the density AS IT SAMPLES, so there is nothing to recover
-afterwards and no second forward pass. Three consequences, and they are the reason this
-path is worth its cost:
+This path needs NO substitution. The student is the actor, so the density the candidate was
+sampled from is the actor's own -- which ``compute_log_prob`` already produces for the whole
+batch. ``ratio = pi_theta / p_t`` therefore comes out of the framework untouched, and
+``off_old_log_probs`` is deliberately NOT written here.
 
-  1. ALIGNMENT IS EXACT. Token i of ``responses`` is the token ``off_log_probs[i]`` was
-     computed on, by construction -- both are written in the same statement from the same
-     draw. The offline path stores text and re-tokenises it, where a per-token density
-     could silently slip by a token and produce a plausible, wrong gradient.
-  2. THE DENSITY IS THE REAL ONE. ``agree`` samples from a TRUNCATED, renormalised
-     student distribution, mu_t(v) = p_a(v) * 1[v in F_t] / Z_t. Asking a model for
-     ``log p_a(v)`` afterwards would miss the ``1/Z_t`` factor and understate the
-     density by exactly ``log Z_t``, biasing ``off_ratio`` upward by ``1/Z_t`` -- a factor
-     of ~1.8 at the keep ratio of 0.55 seen in the offline sweeps, and worse the harder
-     the constraint bites. Only the sampler can know this number.
-  3. THE RATIO IS CHECKABLE. Because the student is the actor itself, the loss's numerator
-     and this denominator are the same model under the same prompt at the same temperature,
-     so before any optimizer step the two differ ONLY by the truncation:
+What the sampler contributes instead is the one quantity no later forward pass can recover:
 
-         off_ratio = exp(log pi_theta - log mu_t) = Z_t
+    Z_t = p_t(y_t) / mu_t(y_t)
 
-     So ``actor/off_ratio`` on the off rows must equal ``batch/sr_joint_keep_ratio``. That
-     identity holds in the real configuration rather than a degenerate one, and it catches a
-     token misalignment, a temperature mismatch, and a wrong normaliser at once.
+the token-level cost of the teacher's constraint, where ``mu_t`` is the truncated,
+renormalised distribution ``agree`` actually samples from. The loss multiplies the
+off-policy term by it AFTER clipping:
+
+    L_off = -Z_t * min( r_t * A_t , clip(r_t, 1-eps, 1+eps) * A_t )
+
+Keeping Z_t OUTSIDE the ratio is the point. Folded in (which is what substituting mu_t for
+old_log_probs would do) a Z_t of 0.2 inflates the ratio fivefold and saturates the clip on
+nearly every token -- discarding gradient for reasons that have nothing to do with how far
+the policy has moved, which is the only thing the clip is meant to police.
+
+Two properties worth stating because they are what make this path auditable:
+
+  1. ALIGNMENT IS EXACT. Token i of ``responses`` is the token ``off_log_z[i]`` was computed
+     on, by construction -- both are written in the same statement from the same draw. The
+     offline path stores text and re-tokenises it, where a per-token quantity could silently
+     slip by a token and produce a plausible, wrong gradient.
+  2. THE RATIO IS CHECKABLE. Because the student is the actor and no optimizer step
+     intervenes, numerator and denominator are the same model under the same prompt at the
+     same temperature, so before the first update ``actor/off_ratio`` on the off rows must sit
+     at 1.0. Z_t is reported separately as ``batch/sr_joint_keep_ratio``. A ratio that is not
+     ~1 at step 0 means a token misalignment or a temperature mismatch -- nothing else in the
+     pipeline reports either.
 """
 
 from __future__ import annotations
@@ -89,10 +99,11 @@ def generate(
         metrics: mutated in place with ``batch/sr_joint_*`` entries.
 
     Returns:
-        ``(cand_out, off_log_probs)`` where ``cand_out`` carries the same five keys
+        ``(cand_out, off_log_z)`` where ``cand_out`` carries the same five keys
         ``generate_sequences`` would return (``prompts`` / ``responses`` / ``input_ids`` /
-        ``attention_mask`` / ``position_ids``) and ``off_log_probs`` is [W, w], the
-        per-token log density of each generated token.
+        ``attention_mask`` / ``position_ids``) and ``off_log_z`` is [W, w], the per-token
+        ``log Z_t``. NOT a density: see the module docstring for why the importance ratio's
+        denominator needs no substitution on this path.
     """
     device = student_prompts.device
     n_questions = student_prompts.size(0)
@@ -123,7 +134,7 @@ def generate(
     reply = unpad_dataproto(worker_group.generate_joint(padded), pad_size=pad_size)
 
     cand_resp = reply.batch["responses"].to(device)
-    off_log_probs = reply.batch["off_log_probs"].to(device)
+    off_log_z = reply.batch["off_log_z"].to(device)
     lengths = reply.batch["response_lengths"].to(device)
 
     # The padded rows were real decodes of duplicated prompts; dropping them is what
@@ -131,9 +142,9 @@ def generate(
     assert cand_resp.size(0) == n_questions, (
         f"joint decoder returned {cand_resp.size(0)} rows for {n_questions} questions"
     )
-    assert off_log_probs.shape == cand_resp.shape, (
-        f"density {tuple(off_log_probs.shape)} does not align with tokens "
-        f"{tuple(cand_resp.shape)}; the importance ratio would be computed on the wrong "
+    assert off_log_z.shape == cand_resp.shape, (
+        f"log Z_t {tuple(off_log_z.shape)} does not align with tokens "
+        f"{tuple(cand_resp.shape)}; the off-policy loss would be weighted at the wrong "
         f"positions"
     )
 
@@ -183,7 +194,7 @@ def generate(
     # certainly not a usable candidate. If this is high, max_new_tokens is too low.
     metrics["batch/sr_joint_truncated"] = int((lengths >= max_response_length).sum().item())
 
-    return cand_out, off_log_probs
+    return cand_out, off_log_z
 
 
 def select_questions(all_q, max_questions_per_step, metrics):

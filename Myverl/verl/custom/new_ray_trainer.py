@@ -480,33 +480,34 @@ class NewRayPPOTrainer(RayPPOTrainer):
         # off_ratio checkable (it must equal Z_t before the first optimizer step) and what
         # keeps the proposal distribution from drifting away from the policy as training goes.
 
-        # The density reaches the loss through exactly ONE channel: the
-        # off_old_log_probs -> old_log_probs swap. 'dynamic_clip' and 'vanilla' skip that
-        # swap, which leaves the actor's own short-prompt value in place and collapses
-        # off_ratio to ~1 -- so mu_t, the whole point of decoding jointly, would silently
-        # never be used. Same rejection _validate_rephraser_config makes for the same
-        # reason; there is a runtime backstop at the swap site too, but failing at startup
-        # costs nothing whereas discovering it a step in costs a model load.
+        # Z_t reaches the loss as a COEFFICIENT on the off-policy term (multiplied in after
+        # clipping), carried by the off_log_z column rather than through the
+        # off_old_log_probs -> old_log_probs swap. So unlike the rephraser path, no
+        # off_policy_reshape value can silently drop it -- the swap is irrelevant here, and
+        # there is a runtime backstop at the swap site checking off_log_z is present.
+        #
+        # What DOES still matter is what the reshape does to the ratio the coefficient
+        # multiplies. p_div_p_0.1 replaces r_t = pi_theta/p_t outright with the LUFFY-style
+        # weight p/(p+0.1), so the run becomes "Z_t-weighted LUFFY" rather than
+        # "Z_t-weighted PPO". A legitimate comparison, but not the formula this path was built
+        # for, so it is announced.
         reshape = self.config.actor_rollout_ref.actor.policy_loss.get("off_policy_reshape", "clip")
-        if reshape in ("dynamic_clip", "vanilla"):
-            raise ValueError(
-                f"joint_decode.enable=True is incompatible with off_policy_reshape={reshape!r}: "
-                f"the off_old_log_probs -> old_log_probs swap is skipped, so the off-policy rows "
-                f"train with an importance ratio of ~1 and the sampling density mu_t never "
-                f"reaches the loss. Use 'clip' (or p_div_p_0.1 / batch_mean_norm / "
-                f"group_ess_weight)."
-            )
-        # p_div_p_0.1 is allowed but worth saying out loud: it discards the ratio in favour
-        # of the LUFFY-style weight p/(p+0.1) (new_core_alg.py), so the 1/Z_t correction --
-        # the reason this path exists rather than scoring candidates afterwards -- has no
-        # effect on the gradient. Two models' worth of memory for a gradient a single model
-        # would produce.
         if reshape == "p_div_p_0.1":
             print(
                 "[joint_decode] off_policy_reshape='p_div_p_0.1' replaces the importance ratio "
-                "with p/(p+0.1), so mu_t (and its 1/Z_t renormalisation) does not affect the "
-                "gradient at all -- only target_probs and candidate selection still read it. "
-                "Use 'clip' if the corrected ratio is the point of the run."
+                "pi_theta/p_t with p/(p+0.1), so the off-policy term becomes Z_t * LUFFY weight "
+                "rather than Z_t * clipped PPO ratio. Z_t itself still applies. Use 'clip' for "
+                "the intended formula."
+            )
+        elif reshape not in ("clip", "batch_mean_norm", "group_ess_weight") and not reshape.startswith("low_clip"):
+            # 'clip' is the intended setting and is implemented by falling through every
+            # reshape branch -- which means a typo also falls through and behaves like 'clip'
+            # with no complaint. Naming the recognised values is the only way that surfaces.
+            print(
+                f"[joint_decode] off_policy_reshape={reshape!r} is not one of the values this "
+                f"path was checked against (clip / p_div_p_0.1 / batch_mean_norm / "
+                f"group_ess_weight / low_clip*). If it is a typo it will behave exactly like "
+                f"'clip' and nothing else will say so."
             )
 
         # The teacher's long prompt comes from summarize_input_ids, which the dataset only
@@ -591,11 +592,11 @@ class NewRayPPOTrainer(RayPPOTrainer):
         # while sampling. Saying so prevents a wasted experiment.
         if rollout_cfg.get("sr_logprob_prompt", "long") != "long":
             print(
-                "[joint_decode] rollout.sr_logprob_prompt is ignored on this path: the "
-                "denominator is the density the token was actually drawn from (recorded by "
-                "the sampler, including the 1/Z_t renormalisation no later forward pass "
-                "could recover). Use joint_decode.student_prompt to choose which prompt the "
-                "student decodes under."
+                "[joint_decode] rollout.sr_logprob_prompt is ignored on this path: the student "
+                "IS the actor, so the ratio's denominator is the actor's own old_log_probs and "
+                "nothing is substituted for it. The truncation cost Z_t is carried separately "
+                "and multiplied in after clipping. Use joint_decode.student_prompt to choose "
+                "which prompt the student decodes under."
             )
 
     def _validate_sr_offline_config(self):
@@ -1688,6 +1689,10 @@ class NewRayPPOTrainer(RayPPOTrainer):
         bn, resp_width = responses.size(0), responses.size(1)
         n = bn // train_batch_size  # 每题 on-policy 采样数（interleaved 排列）
 
+        # 候选来源是否为联合解码。在这里就定下来，因为第 1 步要据此决定是否给整批补 off_log_z
+        # 那一列 —— splice 循环只拷贝目标张量里**已存在**的 key。
+        sr_joint = self.config.get('joint_decode', {}).get('enable', False)
+
         # --- 1. 确保 explain-style 所需的 key 在整批存在（on 行用零占位，masked 掉）---
         #     use_off_policy_probs=True 时 update_actor 会 select 'target_probs'，
         #     这里给全批补零，避免 select 失败；on 行 prefix_mask=0 -> off_ratio 被 mask。
@@ -1701,6 +1706,14 @@ class NewRayPPOTrainer(RayPPOTrainer):
         gen_batch_output.batch['off_old_log_probs'] = torch.zeros(
             (bn, resp_width), dtype=torch.float32, device=device
         )
+        # 联合解码额外需要的一列：逐 token 的 log Z_t，作为 off loss 的系数（clip 之后乘）。
+        # 全批补零而不是只给 off 行：splice 循环按 off_batch 的 key 逐个拷进来，目标张量必须
+        # 先存在。0 是正确的中性值 —— exp(0)=1，on 行的系数因此是 1，何况 prefix_mask=0 已经
+        # 让它们走不到 off 分支。
+        if sr_joint:
+            gen_batch_output.batch['off_log_z'] = torch.zeros(
+                (bn, resp_width), dtype=torch.float32, device=device
+            )
 
         # --- 2. 决定候选题集合：全部题 或 只全错题（由 summarize_replace 控制）---
         #     'all'：每题都生成候选并尝试替换最后一槽（省一次 compute_reward）。
@@ -1782,7 +1795,6 @@ class NewRayPPOTrainer(RayPPOTrainer):
         #
         # 题数上限必须在 W 之前应用：每步成本与 W 成正比（无 paged attention、每 token 两次
         # forward），而 wrong_only 下 W 是"本步答错了几道"这个数据决定的量。
-        sr_joint = self.config.get('joint_decode', {}).get('enable', False)
         if sr_joint:
             K = 1
             all_q = joint_sr.select_questions(
@@ -1926,15 +1938,19 @@ class NewRayPPOTrainer(RayPPOTrainer):
             )
         metrics['debug/sr_logprob_prompt_short'] = 1 if sr_logp_prompt == 'short' else 0
 
-        # 联合解码这条路整段跳过：密度在采样那一刻就已经算好了，而且**只有采样器算得出**。
-        # agree 是从截断并重归一化后的 student 分布 μ_t(v) = p_a(v)·1[v∈F_t]/Z_t 里采的；
-        # 事后拿任何模型 forward 一遍只能得到 log p_a(v)，缺了 −log Z_t 那一项，会把分母
-        # 系统性地低估、把 off_ratio 系统性地放大 1/Z_t 倍（离线 sweep 里 Z_t≈0.55，即约
-        # 1.8 倍，约束越紧越严重）。sr_logprob_prompt 因此对这条路无意义 ——
-        # student 在哪个 prompt 下解码由 joint_decode.student_prompt 决定，
-        # _validate_joint_config 会在启动时把这件事说清楚。
+        # 联合解码这条路整段跳过，理由与"密度只有采样器算得出"相反 —— 是**不需要**密度：
+        # student 就是 actor，所以候选的采样密度 p_t 正是下游 compute_log_prob 对整批算出的
+        # old_log_probs 本身。不做替换，ratio = π_θ/p_t 就是框架原样的结果。
+        #
+        # 采样器唯一贡献的是事后算不出来的那个量：Z_t = p_t/μ_t，即 teacher 约束的逐 token
+        # 代价。它作为**系数**乘在 off loss 上（clip 之后），不进 ratio —— 详见 joint_sr.py：
+        # 折进 ratio 会让 Z_t=0.2 把比值放大五倍、几乎每个 token 撞上 clip 上界，丢掉的梯度
+        # 与"策略偏移多远"毫无关系，而那才是 clip 该管的事。
+        #
+        # sr_logprob_prompt 对这条路无意义：分母就是 actor 在短 prompt 下的密度，
+        # 而 student 在哪个 prompt 下解码由 joint_decode.student_prompt 决定。
         if sr_joint:
-            cand_log_prob = sr_joint_logq                     # [W, w]
+            cand_log_prob = None                              # 不替换分母
         else:
             logp_in = cand_out
             if sr_logp_prompt == 'short':
@@ -2006,15 +2022,24 @@ class NewRayPPOTrainer(RayPPOTrainer):
         # 所以那个 max() 取回同一个值。联合解码也一样：worker 按 meta_info 里传过去的
         # max_response_length 分配输出缓冲，并把超出的部分截掉。
         #
-        # 断言这一点而不是只在注释里说：cand_log_prob 在联合解码这条路上是 worker 返回的
-        # 张量（不是 compute_log_prob 的输出），宽度对不上时下面这行会广播或报形状错，
-        # 而错在哪一步就看不出来了。
-        assert cand_log_prob.shape == off_batch.batch['responses'].shape, (
-            f"密度 {tuple(cand_log_prob.shape)} 与 off 行 response "
-            f"{tuple(off_batch.batch['responses'].shape)} 宽度不一致；IS 比值会算在错的位置上"
-        )
-        off_batch.batch['target_probs'] = torch.exp(cand_log_prob)
-        off_batch.batch['off_old_log_probs'] = cand_log_prob
+        # 断言而不是只写注释：这两个张量都来自 worker（不是 compute_log_prob 的输出），
+        # 宽度对不上时下面的赋值会广播或报形状错，而错在哪一步就看不出来了。
+        resp_shape = off_batch.batch['responses'].shape
+        if sr_joint:
+            # 联合解码：**不写** target_probs / off_old_log_probs。分母保持 actor 自己的
+            # old_log_probs（student 就是 actor），只额外带一列逐 token 的 log Z_t 当系数。
+            assert sr_joint_logq.shape == resp_shape, (
+                f"log Z_t {tuple(sr_joint_logq.shape)} 与 off 行 response {tuple(resp_shape)} "
+                f"宽度不一致；系数会乘在错的位置上"
+            )
+            off_batch.batch['off_log_z'] = sr_joint_logq
+        else:
+            assert cand_log_prob.shape == resp_shape, (
+                f"密度 {tuple(cand_log_prob.shape)} 与 off 行 response {tuple(resp_shape)} "
+                f"宽度不一致；IS 比值会算在错的位置上"
+            )
+            off_batch.batch['target_probs'] = torch.exp(cand_log_prob)
+            off_batch.batch['off_old_log_probs'] = cand_log_prob
 
         # 候选选择打分（近似 no-prefix 亲和度）：用已算好的 cand_log_prob（候选在
         # sr_logprob_prompt 指定的那个 prompt 下的 per-token logprob）做「序列平均
@@ -2030,8 +2055,15 @@ class NewRayPPOTrainer(RayPPOTrainer):
         # 想要严格的 reasoner 亲和度需要对 W*K 行做一次 reasoner forward（最多 128×8
         # 序列，成本接近整轮 rollout），故未实现。**离线模式下 K=1，本选择逻辑无事可做
         # （候选已在离线挑好），建议保持默认 'shortest'。**
+        #
+        # 联合解码也是 K=1（一题只解一条），所以同样无事可做；而且这条路不算候选密度，
+        # cand_log_prob 是 None。给零分让 select='logp' 退化成"取唯一那条"，与 'shortest'
+        # 同结果 —— 而不是在这里崩。
         cand_valid = (cand_resp != pad_token_id).float()            # [W*K, w]
-        cand_logp_mean = (cand_log_prob * cand_valid).sum(-1) / (cand_valid.sum(-1) + 1e-8)  # [W*K]
+        if cand_log_prob is None:
+            cand_logp_mean = torch.zeros(cand_resp.size(0), device=cand_resp.device)
+        else:
+            cand_logp_mean = (cand_log_prob * cand_valid).sum(-1) / (cand_valid.sum(-1) + 1e-8)  # [W*K]
         sr_select = self.config.actor_rollout_ref.rollout.get('summarize_replace_select', 'shortest')
 
         # --- 7. 每题挑一条合格候选，替换其最后一条 rollout（固定第 n-1 槽）---
@@ -3547,19 +3579,30 @@ class NewRayPPOTrainer(RayPPOTrainer):
                 # 成 ≈1，IS 修正整个消失 —— 而且不会报错。_validate_rephraser_config 已在启动时
                 # 拒掉会导致跳过的 reshape，这里兜住配置之外的路径。
                 #
-                # 联合解码同理，而且更严格：它的密度是 μ_t（含 1/Z_t 截断归一化），除了这条
-                # swap 之外没有任何别的通道，而 μ_t 与 p_a 的差正是这个方法的全部内容。
-                # 两个 feature 都要兜，所以条件写成两者取或。
-                _two_model = (
+                # 联合解码**不走这条 swap**，而且不该走：它的 student 就是 actor，所以分母正是
+                # old_log_probs 本身。它靠 off_log_z 那一列把 Z_t 带给 loss，所以那一列缺失才是
+                # 它的同类静默失败 —— Z_t 悄悄变成 1、截断代价整个消失、不报错。守卫因此分成两个。
+                if (
                     self.config.get("rephraser", {}).get("enable", False)
-                    or self.config.get("joint_decode", {}).get("enable", False)
-                )
-                if _two_model and off_policy_mask.any() and not _swap_done:
+                    and off_policy_mask.any()
+                    and not _swap_done
+                ):
                     raise RuntimeError(
-                        "off_old_log_probs never reached old_log_probs: the off-policy rows would "
-                        "train with an importance ratio of ~1, silently dropping the proposal "
-                        "density (the rephraser's pi_phi(y|x_long), or joint decoding's mu_t). "
-                        "Check off_policy_reshape."
+                        "rephraser.enable=True but off_old_log_probs never reached old_log_probs: "
+                        "the off-policy rows would train with an importance ratio of ~1, silently "
+                        "dropping the proposal density pi_phi(y|x_long). Check off_policy_reshape."
+                    )
+                if (
+                    self.config.get("joint_decode", {}).get("enable", False)
+                    and off_policy_mask.any()
+                    and "off_log_z" not in batch.batch
+                ):
+                    raise RuntimeError(
+                        "joint_decode.enable=True but off_log_z is missing from the batch: the "
+                        "off-policy rows would train with Z_t = 1, silently discarding the cost of "
+                        "the teacher's constraint -- which is the entire method. It is written by "
+                        "_summarize_replace_normal_step; a recycle/extra step that produces off "
+                        "rows some other way would land here."
                     )
                 
                 batch = batch.union(old_log_prob)

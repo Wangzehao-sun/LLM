@@ -960,7 +960,7 @@ class NewActorRolloutRefWorker(Worker, DistProfilerExtension):
              LOSS will use) and ``teacher_input_ids`` / ``teacher_attention_mask``
              (left-padded, may differ in length -- only the generated suffix has to align,
              and it does because both models are fed the same sampled token each step).
-        Out: ``responses`` and ``off_log_probs``, both [B, max_response_length] and aligned
+        Out: ``responses`` and ``off_log_z``, both [B, max_response_length] and aligned
              index-for-index, plus three per-row diagnostics.
         """
         from verl.custom.joint_decode_core import joint_generate
@@ -998,7 +998,7 @@ class NewActorRolloutRefWorker(Worker, DistProfilerExtension):
         n_rows = student_batch["input_ids"].size(0)
 
         responses = torch.full((n_rows, width), self.tokenizer.pad_token_id, dtype=torch.long)
-        off_log_probs = torch.zeros((n_rows, width), dtype=torch.float32)
+        off_log_z = torch.zeros((n_rows, width), dtype=torch.float32)
         lengths = torch.zeros(n_rows, dtype=torch.long)
         fallback_frac = torch.zeros(n_rows, dtype=torch.float32)
         keep_ratio = torch.zeros(n_rows, dtype=torch.float32)
@@ -1022,7 +1022,7 @@ class NewActorRolloutRefWorker(Worker, DistProfilerExtension):
             with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
                 for begin in range(0, n_rows, micro):
                     stop = min(begin + micro, n_rows)
-                    out_ids, out_len, fb_row, logp_row, z_row, logq, narrow = joint_generate(
+                    out_ids, out_len, fb_row, logp_row, z_row, log_z, narrow = joint_generate(
                         student, teacher,
                         {k: v[begin:stop] for k, v in student_batch.items()},
                         {k: v[begin:stop] for k, v in teacher_batch.items()},
@@ -1036,7 +1036,7 @@ class NewActorRolloutRefWorker(Worker, DistProfilerExtension):
                     # represented in the batch anyway.
                     keep = min(out_ids.size(1), width)
                     responses[begin:stop, :keep] = out_ids[:, :keep]
-                    off_log_probs[begin:stop, :keep] = logq[:, :keep]
+                    off_log_z[begin:stop, :keep] = log_z[:, :keep]
                     out_len = out_len.clamp(max=keep)
                     lengths[begin:stop] = out_len
 
@@ -1055,11 +1055,12 @@ class NewActorRolloutRefWorker(Worker, DistProfilerExtension):
                 self._teacher_module.to("cpu")
             get_torch_device().empty_cache()
 
-        # A density on a pad token becomes a gradient on a pad token, so the invariant is
-        # enforced rather than assumed.
+        # Zero past each row's end. exp(0) = 1, so a token that was never emitted gets a
+        # neutral coefficient rather than a spurious one -- and the loss masks it out anyway,
+        # but a stray value here would be a weight on a pad token, so it is enforced.
         valid = torch.arange(width).unsqueeze(0) < lengths.unsqueeze(1)
-        off_log_probs = off_log_probs * valid
-        assert off_log_probs.shape == responses.shape, "density must align with tokens 1:1"
+        off_log_z = off_log_z * valid
+        assert off_log_z.shape == responses.shape, "log Z_t must align with tokens 1:1"
 
         if n_narrow and self.rank == 0:
             print(f"[joint_decode] top-p nucleus exceeded the candidate cap on {n_narrow:,} "
@@ -1068,7 +1069,7 @@ class NewActorRolloutRefWorker(Worker, DistProfilerExtension):
         output = DataProto.from_dict(
             tensors={
                 "responses": responses,
-                "off_log_probs": off_log_probs,
+                "off_log_z": off_log_z,
                 "response_lengths": lengths,
                 "fallback_frac": fallback_frac,
                 "teacher_keep_ratio": keep_ratio,
