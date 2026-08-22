@@ -165,9 +165,12 @@ def generate(
     #   keep_ratio    -- Z_t, how much of the student's mass the teacher permitted. This
     #       is the continuous version of the above: fallback only fires when Z_t hits 0,
     #       so a low keep_ratio with zero fallback means the constraint is biting hard
-    #       everywhere without ever failing outright -- invisible to fallback alone.
+    #       everywhere without ever failing outright -- invisible to fallback alone. It is
+    #       also what actor/off_ratio must equal before the first optimizer step.
     #   student_logp  -- what the constraint cost, in the student's own terms.
-    metrics["batch/sr_joint_questions"] = n_questions
+    #
+    # No question count here: the SR path already reports batch/sr_target_questions, and
+    # select_questions corrects it when the cap bites.
     metrics["batch/sr_joint_fallback_frac"] = float(reply.batch["fallback_frac"].mean().item())
     metrics["batch/sr_joint_keep_ratio"] = float(reply.batch["teacher_keep_ratio"].mean().item())
     metrics["batch/sr_joint_student_logp"] = float(reply.batch["student_mean_logp"].mean().item())
@@ -200,6 +203,9 @@ def select_questions(all_q, max_questions_per_step, metrics):
         return all_q
     dropped = len(all_q) - max_questions_per_step
     metrics["batch/sr_joint_dropped"] = dropped
+    # sr_target_questions was already recorded before the cap, so correct it here rather
+    # than leaving a count that overstates what was actually decoded.
+    metrics["batch/sr_target_questions"] = max_questions_per_step
     print(
         f"[joint_decode] {len(all_q)} questions this step, decoding the first "
         f"{max_questions_per_step} and DROPPING {dropped}. Those questions get no "
