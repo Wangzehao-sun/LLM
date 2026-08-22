@@ -126,11 +126,13 @@ top_k: -1
 # here, so that product is the whole story.
 max_new_tokens: 4096
 
-# Rows decoded concurrently per rank. Bounded by memory, not by the question count. What
-# binds: the actor's params are UNSHARDED for the duration (summon_full_params(recurse=True)
-# -- which is what keeps the per-token cost off the interconnect, see joint_decode_core.py),
-# the teacher sits alongside, and both models' KV caches grow with this number times
-# max_new_tokens.
+# Rows decoded concurrently per rank. Bounded by memory, not by the question count.
+#
+# What is resident during a joint step, per rank: the actor's FSDP shard (as always), a FULL
+# unsharded copy of it (the student mirror -- gathered once per step so the decode costs no
+# interconnect traffic per token; see _joint_student), the teacher, and both decoding models'
+# KV caches, which grow with this number times max_new_tokens. Every rank needs to fit a whole
+# model twice over, which is the assumption this design rests on.
 batch_size: 8
 
 # Hard cap on questions per step, applied AFTER wrong_only narrows the set. This exists

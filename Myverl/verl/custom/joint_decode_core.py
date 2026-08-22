@@ -346,6 +346,11 @@ def joint_generate(model_a, model_b, batch_a, batch_b, *, eos_ids, pad_id, args)
 
     # Probed once per batch, not per step: inspect.signature is not free and the
     # answer cannot change mid-decode.
+    #
+    # Both callers hand over PLAIN modules, so the probe works. The training path
+    # deliberately does not pass its FSDP wrapper here -- an FSDP forward is (*args, **kwargs)
+    # and the probe would silently find nothing, costing ~10GB of unused prefill logits at a
+    # 152k vocab. See NewActorRolloutRefWorker._joint_student.
     keep_a = last_logit_kwargs(model_a)
     keep_b = last_logit_kwargs(model_b)
 

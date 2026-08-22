@@ -862,6 +862,77 @@ class NewActorRolloutRefWorker(Worker, DistProfilerExtension):
             f"of {wanted}:\n  " + "\n  ".join(errors)
         )
 
+    def _joint_student(self, cfg):
+        """Return the plain-HF mirror of the actor, and refresh its weights from the actor.
+
+        THIS IS THE GATHER-ONCE STEP, and it is the whole reason this path is affordable.
+
+        The actor is FSDP1 FULL_SHARD with per-layer wrapping, so each rank holds 1/world_size
+        of every layer. Decoding straight through the FSDP wrapper means each layer all-gathers
+        and reshards inside EVERY forward -- roughly the whole model across the interconnect per
+        TOKEN. (The obvious dodge, summon_full_params(recurse=True) around the loop, does not
+        work: running a forward inside the context fires FSDP's own post-forward hooks, which
+        reshard the nested handles, and the exit path then asserts they are still unsharded --
+        "Expects tensor to be unsharded with size N but got N/world_size".)
+
+        So instead: gather the full weights ONCE per step into an unsharded module and decode
+        against that, with zero FSDP involvement for the thousands of steps that follow. This
+        is exactly what fsdp_vllm.py does to hand weights to the vLLM engine, and it puts the
+        student in the same state the offline evaluator's model is in.
+
+        ``summon_full_params`` is safe HERE because no forward runs inside it -- the only thing
+        happening is a state_dict read, the same use layered_summon_lora_params makes of it.
+
+        Costs one full copy of the weights resident per rank (~8GB for a 4B model in bf16) plus
+        one gather + copy per step. Both are paid once per step rather than once per token.
+        """
+        from transformers import AutoConfig, AutoModelForCausalLM
+
+        inner = getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+
+        if getattr(self, "_student_module", None) is None:
+            # from_config, NOT from_pretrained: every parameter is about to be overwritten from
+            # the actor, so reading the checkpoint off disk would be wasted I/O -- and stale,
+            # since the actor has been training.
+            #
+            # No init_empty_weights/meta device here. It would skip the real allocation, but
+            # this repo consistently guards that on `not tie_word_embeddings` (see
+            # get_init_weight_context_manager and its three call sites) because materialising a
+            # meta-tensor model breaks tied embeddings, and load_state_dict(strict=True) would
+            # then fail or silently untie them. from_config allocates for real, which costs one
+            # extra allocation ONCE per run -- not per step.
+            hf_config = AutoConfig.from_pretrained(
+                copy_to_local(self.config.model.path),
+                trust_remote_code=self.config.model.get("trust_remote_code", False),
+            )
+            wanted = [cfg.attn_impl] if cfg.attn_impl != "auto" else ["flash_attention_2", "sdpa", "eager"]
+            errors = []
+            for impl in wanted:
+                try:
+                    model = AutoModelForCausalLM.from_config(
+                        hf_config, torch_dtype=torch.bfloat16, attn_implementation=impl
+                    )
+                except (ValueError, ImportError, RuntimeError) as error:
+                    errors.append(f"{impl}: {type(error).__name__}: {error}")
+                    continue
+                if self.rank == 0:
+                    print(f"[joint_decode] student mirror attn_implementation={impl} "
+                          f"(unsharded copy of the actor, refreshed each step)", flush=True)
+                self._student_module = model.to(get_device_id()).eval()
+                break
+            else:
+                raise RuntimeError(
+                    "could not build the joint-decoding student mirror with any of "
+                    f"{wanted}:\n  " + "\n  ".join(errors)
+                )
+
+        # Refresh EVERY step: the actor's weights change with each update, and a stale mirror
+        # would silently decode against an old policy -- which would also break the
+        # off_ratio == Z_t identity that is this path's only end-to-end check.
+        with FSDP.summon_full_params(self.actor_module_fsdp, writeback=False):
+            self._student_module.load_state_dict(inner.state_dict(), strict=True, assign=False)
+        return self._student_module
+
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     @DistProfiler.annotate(color="magenta")
     @torch.no_grad()
@@ -883,8 +954,6 @@ class NewActorRolloutRefWorker(Worker, DistProfilerExtension):
         Out: ``responses`` and ``off_log_probs``, both [B, max_response_length] and aligned
              index-for-index, plus three per-row diagnostics.
         """
-        from contextlib import nullcontext
-
         from verl.custom.joint_decode_core import joint_generate
 
         assert self._is_actor, (
@@ -932,43 +1001,16 @@ class NewActorRolloutRefWorker(Worker, DistProfilerExtension):
         if pad_id is None:
             pad_id = eos_ids[0]
 
-        # The sharding manager leaves the module in train() after rollout
-        # (fsdp_vllm.py's __exit__), and decoding under train() applies dropout -- silently
-        # randomised candidates, no error. Gradient checkpointing is worse: HF turns
-        # use_cache off when it is active, which would make the KV-cache loop O(n^2)
-        # recompute. Both are switched off here and restored afterwards.
-        was_training = self.actor_module_fsdp.training
-        inner = self.actor_module if fsdp_version(self.actor_module_fsdp) == 1 else self.actor_module_fsdp
-        gc_was_on = getattr(inner, "is_gradient_checkpointing", False)
-        if gc_was_on:
-            inner.gradient_checkpointing_disable()
-        self.actor_module_fsdp.eval()
-
-        # recurse=True, unlike hf_rollout.py:108. That call passes recurse=False citing
-        # pytorch#100069, which is a HYBRID_SHARD issue; this config is FULL_SHARD
-        # (fsdp_size=-1 gives a 1-D mesh). The difference is decisive here: with
-        # recurse=False only the ROOT handle is unsharded, so every per-layer handle
-        # (transformer_auto_wrap_policy wraps each layer) all-gathers and reshards inside
-        # EVERY forward -- one all-gather of the whole model per token, ~8GB for a 4B model,
-        # tens of TB over a full response. recurse=True unshards once and holds it for the
-        # loop, at the cost of the full params staying resident. fsdp_vllm.py:117 already
-        # calls summon_full_params with recurse at its default of True.
-        param_ctx = (
-            FSDP.summon_full_params(self.actor_module_fsdp, writeback=False, recurse=True)
-            if isinstance(self.actor_module_fsdp, FSDP)
-            else nullcontext()
-        )
+        # The student is the plain-HF mirror, refreshed from the actor here. Everything below
+        # therefore runs with ZERO FSDP involvement -- no summon context, no per-layer
+        # all-gather, no train()/eval() or gradient-checkpointing state to juggle on the
+        # actor. See _joint_student for why the alternatives do not work.
+        student = self._joint_student(cfg)
 
         micro = max(1, int(cfg.batch_size))
         n_narrow = 0
         try:
-            with param_ctx, torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
-                # The INNER module, not the FSDP wrapper: joint_generate probes forward()'s
-                # signature for logits_to_keep, and FSDP.forward is (*args, **kwargs), so
-                # probing the wrapper finds nothing and prefill materialises logits for every
-                # position (~10GB at a 152k vocab). Inside the summon context the inner
-                # module's params are already full.
-                student = inner
+            with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
                 for begin in range(0, n_rows, micro):
                     stop = min(begin + micro, n_rows)
                     out_ids, out_len, fb_row, logp_row, z_row, logq, narrow = joint_generate(
@@ -997,12 +1039,9 @@ class NewActorRolloutRefWorker(Worker, DistProfilerExtension):
                     keep_ratio[begin:stop] = (z_row / denom.double()).to(torch.float32)
                     student_logp[begin:stop] = (logp_row / denom.double()).to(torch.float32)
         finally:
-            # Restore the module's state even if decoding raised, or the next update_actor
-            # would train in eval mode without gradient checkpointing.
-            if was_training:
-                self.actor_module_fsdp.train()
-            if gc_was_on:
-                inner.gradient_checkpointing_enable()
+            # The actor's own train()/eval() and gradient-checkpointing state are untouched by
+            # this path -- the mirror is what decodes -- so there is nothing to restore there.
+            # Only the teacher goes back to CPU, even if decoding raised.
             if cfg.get("teacher_offload", True) and self._teacher_module is not None:
                 self._teacher_module.to("cpu")
             get_torch_device().empty_cache()
@@ -1029,7 +1068,10 @@ class NewActorRolloutRefWorker(Worker, DistProfilerExtension):
         )
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
-        # unshard the root FSDP module -- same reason compute_log_prob does it.
+        # Reshard the root handle. summon_full_params in _joint_student unshards it, and
+        # although its own exit path reshards, compute_log_prob does this explicitly for the
+        # same reason (the root handle can be left unsharded after a gather) -- following the
+        # existing convention rather than assuming.
         if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
             self.actor.actor_module._handle.reshard(True)
         if self._is_offload_param:

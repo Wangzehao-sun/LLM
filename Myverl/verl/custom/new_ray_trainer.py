@@ -561,19 +561,19 @@ class NewRayPPOTrainer(RayPPOTrainer):
             f"{joint_cfg.get('max_new_tokens')} tokens, two model forwards per token. "
             f"student=the actor itself, teacher={joint_cfg.get('teacher_model_path')}"
         )
-        # Memory is the other constraint, and it moved: summon_full_params(recurse=True)
-        # holds the actor's params UNSHARDED for the whole decode (which is what keeps the
-        # per-token cost off the interconnect), and the teacher sits alongside it. Both come
-        # out of the same budget vLLM reserved via gpu_memory_utilization -- vLLM is asleep
-        # by then, so its arena is available to the caching allocator, but how much of it is
+        # Memory is the other constraint, and this design assumes each GPU fits a whole model
+        # TWICE: the actor's shard plus a full unsharded mirror of it, gathered once per step so
+        # the decode costs no per-token interconnect traffic. The teacher sits alongside. All of
+        # it comes out of what vLLM's gpu_memory_utilization reservation leaves -- vLLM is
+        # asleep by then, so its arena is back with the caching allocator, but how much is
         # actually reusable has not been measured. Lower gpu_memory_utilization if the first
         # joint step OOMs.
         print(
-            f"[joint_decode] the actor's params are unsharded for the decode (FULL_SHARD x "
-            f"{n_gpus} -> full model per rank) and the teacher is resident alongside; "
-            f"teacher_offload={joint_cfg.get('teacher_offload', True)}. Both share the budget "
-            f"gpu_memory_utilization="
-            f"{self.config.actor_rollout_ref.rollout.get('gpu_memory_utilization')} left over."
+            f"[joint_decode] resident per rank during a joint step: the actor's FSDP shard, a "
+            f"FULL unsharded mirror of it (refreshed each step), and the teacher "
+            f"(offload={joint_cfg.get('teacher_offload', True)}), plus both decoders' KV caches. "
+            f"All from what gpu_memory_utilization="
+            f"{self.config.actor_rollout_ref.rollout.get('gpu_memory_utilization')} leaves over."
         )
 
         if sr_mode == "all":

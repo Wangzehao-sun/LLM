@@ -45,12 +45,14 @@ set -x
 # MAX_QUESTIONS caps W: an uncapped step has no bound on its own duration. Whatever the cap
 # drops is logged (batch/sr_joint_dropped), never silently skipped.
 #
-# MEMORY. During the decode the actor's params are held UNSHARDED
-# (summon_full_params(recurse=True) -- necessary, or every layer all-gathers per token and
-# the interconnect becomes the bottleneck), and the teacher sits alongside. Both come out of
-# what is left after vLLM's gpu_memory_utilization reservation. vLLM is asleep by then so its
-# arena is available to the caching allocator, but how much is really reusable has NOT been
-# measured -- if the first joint step OOMs, lower GPU_MEM_UTIL.
+# MEMORY -- this design assumes each GPU can hold a whole model TWICE. The actor's weights are
+# gathered once per step into an unsharded plain-HF mirror, and the decode runs against that;
+# without it every layer would all-gather per token and the interconnect, not the GPU, would be
+# the bottleneck. So a joint step holds: the actor's FSDP shard, the full mirror, the teacher,
+# and both decoding models' KV caches. All of it comes out of what is left after vLLM's
+# gpu_memory_utilization reservation. vLLM is asleep by then so its arena is back with the
+# caching allocator, but how much is really reusable has NOT been measured -- if the first
+# joint step OOMs, lower GPU_MEM_UTIL.
 #
 # THE THREE METRICS TO WATCH, in this order:
 #   batch/sr_joint_fallback_frac -- share of tokens where the intersection was EMPTY, so
