@@ -76,11 +76,11 @@ fuse_weight: 0.5
 # How far down the STUDENT's own ranking it may look for a token the teacher permits.
 # Raising this lets it reach further instead of falling back, WITHOUT widening what the
 # teacher allows -- usually the cheapest response to a high fallback rate.
-agree_student_top_k: 10
+agree_student_top_k: 50
 
 # How much of the vocabulary the TEACHER permits at all. This is the knob that sets how
 # tightly the constraint binds.
-agree_teacher_top_k: 10
+agree_teacher_top_k: 8
 
 # Probability floors, applied on top of the top-k intersection. 0 disables a side.
 # The teacher's floor sets how wide the allowed region is; the student's only drops
@@ -98,7 +98,7 @@ agree_student_min_prob: 0.0
 # Both branches SAMPLE (at `temperature`) rather than take an argmax: an argmax fallback
 # would pin every disagreeing position to one fixed token, so diversity would decay with
 # each fallback.
-agree_fallback: teacher
+agree_fallback: student
 
 # ---------------------------------------------------------------------------
 # sampling
@@ -124,14 +124,14 @@ top_k: -1
 # sequential two-model forwards, where W is the number of questions this step and n_gpus is
 # the reasoner's count (this shares its pool). There is no paged attention and no CUDA graph
 # here, so that product is the whole story.
-max_new_tokens: 4096
+max_new_tokens: 8192
 
 # Rows decoded concurrently per rank. Bounded by memory, not by the question count. What
 # binds: the actor's params are UNSHARDED for the duration (summon_full_params(recurse=True)
 # -- which is what keeps the per-token cost off the interconnect, see joint_decode_core.py),
 # the teacher sits alongside, and both models' KV caches grow with this number times
 # max_new_tokens.
-batch_size: 8
+batch_size: 16
 
 # Hard cap on questions per step, applied AFTER wrong_only narrows the set. This exists
 # because the cost above is linear in W and W is data-dependent -- a step where most
@@ -140,7 +140,7 @@ batch_size: 8
 #
 # 0 = no cap. Only sensible with wrong_only; summarize_replace=all sends every question
 # here and is not viable at these lengths.
-max_questions_per_step: 16
+max_questions_per_step: 0
 
 # auto tries flash_attention_2, then sdpa, then eager, and says which it got. Pin it to
 # fail loudly instead if a specific backend is required.
