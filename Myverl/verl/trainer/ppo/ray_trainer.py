@@ -76,7 +76,6 @@ class Role(Enum):
     ActorRolloutRef = 6
     ActorRolloutSE = 7  # Secondary ActorRollout for SE training
     ActorRolloutRephraser = 8  # Frozen second model that rolls out the summarize prompt
-    JointDecode = 9  # Two frozen models decoding together, fused per token
 
 
 @dataclass

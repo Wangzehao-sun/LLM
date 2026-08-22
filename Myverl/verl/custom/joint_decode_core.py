@@ -14,12 +14,12 @@ Every token is decided by BOTH models. Two families of rule, selected by ``fuse`
 
 This lives in the package rather than in ``Data/`` because it now has two callers:
 ``Data/joint_decode.py`` (offline evaluation, under torchrun) and
-``verl/custom/joint_decode_worker.py`` (a Ray worker that produces the
-summarize-replacement candidate during training). The rule that decided the split is
-CLAUDE.md's: reusable package code belongs here, and ``Data/`` scripts may import from
-``verl`` but never the reverse. Nothing in this module touches argparse, parquet, Ray,
-or ``torch.distributed`` -- prompts arrive already tokenised, so both callers reach it
-without an adapter.
+``NewActorRolloutRefWorker.generate_joint`` in ``verl/custom/fsdp_workers_new.py`` (which
+produces the summarize-replacement candidate during training, with the LIVE actor as model A
+and a frozen teacher as model B). The rule that decided the split is CLAUDE.md's: reusable
+package code belongs here, and ``Data/`` scripts may import from ``verl`` but never the
+reverse. Nothing in this module touches argparse, parquet, Ray, or ``torch.distributed`` --
+prompts arrive already tokenised, so both callers reach it without an adapter.
 
 It deliberately does NOT go through verl's rollout stack. vLLM is entered once per
 request (``vllm_rollout_spmd.py:304`` calls ``LLM.generate()``), so there is no

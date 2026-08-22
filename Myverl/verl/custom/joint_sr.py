@@ -1,11 +1,15 @@
 """Drive the joint decoder and hand its output back to the summarize-replacement path.
 
 This is the seam between two things that otherwise know nothing about each other:
-``joint_decode_worker.py`` (two frozen models, per-token fusion) and
-``_summarize_replace_normal_step`` (score, filter, select, splice). Keeping the seam in
-its own module is what limits the edit to the existing trainer to a single extra branch
-plus a skipped log-prob call -- the load-bearing steps 5-7 of that function are shared
-by all three candidate sources rather than copied per source.
+``NewActorRolloutRefWorker.generate_joint`` (the LIVE actor as student, a frozen teacher
+constraining it, fused per token) and ``_summarize_replace_normal_step`` (score, filter,
+select, splice). Keeping the seam in its own module is what limits the edit to the existing
+trainer to a single extra branch plus a skipped log-prob call -- the load-bearing steps 5-7
+of that function are shared by all three candidate sources rather than copied per source.
+
+The student is the model being TRAINED, not a frozen copy, which is why the decode lives on
+the actor's own worker rather than in a worker of its own: only that process holds the
+actor's FSDP module.
 
 WHAT IS DIFFERENT ABOUT THIS SOURCE. The other two paths produce candidate TEXT and then
 have to ask a model what density that text had:
@@ -14,8 +18,8 @@ have to ask a model what density that text had:
   * offline -- a parquet column, re-tokenised by the dataset, then ``compute_log_prob``
 
 Joint decoding measures the density AS IT SAMPLES, so there is nothing to recover
-afterwards and no second forward pass. Two consequences worth stating because they are
-the reason this path is worth its cost:
+afterwards and no second forward pass. Three consequences, and they are the reason this
+path is worth its cost:
 
   1. ALIGNMENT IS EXACT. Token i of ``responses`` is the token ``off_log_probs[i]`` was
      computed on, by construction -- both are written in the same statement from the same
@@ -27,11 +31,21 @@ the reason this path is worth its cost:
      density by exactly ``log Z_t``, biasing ``off_ratio`` upward by ``1/Z_t`` -- a factor
      of ~1.8 at the keep ratio of 0.55 seen in the offline sweeps, and worse the harder
      the constraint bites. Only the sampler can know this number.
+  3. THE RATIO IS CHECKABLE. Because the student is the actor itself, the loss's numerator
+     and this denominator are the same model under the same prompt at the same temperature,
+     so before any optimizer step the two differ ONLY by the truncation:
+
+         off_ratio = exp(log pi_theta - log mu_t) = Z_t
+
+     So ``actor/off_ratio`` on the off rows must equal ``batch/sr_joint_keep_ratio``. That
+     identity holds in the real configuration rather than a degenerate one, and it catches a
+     token misalignment, a temperature mismatch, and a wrong normaliser at once.
 """
 
 from __future__ import annotations
 
 import torch
+from omegaconf import OmegaConf
 
 from verl import DataProto
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
@@ -39,7 +53,8 @@ from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 
 def generate(
     *,
-    joint_decode_wg,
+    worker_group,
+    joint_config,
     student_prompts: torch.Tensor,
     teacher_prompts: torch.Tensor,
     pad_token_id: int,
@@ -52,8 +67,15 @@ def generate(
     """Decode one candidate per question and return it in the SR path's own shape.
 
     Args:
-        joint_decode_wg: the ``JointDecodeWorker`` group.
-        student_prompts: [W, L_short] left-padded. The prompt the LOSS will use.
+        worker_group: the ACTOR's worker group. The student is the live actor, so the
+            decode has to run in the process that owns its FSDP module -- there is no
+            separate joint-decode worker. See
+            ``NewActorRolloutRefWorker.generate_joint``.
+        joint_config: the ``joint_decode`` config node. Sent over with the request rather
+            than read on the far side, because the actor worker is constructed with
+            ``config.actor_rollout_ref`` and cannot see the top-level node.
+        student_prompts: [W, L_short] left-padded. The prompt the LOSS will use, and the
+            one the actor decodes under.
         teacher_prompts: [W, L_long] left-padded. May differ in length; only the
             generated suffix has to align, and it does because both models are fed the
             same sampled token each step.
@@ -84,7 +106,12 @@ def generate(
             "teacher_input_ids": teacher_prompts,
             "teacher_attention_mask": teacher_attn,
         },
-        meta_info={"max_response_length": max_response_length},
+        meta_info={
+            "max_response_length": max_response_length,
+            # Resolved to a plain container: meta_info is pickled to the workers, and an
+            # OmegaConf node carrying interpolations would not survive that cleanly.
+            "joint_decode_config": OmegaConf.to_container(joint_config, resolve=True),
+        },
     )
 
     # Pad to the worker's dp size before dispatch. DP_COMPUTE_PROTO chunks by world_size
@@ -92,8 +119,8 @@ def generate(
     # divide evenly asserts inside chunk(). Under summarize_replace='wrong_only' that
     # count is "how many questions failed this step" -- an arbitrary integer, which is
     # exactly the 11-rows-into-4-GPUs failure this repo already hit once (commit 4ba0f1d).
-    padded, pad_size = pad_dataproto_to_divisor(request, joint_decode_wg.world_size)
-    reply = unpad_dataproto(joint_decode_wg.generate_joint(padded), pad_size=pad_size)
+    padded, pad_size = pad_dataproto_to_divisor(request, worker_group.world_size)
+    reply = unpad_dataproto(worker_group.generate_joint(padded), pad_size=pad_size)
 
     cand_resp = reply.batch["responses"].to(device)
     off_log_probs = reply.batch["off_log_probs"].to(device)
@@ -138,9 +165,12 @@ def generate(
     #   keep_ratio    -- Z_t, how much of the student's mass the teacher permitted. This
     #       is the continuous version of the above: fallback only fires when Z_t hits 0,
     #       so a low keep_ratio with zero fallback means the constraint is biting hard
-    #       everywhere without ever failing outright -- invisible to fallback alone.
+    #       everywhere without ever failing outright -- invisible to fallback alone. It is
+    #       also what actor/off_ratio must equal before the first optimizer step.
     #   student_logp  -- what the constraint cost, in the student's own terms.
-    metrics["batch/sr_joint_questions"] = n_questions
+    #
+    # No question count here: the SR path already reports batch/sr_target_questions, and
+    # select_questions corrects it when the cap bites.
     metrics["batch/sr_joint_fallback_frac"] = float(reply.batch["fallback_frac"].mean().item())
     metrics["batch/sr_joint_keep_ratio"] = float(reply.batch["teacher_keep_ratio"].mean().item())
     metrics["batch/sr_joint_student_logp"] = float(reply.batch["student_mean_logp"].mean().item())
@@ -173,6 +203,9 @@ def select_questions(all_q, max_questions_per_step, metrics):
         return all_q
     dropped = len(all_q) - max_questions_per_step
     metrics["batch/sr_joint_dropped"] = dropped
+    # sr_target_questions was already recorded before the cap, so correct it here rather
+    # than leaving a count that overstates what was actually decoded.
+    metrics["batch/sr_target_questions"] = max_questions_per_step
     print(
         f"[joint_decode] {len(all_q)} questions this step, decoding the first "
         f"{max_questions_per_step} and DROPPING {dropped}. Those questions get no "

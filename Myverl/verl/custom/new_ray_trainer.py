@@ -474,9 +474,11 @@ class NewRayPPOTrainer(RayPPOTrainer):
                 "pre-generated column."
             )
 
-        for key in ("student_model_path", "teacher_model_path"):
-            if not joint_cfg.get(key):
-                raise ValueError(f"joint_decode.enable=True requires joint_decode.{key}")
+        if not joint_cfg.get("teacher_model_path"):
+            raise ValueError("joint_decode.enable=True requires joint_decode.teacher_model_path")
+        # No student_model_path: the student IS the actor being trained. That is what makes
+        # off_ratio checkable (it must equal Z_t before the first optimizer step) and what
+        # keeps the proposal distribution from drifting away from the policy as training goes.
 
         # The density reaches the loss through exactly ONE channel: the
         # off_old_log_probs -> old_log_probs swap. 'dynamic_clip' and 'vanilla' skip that
@@ -545,10 +547,11 @@ class NewRayPPOTrainer(RayPPOTrainer):
 
         # Cost, printed because it is the number that decides whether this is viable at
         # all. There is no paged attention and no CUDA graph here, and each token costs two
-        # forward passes, so the step time is essentially this product.
+        # forward passes, so the step time is essentially this product. The GPU count is the
+        # reasoner's -- joint decoding runs on the same pool, on the actor's own worker.
         max_q = int(joint_cfg.get("max_questions_per_step", 0))
         batch = max(1, int(joint_cfg.get("batch_size", 8)))
-        n_gpus = max(1, int(joint_cfg.get("n_gpus_per_node", 0)) or self.config.trainer.n_gpus_per_node)
+        n_gpus = max(1, int(self.config.trainer.n_gpus_per_node))
         train_bsz = self.config.data.train_batch_size
         worst_q = max_q if max_q else train_bsz
         waves = -(-worst_q // (batch * n_gpus))
@@ -556,9 +559,23 @@ class NewRayPPOTrainer(RayPPOTrainer):
             f"[joint_decode] up to {worst_q} question(s)/step over {n_gpus} GPU(s) at "
             f"batch_size={batch} = {waves} sequential wave(s) x "
             f"{joint_cfg.get('max_new_tokens')} tokens, two model forwards per token. "
-            f"student={joint_cfg.get('student_model_path')} "
-            f"teacher={joint_cfg.get('teacher_model_path')}"
+            f"student=the actor itself, teacher={joint_cfg.get('teacher_model_path')}"
         )
+        # Memory is the other constraint, and it moved: summon_full_params(recurse=True)
+        # holds the actor's params UNSHARDED for the whole decode (which is what keeps the
+        # per-token cost off the interconnect), and the teacher sits alongside it. Both come
+        # out of the same budget vLLM reserved via gpu_memory_utilization -- vLLM is asleep
+        # by then, so its arena is available to the caching allocator, but how much of it is
+        # actually reusable has not been measured. Lower gpu_memory_utilization if the first
+        # joint step OOMs.
+        print(
+            f"[joint_decode] the actor's params are unsharded for the decode (FULL_SHARD x "
+            f"{n_gpus} -> full model per rank) and the teacher is resident alongside; "
+            f"teacher_offload={joint_cfg.get('teacher_offload', True)}. Both share the budget "
+            f"gpu_memory_utilization="
+            f"{self.config.actor_rollout_ref.rollout.get('gpu_memory_utilization')} left over."
+        )
+
         if sr_mode == "all":
             print(
                 f"[joint_decode] WARNING: summarize_replace='all' sends every question here "
@@ -999,18 +1016,6 @@ class NewRayPPOTrainer(RayPPOTrainer):
                     role=rp_role,
                 )
 
-            # Joint decoding: two frozen models that decode together, fusing per token,
-            # to produce the summarize-replacement candidate. Unlike the rephraser this
-            # is NOT an actor_rollout worker -- it takes only its own config node and has
-            # no `role` argument, because there is nothing for a role to select between
-            # (no optimizer, no vLLM engine, no FSDP wrap). See joint_decode_worker.py.
-            if Role.JointDecode in self.role_worker_mapping:
-                resource_pool_jd = self.resource_pool_manager.get_resource_pool(Role.JointDecode)
-                self.resource_pool_to_cls[resource_pool_jd]["joint_decode"] = RayClassWithInitArgs(
-                    cls=self.role_worker_mapping[Role.JointDecode],
-                    config=self.config.joint_decode,
-                )
-
         else:
             raise NotImplementedError
 
@@ -1085,16 +1090,10 @@ class NewRayPPOTrainer(RayPPOTrainer):
             self.rephraser_wg.init_model()
             print("Frozen rephraser initialized (rollout + log-prob only, no optimizer).")
 
-        # Joint decoder. Same reasoning for the ordering as the rephraser, and more
-        # acutely so: this worker loads two unsharded models, so letting it allocate
-        # before the reasoner's vLLM engine sizes its kv cache would make that estimate
-        # see less free memory than it does today. Set to None unconditionally -- the SR
-        # path tests the attribute rather than the config.
-        self.joint_decode_wg = None
-        if "joint_decode" in all_wg:
-            self.joint_decode_wg = all_wg["joint_decode"]
-            self.joint_decode_wg.init_model()
-            print("Joint decoder initialized (two frozen models, per-token fusion).")
+        # Joint decoding needs no worker group of its own: the student IS the actor, so the
+        # decode runs as a method on the actor worker (generate_joint) reached through
+        # self.actor_rollout_wg. The frozen teacher is loaded lazily inside that worker on
+        # first use, which also keeps it out of vLLM's kv-cache sizing.
 
 
         # create async rollout manager and request scheduler
@@ -1774,24 +1773,17 @@ class NewRayPPOTrainer(RayPPOTrainer):
         sr_offline = self.config.actor_rollout_ref.rollout.get('sr_use_offline', False)
         if sr_offline:
             K = 1
-        # 联合解码：候选由两个冻结模型逐 token 融合产出（teacher 约束方向、student 选词），
-        # 密度在采样时就一并记下，所以下面第 4 步的 compute_log_prob 可以整段跳过。
-        # 与离线模式同理压成 K=1：一题只解一条，K>1 会让行数对不上。
+        # 联合解码：候选由**正在训练的 actor**（student，选词）与一个冻结 teacher（约束方向）
+        # 逐 token 融合产出，密度在采样时就一并记下，所以下面第 4 步的 compute_log_prob 可以
+        # 整段跳过。与离线模式同理压成 K=1：一题只解一条，K>1 会让行数对不上。
+        #
+        # 跑在 actor 自己的 worker 上（generate_joint），不是独立池：student 就是 actor，
+        # 只有持有它 FSDP 模块的那个进程能逐 token 拿到它的 logits。
         #
         # 题数上限必须在 W 之前应用：每步成本与 W 成正比（无 paged attention、每 token 两次
         # forward），而 wrong_only 下 W 是"本步答错了几道"这个数据决定的量。
-        #
-        # 以 config 为准、再断言 worker 在：反过来（只看 worker 在不在）会让一次 worker
-        # 创建失败静默退化成在线生成 —— 训练照跑、指标照出，只是候选来源与配置说的不是
-        # 一回事，这种失败没有任何地方会报。
         sr_joint = self.config.get('joint_decode', {}).get('enable', False)
         if sr_joint:
-            assert self.joint_decode_wg is not None, (
-                "joint_decode.enable=True 但 joint_decode worker 不存在。init_workers 只在 "
-                "Role.JointDecode 进了 role_worker_mapping 时才建它，而那由 main_ppo_new.py "
-                "读同一个 enable 决定 —— 两处不一致说明 config 没被 _load_joint_decode_config "
-                "合进来（例如换了 entry point）。"
-            )
             K = 1
             all_q = joint_sr.select_questions(
                 all_q, int(self.config.joint_decode.get('max_questions_per_step', 0)), metrics,
@@ -1827,14 +1819,15 @@ class NewRayPPOTrainer(RayPPOTrainer):
         # 每题短 prompt 重复 K 次，与 W*K 候选对齐。
         short_wk = short_prompts[wq_idx].repeat_interleave(K, dim=0).to(device)  # [W*K, L_short]
 
-        # 联合解码：候选由 joint_decode worker 逐 token 融合两个冻结模型产出，密度随采样一并
-        # 返回，所以第 4 步整段跳过（详见 joint_sr.py：这条路的密度是真正的 μ_t，含 1/Z_t
-        # 归一化，事后拿模型重算是拿不到的）。
+        # 联合解码：候选由 actor 自己的 worker 逐 token 融合 actor(student) 与冻结 teacher
+        # 产出，密度随采样一并返回，所以第 4 步整段跳过（详见 joint_sr.py：这条路的密度是
+        # 真正的 μ_t，含 1/Z_t 归一化，事后拿模型重算是拿不到的）。
         sr_joint_logq = None
         if sr_joint:
             with marked_timer("sr_joint_gen", timing_raw, color="cyan"):
                 cand_out, sr_joint_logq = joint_sr.generate(
-                    joint_decode_wg=self.joint_decode_wg,
+                    worker_group=self.actor_rollout_wg,
+                    joint_config=self.config.joint_decode,
                     student_prompts=(
                         short_wk if self.config.joint_decode.get('student_prompt', 'short') == 'short'
                         else long_prompt

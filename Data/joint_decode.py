@@ -24,11 +24,12 @@ initialise; each writes its own shard, matching what ``main_generation.py:233`` 
 batch. Every downstream reader (``aggregate_sr_responses.py:119``,
 ``sweep_sft_checkpoints.sh``) globs ``*.parquet``, so no merge step is needed.
 
-The same decode core also runs INSIDE training, on a Ray worker, to produce the
-summarize-replacement candidate (``verl/custom/joint_decode_worker.py`` ->
-``verl/custom/joint_sr.py``). That path is throughput-bound for the reasons the core
-module explains, so it is confined to a small number of questions per step. This script
-stays the way to sweep settings cheaply before committing one to a training run.
+The same decode core also runs INSIDE training, on the actor's own worker, to produce the
+summarize-replacement candidate (``NewActorRolloutRefWorker.generate_joint`` ->
+``verl/custom/joint_sr.py``). There the student is the model being TRAINED rather than a
+frozen checkpoint. That path is throughput-bound for the reasons the core module explains, so
+it is confined to a small number of questions per step. This script stays the way to sweep
+settings cheaply before committing one to a training run.
 
 Usage:
 
@@ -76,8 +77,8 @@ import torch
 # ---------------------------------------------------------------------------
 # The decode core -- fusion, agreement, sampling, and the KV-cache loop -- lives in the
 # verl package rather than here, because it now has a SECOND caller:
-# verl/custom/joint_decode_worker.py runs the same loop inside a Ray worker to produce
-# the summarize-replacement candidate during training. One copy is what makes the
+# NewActorRolloutRefWorker.generate_joint runs the same loop on the actor's own worker to
+# produce the summarize-replacement candidate during training. One copy is what makes the
 # offline numbers and the training behaviour the same thing, instead of two
 # implementations that agree until they drift.
 #
