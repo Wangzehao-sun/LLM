@@ -226,40 +226,19 @@ class TaskRunner:
             else:
                 mapping[Role.ActorRolloutRephraser] = global_pool_id
 
-        # Joint decoding: two FROZEN models that decode together, fusing per token, to
-        # produce the summarize-replacement candidate. Its knobs live in their own file
-        # (verl/custom/config/joint_decode.yaml) rather than in ppo_trainer.yaml, and are
-        # loaded here so that file's defaults exist before anything reads them. CLI
-        # `+joint_decode.<key>=` overrides layer on top and win.
+        # Joint decoding: the live actor is the student and a frozen teacher constrains it,
+        # decoding together per token to produce the summarize-replacement candidate.
         #
-        # Resolving it into `config` (rather than passing it around separately) is what
-        # lets the trainer read `self.config.joint_decode.*` like any other node. With
-        # `enable: False` -- the default, and the value when the node is absent entirely
-        # -- nothing below runs and the resource spec is untouched.
-        joint_cfg = _load_joint_decode_config(config)
-        if joint_cfg.get("enable", False):
-            from verl.custom.joint_decode_worker import JointDecodeWorker
-
-            role_worker_mapping[Role.JointDecode] = ray.remote(JointDecodeWorker)
-            joint_gpus = joint_cfg.get("n_gpus_per_node", 0)
-            if joint_gpus > 0:
-                joint_pool_id = "joint_decode_pool"
-                resource_pool_spec[joint_pool_id] = [joint_gpus] * config.trainer.nnodes
-                mapping[Role.JointDecode] = joint_pool_id
-                print(
-                    f"[joint_decode] dedicated pool {joint_pool_id!r}: {joint_gpus} GPU(s) x "
-                    f"{config.trainer.nnodes} node(s), on top of the reasoner's "
-                    f"{config.trainer.n_gpus_per_node}. CUDA_VISIBLE_DEVICES must expose all of "
-                    f"them; trainer.n_gpus_per_node counts the reasoner's only."
-                )
-            else:
-                mapping[Role.JointDecode] = global_pool_id
-                print(
-                    "[joint_decode] sharing the reasoner's pool: two unsharded bf16 models plus "
-                    "their KV caches come out of the same budget vLLM already reserved via "
-                    "gpu_memory_utilization, so lower that to match or expect an OOM at the "
-                    "first joint step."
-                )
+        # No Role and no resource pool: the student IS the actor, so the decode has to run in
+        # the process that owns its FSDP module. It is a method on the actor worker
+        # (NewActorRolloutRefWorker.generate_joint), reached through the existing
+        # actor_rollout worker group. All that is needed here is to make the config node
+        # exist -- its knobs live in verl/custom/config/joint_decode.yaml rather than in
+        # ppo_trainer.yaml, and CLI `+joint_decode.<key>=` overrides layer on top and win.
+        #
+        # Resolving it into `config` (rather than passing it around) is what lets both the
+        # trainer and the worker read `config.joint_decode.*` like any other node.
+        _load_joint_decode_config(config)
         # Load the reward manager for training and validation.
         reward_fn = load_reward_manager(config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {}))
         val_reward_fn = load_reward_manager(config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {}))

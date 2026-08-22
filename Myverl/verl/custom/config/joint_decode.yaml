@@ -1,62 +1,60 @@
 # Joint decoding as the source of the summarize-replacement (SR) candidate.
 #
-# Two frozen models decode TOGETHER, one token at a time: the teacher constrains which
-# tokens are allowed (both models' top-k, both above a probability floor) and the student
-# picks among the survivors. The resulting response replaces one of the n GRPO rollouts,
-# and the density it was really sampled from becomes the importance ratio's denominator.
+# The ACTOR BEING TRAINED is the student and a frozen teacher constrains it. Every token
+# must sit in both models' top-k and clear both probability floors; among the survivors the
+# student's own distribution decides. The resulting response replaces one of the n GRPO
+# rollouts, and the density it was really sampled from becomes the importance ratio's
+# denominator.
+#
+# The student being the LIVE actor is what makes this checkable. Numerator and denominator
+# are then the same model under the same prompt at the same temperature, so before any
+# optimizer step they differ only by the truncation:
+#
+#     off_ratio = exp(log pi_theta - log mu_t) = Z_t
+#
+# i.e. actor/off_ratio on the off rows must equal batch/sr_joint_keep_ratio. A frozen student
+# would instead add a model gap that widens as training proceeds -- silently decaying ESS.
+#
+# Runs on the reasoner's OWN GPUs, as a method on the actor worker
+# (NewActorRolloutRefWorker.generate_joint), after the rollout when vLLM is asleep. There is
+# no separate resource pool and no separate worker: only the process holding the actor's FSDP
+# module can read its logits token by token.
 #
 # This file holds every knob. It is loaded EXPLICITLY by the trainer rather than composed
 # through Hydra's `defaults:`, which is what keeps ppo_trainer.yaml unmodified -- with
-# `enable: False` (the default) no worker is created and every existing script behaves
+# `enable: False` (the default) nothing happens and every existing script behaves
 # byte-identically. Override from the command line with `+joint_decode.<key>=<value>`;
 # those win over the values here.
 #
 # See examples/custom/train_hype_summarize_joint.sh for a working invocation, and
 # verl/custom/joint_decode_core.py for what the fusion rules actually compute.
 
-# False creates no worker and adds no GPU cost. The feature is entirely inert.
+# False changes nothing: no teacher is loaded and the SR path keeps its existing sources.
 enable: False
 
 # ---------------------------------------------------------------------------
-# models: both FROZEN, both loaded from a path
+# the teacher (the student is the actor, so it needs no path)
 # ---------------------------------------------------------------------------
 
-# The model whose voice the output is in, and whose distribution the loss's denominator
-# is measured under. Usually the same architecture as the actor.
+# The model that steers. Frozen, plain HF (never FSDP-wrapped -- it takes no gradient, and
+# sharding it would mean an all-gather per layer per token). Reads the long summarize prompt
+# by default, so it guides from information the actor does not have.
 #
-# NOT the live actor. The actor's weights live in FSDP shards in another worker, so
-# joining it to this loop would mean re-materialising them into an HF module every step.
-# That is a change to the training framework, which this feature is scoped out of. The
-# consequence is that the proposal distribution is FIXED across training -- the same
-# assumption the offline-SR path already documents and relies on.
-student_model_path: null
-
-# The model that steers. Reads the long summarize prompt by default, so it guides from
-# information the student does not have.
+# Must share the ACTOR's vocabulary. The requirement is stricter than the rephraser's, which
+# only exchanges token ids: per-token fusion compares the two models' logits index by index,
+# so a mismatch fuses unrelated tokens and produces fluent nonsense with no error anywhere.
+# generate_joint compares the vocabularies against the actor's tokenizer and refuses to start.
 teacher_model_path: null
 
-# Must be identical between the two -- per-token fusion compares logits index by index,
-# so a vocabulary mismatch makes every step meaningless with no error raised. init_model
-# checks this and refuses to start.
 trust_remote_code: True
 
-# ---------------------------------------------------------------------------
-# resource pool
-# ---------------------------------------------------------------------------
-
-# GPUs per node for this worker's OWN pool, on top of trainer.n_gpus_per_node.
+# Keep the teacher on CPU between steps, moving it to GPU only while decoding. ~8GB over
+# PCIe per step for a 4B model (~1-2s), which is negligible against thousands of sequential
+# decode steps -- and it leaves gpu_memory_utilization alone.
 #
-#   > 0  -- its own pool, hence its own process. This is the DEFAULT-recommended setting:
-#           two unsharded bf16 models (~16GB for a 4B pair, before the KV cache) would
-#           otherwise compete with the reasoner's vLLM engine, whose arena is reserved up
-#           front and cannot yield.
-#   == 0 -- shares the reasoner's pool and process. Cheaper in GPUs and workable for a
-#           small model, but the memory above is taken from the same budget vLLM already
-#           reserved via gpu_memory_utilization, so that must be lowered to match.
-#
-# CUDA_VISIBLE_DEVICES must expose the GPUs of every pool; trainer.n_gpus_per_node counts
-# the reasoner's only.
-n_gpus_per_node: 0
+# False keeps it resident: no transfer, but its memory competes with the arena vLLM reserved
+# up front, so gpu_memory_utilization has to come down to match.
+teacher_offload: True
 
 # ---------------------------------------------------------------------------
 # fusion rule
@@ -123,12 +121,16 @@ top_k: -1
 
 # Cap on generated tokens. The per-step cost is
 #   ceil(W / (batch_size * n_gpus)) * max_new_tokens
-# sequential two-model forwards, where W is the number of questions this step. There is
-# no paged attention and no CUDA graph here, so that product is the whole story.
+# sequential two-model forwards, where W is the number of questions this step and n_gpus is
+# the reasoner's count (this shares its pool). There is no paged attention and no CUDA graph
+# here, so that product is the whole story.
 max_new_tokens: 4096
 
-# Rows decoded concurrently per rank. Bounded by memory, not by the question count: two
-# unsharded models plus their KV caches at these lengths is what binds.
+# Rows decoded concurrently per rank. Bounded by memory, not by the question count. What
+# binds: the actor's params are UNSHARDED for the duration (summon_full_params(recurse=True)
+# -- which is what keeps the per-token cost off the interconnect, see joint_decode_core.py),
+# the teacher sits alongside, and both models' KV caches grow with this number times
+# max_new_tokens.
 batch_size: 8
 
 # Hard cap on questions per step, applied AFTER wrong_only narrows the set. This exists
@@ -162,6 +164,10 @@ shrink_batch: True
 # long  -- the pre-rendered summarize prompt (data.use_summarize must be on).
 #
 # The default pairing is the method: the teacher steers from the information-richer long
-# prompt while the student chooses under the short one the gradient will be taken at.
+# prompt while the student decodes under the short one the gradient will be taken at.
+#
+# Leave student_prompt at 'short'. It is what makes the off_ratio == Z_t identity hold, since
+# the loss recomputes the numerator under the short prompt; setting it to 'long' would put a
+# prompt shift back into the ratio and give up the only end-to-end check this path has.
 student_prompt: short
 teacher_prompt: long

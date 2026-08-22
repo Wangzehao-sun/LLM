@@ -797,6 +797,247 @@ class NewActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         return output
 
+    # ------------------------------------------------------------------
+    # joint decoding: the LIVE actor is the student, a frozen model is the teacher
+    # ------------------------------------------------------------------
+    def _joint_teacher(self, cfg):
+        """Return the frozen teacher, loading it on first use.
+
+        Plain HF, deliberately NOT FSDP-wrapped. Per-token fusion needs both models' full
+        logit rows every step; a sharded teacher would all-gather per layer per token, and
+        the teacher never receives a gradient so there is nothing to shard FOR.
+
+        Loaded lazily rather than in init_model so that a run with joint decoding disabled
+        pays nothing, and so the load happens after vLLM has sized its kv cache.
+
+        ``cfg`` is the joint_decode config node, handed in by generate_joint -- this worker is
+        constructed with ``config.actor_rollout_ref``, so it cannot reach the top-level
+        ``config.joint_decode`` itself.
+        """
+        if getattr(self, "_teacher_module", None) is not None:
+            return self._teacher_module
+
+        from transformers import AutoModelForCausalLM
+
+        local_path = copy_to_local(cfg.teacher_model_path)
+
+        # Vocab equality is a HARD requirement, stricter than the rephraser path's. That one
+        # exchanges token IDS; this one intersects the two models' logits INDEX BY INDEX, so
+        # a mismatch silently fuses unrelated tokens and produces fluent nonsense with no
+        # error anywhere.
+        teacher_tokenizer = hf_tokenizer(local_path, trust_remote_code=cfg.get("trust_remote_code", True))
+        if teacher_tokenizer.get_vocab() != self.tokenizer.get_vocab():
+            raise ValueError(
+                "joint decoding needs the teacher and the actor to share a vocabulary: "
+                "per-token fusion compares their logits index by index, so a mismatch makes "
+                f"every fused step meaningless.\n  actor:   {self.config.model.path}\n"
+                f"  teacher: {cfg.teacher_model_path}"
+            )
+
+        # Try the requested attention backend, then fall back. flash-attention-2 is an
+        # optional dependency and some architectures have no kernel; failing the whole run
+        # over it would be the wrong trade when sdpa gives identical numbers.
+        wanted = [cfg.attn_impl] if cfg.attn_impl != "auto" else ["flash_attention_2", "sdpa", "eager"]
+        errors = []
+        for impl in wanted:
+            try:
+                model = AutoModelForCausalLM.from_pretrained(
+                    local_path,
+                    torch_dtype=torch.bfloat16,
+                    trust_remote_code=cfg.get("trust_remote_code", True),
+                    attn_implementation=impl,
+                )
+            except (ValueError, ImportError, RuntimeError) as error:
+                errors.append(f"{impl}: {type(error).__name__}: {error}")
+                continue
+            if self.rank == 0:
+                print(f"[joint_decode] teacher attn_implementation={impl}", flush=True)
+            # Starts on CPU when offloading is on; generate_joint moves it per step.
+            self._teacher_module = model.eval()
+            if not cfg.get("teacher_offload", True):
+                self._teacher_module = self._teacher_module.to(get_device_id())
+            return self._teacher_module
+        raise RuntimeError(
+            f"could not load the joint-decoding teacher from {cfg.teacher_model_path} with any "
+            f"of {wanted}:\n  " + "\n  ".join(errors)
+        )
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    @DistProfiler.annotate(color="magenta")
+    @torch.no_grad()
+    def generate_joint(self, data: DataProto) -> DataProto:
+        """Decode with the live actor as student and a frozen teacher as constraint.
+
+        Produces the summarize-replacement candidate, plus the per-token density it was
+        actually sampled from (the importance ratio's denominator). Runs on the SAME GPUs as
+        everything else, after the rollout, when vLLM is asleep.
+
+        ``_is_actor`` and not ``_is_rollout``: the student must be the model receiving
+        gradients. ``se_rollout_ref`` is a rollout but has no actor, and
+        ``rephraser_rollout`` is frozen -- neither should ever land here.
+
+        In:  ``student_input_ids`` / ``student_attention_mask`` (left-padded; the prompt the
+             LOSS will use) and ``teacher_input_ids`` / ``teacher_attention_mask``
+             (left-padded, may differ in length -- only the generated suffix has to align,
+             and it does because both models are fed the same sampled token each step).
+        Out: ``responses`` and ``off_log_probs``, both [B, max_response_length] and aligned
+             index-for-index, plus three per-row diagnostics.
+        """
+        from contextlib import nullcontext
+
+        from verl.custom.joint_decode_core import joint_generate
+
+        assert self._is_actor, (
+            f"joint decoding needs the trained actor as its student, but this worker's role "
+            f"is {self.role!r}"
+        )
+        # The joint_decode settings arrive through meta_info, not through self.config: this
+        # worker is constructed with config.actor_rollout_ref, so the top-level
+        # config.joint_decode node is not reachable from here. joint_sr.generate puts it on
+        # the request, and DataProto.chunk copies meta_info to every shard.
+        cfg = OmegaConf.create(data.meta_info["joint_decode_config"])
+        device = get_device_id()
+        width = int(data.meta_info["max_response_length"])
+
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        # nn.Module.to() moves params in place and returns self, so this and
+        # self._teacher_module stay the same object -- which is what lets the finally block
+        # below send it back to CPU without having to thread the local through.
+        teacher = self._joint_teacher(cfg)
+        if cfg.get("teacher_offload", True):
+            teacher.to(device)
+
+        data = data.to(device)
+        student_batch = {
+            "input_ids": data.batch["student_input_ids"],
+            "attention_mask": data.batch["student_attention_mask"],
+        }
+        teacher_batch = {
+            "input_ids": data.batch["teacher_input_ids"],
+            "attention_mask": data.batch["teacher_attention_mask"],
+        }
+        n_rows = student_batch["input_ids"].size(0)
+
+        responses = torch.full((n_rows, width), self.tokenizer.pad_token_id, dtype=torch.long)
+        off_log_probs = torch.zeros((n_rows, width), dtype=torch.float32)
+        lengths = torch.zeros(n_rows, dtype=torch.long)
+        fallback_frac = torch.zeros(n_rows, dtype=torch.float32)
+        keep_ratio = torch.zeros(n_rows, dtype=torch.float32)
+        student_logp = torch.zeros(n_rows, dtype=torch.float32)
+
+        eos = self.tokenizer.eos_token_id
+        eos_ids = list(eos) if isinstance(eos, (list, tuple)) else [eos]
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = eos_ids[0]
+
+        # The sharding manager leaves the module in train() after rollout
+        # (fsdp_vllm.py's __exit__), and decoding under train() applies dropout -- silently
+        # randomised candidates, no error. Gradient checkpointing is worse: HF turns
+        # use_cache off when it is active, which would make the KV-cache loop O(n^2)
+        # recompute. Both are switched off here and restored afterwards.
+        was_training = self.actor_module_fsdp.training
+        inner = self.actor_module if fsdp_version(self.actor_module_fsdp) == 1 else self.actor_module_fsdp
+        gc_was_on = getattr(inner, "is_gradient_checkpointing", False)
+        if gc_was_on:
+            inner.gradient_checkpointing_disable()
+        self.actor_module_fsdp.eval()
+
+        # recurse=True, unlike hf_rollout.py:108. That call passes recurse=False citing
+        # pytorch#100069, which is a HYBRID_SHARD issue; this config is FULL_SHARD
+        # (fsdp_size=-1 gives a 1-D mesh). The difference is decisive here: with
+        # recurse=False only the ROOT handle is unsharded, so every per-layer handle
+        # (transformer_auto_wrap_policy wraps each layer) all-gathers and reshards inside
+        # EVERY forward -- one all-gather of the whole model per token, ~8GB for a 4B model,
+        # tens of TB over a full response. recurse=True unshards once and holds it for the
+        # loop, at the cost of the full params staying resident. fsdp_vllm.py:117 already
+        # calls summon_full_params with recurse at its default of True.
+        param_ctx = (
+            FSDP.summon_full_params(self.actor_module_fsdp, writeback=False, recurse=True)
+            if isinstance(self.actor_module_fsdp, FSDP)
+            else nullcontext()
+        )
+
+        micro = max(1, int(cfg.batch_size))
+        n_narrow = 0
+        try:
+            with param_ctx, torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
+                # The INNER module, not the FSDP wrapper: joint_generate probes forward()'s
+                # signature for logits_to_keep, and FSDP.forward is (*args, **kwargs), so
+                # probing the wrapper finds nothing and prefill materialises logits for every
+                # position (~10GB at a 152k vocab). Inside the summon context the inner
+                # module's params are already full.
+                student = inner
+                for begin in range(0, n_rows, micro):
+                    stop = min(begin + micro, n_rows)
+                    out_ids, out_len, fb_row, logp_row, z_row, logq, narrow = joint_generate(
+                        student, teacher,
+                        {k: v[begin:stop] for k, v in student_batch.items()},
+                        {k: v[begin:stop] for k, v in teacher_batch.items()},
+                        eos_ids=eos_ids, pad_id=pad_id, args=cfg,
+                    )
+                    n_narrow += narrow
+
+                    # joint_generate returns only the columns it actually ran (it breaks
+                    # early once every row finished), and max_new_tokens may exceed the
+                    # trainer's width. Truncating is correct: a longer response cannot be
+                    # represented in the batch anyway.
+                    keep = min(out_ids.size(1), width)
+                    responses[begin:stop, :keep] = out_ids[:, :keep]
+                    off_log_probs[begin:stop, :keep] = logq[:, :keep]
+                    out_len = out_len.clamp(max=keep)
+                    lengths[begin:stop] = out_len
+
+                    # 0 rather than NaN for an empty row: these go into a DataProto that
+                    # gets padded, chunked and concatenated, and a NaN would poison every
+                    # batch mean computed over it.
+                    denom = out_len.clamp(min=1).to(torch.float32)
+                    fallback_frac[begin:stop] = fb_row.to(torch.float32) / denom
+                    keep_ratio[begin:stop] = (z_row / denom.double()).to(torch.float32)
+                    student_logp[begin:stop] = (logp_row / denom.double()).to(torch.float32)
+        finally:
+            # Restore the module's state even if decoding raised, or the next update_actor
+            # would train in eval mode without gradient checkpointing.
+            if was_training:
+                self.actor_module_fsdp.train()
+            if gc_was_on:
+                inner.gradient_checkpointing_enable()
+            if cfg.get("teacher_offload", True) and self._teacher_module is not None:
+                self._teacher_module.to("cpu")
+            get_torch_device().empty_cache()
+
+        # A density on a pad token becomes a gradient on a pad token, so the invariant is
+        # enforced rather than assumed.
+        valid = torch.arange(width).unsqueeze(0) < lengths.unsqueeze(1)
+        off_log_probs = off_log_probs * valid
+        assert off_log_probs.shape == responses.shape, "density must align with tokens 1:1"
+
+        if n_narrow and self.rank == 0:
+            print(f"[joint_decode] top-p nucleus exceeded the candidate cap on {n_narrow:,} "
+                  f"row-steps; sampling was narrower than top_p={cfg.top_p} asked for", flush=True)
+
+        output = DataProto.from_dict(
+            tensors={
+                "responses": responses,
+                "off_log_probs": off_log_probs,
+                "response_lengths": lengths,
+                "fallback_frac": fallback_frac,
+                "teacher_keep_ratio": keep_ratio,
+                "student_mean_logp": student_logp,
+            }
+        )
+
+        # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
+        # unshard the root FSDP module -- same reason compute_log_prob does it.
+        if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
+            self.actor.actor_module._handle.reshard(True)
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            log_gpu_memory_usage("After offload actor model during generate_joint", logger=logger)
+
+        return output
+
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     @DistProfiler.annotate(color="olive")
     def compute_ref_log_prob(self, data: DataProto):

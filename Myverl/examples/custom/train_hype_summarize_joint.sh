@@ -1,87 +1,94 @@
 set -x
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# SR candidates from JOINT DECODING: two frozen models decide every token together.
+# SR candidates from JOINT DECODING: the trained actor and a frozen teacher decide every
+# token together.
 #
-# The teacher constrains and the student chooses. At each step a token must sit in BOTH
-# models' top-k and clear both probability floors; among the survivors the STUDENT's
-# distribution decides. So the teacher steers direction while the text stays in the
-# student's voice. The resulting response replaces one of the n GRPO rollouts for that
-# question, exactly as the other two SR paths do.
+# The teacher constrains and the actor chooses. At each step a token must sit in BOTH models'
+# top-k and clear both probability floors; among the survivors the ACTOR's own distribution
+# decides. So the teacher steers direction while the text stays in the actor's voice. The
+# resulting response replaces one of the n GRPO rollouts for that question, exactly as the
+# other two SR paths do.
 #
-#   reasoner ($MODEL_PATH, N_REASONER_GPUS) -- rolls out the short question prompt and is
-#       the ONLY model that receives gradient updates.
-#   student  ($STUDENT_PATH, JOINT_GPUS)    -- frozen. Chooses among permitted tokens,
-#       decoding under the SHORT prompt (the one the loss uses).
-#   teacher  ($TEACHER_PATH, same pool)     -- frozen. Constrains the token set, reading
-#       the LONG summarize prompt, so it steers using information the student lacks.
+#   actor / student ($MODEL_PATH)  -- the model being TRAINED. It rolls out the short
+#       question prompt as usual, and then acts as the student in joint decoding, decoding
+#       under that same short prompt.
+#   teacher ($TEACHER_PATH)        -- frozen, plain HF, never updated. Constrains the token
+#       set while reading the LONG summarize prompt, so it steers using information the
+#       actor does not have.
+#
+# ONE POOL, NO EXTRA GPUs. Joint decoding is a method on the actor's own worker
+# (NewActorRolloutRefWorker.generate_joint), so it runs on the reasoner's GPUs after the
+# rollout, once vLLM has gone to sleep. There is nothing to split and no CUDA_VISIBLE_DEVICES
+# arithmetic to get wrong: trainer.n_gpus_per_node is the whole story. The student must be
+# the live actor, and only the process holding its FSDP module can read its logits per token.
 #
 # WHAT THIS PATH BUYS. The importance ratio's denominator is the density the token was
 # ACTUALLY drawn from, recorded as it was sampled:
 #
-#     mu_t(v) = p_student(v) * 1[v in F_t] / Z_t
+#     mu_t(v) = p_actor(v) * 1[v in F_t] / Z_t
 #
 # The 1/Z_t is the part no later forward pass can recover -- asking any model for
-# log p_student(v) afterwards misses -log Z_t and inflates off_ratio by 1/Z_t (roughly
-# 1.8x at the keep ratio of 0.55 the offline sweeps saw, worse as the constraint tightens).
-# Only the sampler knows that number, which is why this is a decoder and not a scorer.
-# Token alignment is likewise exact: the ids and their densities are written in the same
-# statement from the same draw, unlike the offline path which stores text and re-tokenises.
+# log p_actor(v) afterwards misses -log Z_t and inflates off_ratio by 1/Z_t (roughly 1.8x at
+# the keep ratio of 0.55 the offline sweeps saw, worse as the constraint tightens). Only the
+# sampler knows that number, which is why this is a decoder and not a scorer. Token alignment
+# is likewise exact: the ids and their densities are written in the same statement from the
+# same draw, unlike the offline path which stores text and re-tokenises.
 #
 # WHAT IT COSTS. There is no paged attention and no CUDA graph here, and every token costs
 # two forward passes. Per step:
 #
-#     ceil(W / (JOINT_BATCH * JOINT_GPUS)) * MAX_NEW_TOKENS   sequential two-model forwards
+#     ceil(W / (JOINT_BATCH * N_GPUS)) * MAX_NEW_TOKENS    sequential two-model forwards
 #
-# W is data-dependent under 'wrong_only' -- it is how many questions the reasoner got
-# entirely wrong this step. That is why SUMMARIZE_REPLACE defaults to wrong_only here and
-# why MAX_QUESTIONS caps W: an uncapped step has no bound on its own duration. Whatever
-# the cap drops is logged (batch/sr_joint_dropped), never silently skipped.
+# W is data-dependent under 'wrong_only' -- it is how many questions the actor got entirely
+# wrong this step. That is why SUMMARIZE_REPLACE defaults to wrong_only here and why
+# MAX_QUESTIONS caps W: an uncapped step has no bound on its own duration. Whatever the cap
+# drops is logged (batch/sr_joint_dropped), never silently skipped.
 #
-# GPU accounting -- the thing that is easy to get wrong:
-#   CUDA_VISIBLE_DEVICES must expose the GPUs of BOTH pools (set GPU_DEVICES below), while
-#   trainer.n_gpus_per_node counts the REASONER's only. The joint decoder's share is passed
-#   separately as joint_decode.n_gpus_per_node. Its own pool means its own process, which
-#   matters because two unsharded bf16 models (~16GB for a 4B pair, before KV cache) would
-#   otherwise be taken out of the same budget the reasoner's vLLM engine already reserved.
+# MEMORY. During the decode the actor's params are held UNSHARDED
+# (summon_full_params(recurse=True) -- necessary, or every layer all-gathers per token and
+# the interconnect becomes the bottleneck), and the teacher sits alongside. Both come out of
+# what is left after vLLM's gpu_memory_utilization reservation. vLLM is asleep by then so its
+# arena is available to the caching allocator, but how much is really reusable has NOT been
+# measured -- if the first joint step OOMs, lower GPU_MEM_UTIL.
 #
 # THE THREE METRICS TO WATCH, in this order:
 #   batch/sr_joint_fallback_frac -- share of tokens where the intersection was EMPTY, so
 #       one model decided alone. Near 1.0 means the agreement never bound and the run is
 #       effectively plain single-model decoding; raise AGREE_STUDENT_TOP_K first (it lets
-#       the student reach further down its own ranking without widening what the teacher
+#       the actor reach further down its own ranking without widening what the teacher
 #       permits).
-#   batch/sr_joint_keep_ratio    -- Z_t, the share of the student's mass the teacher left
+#   batch/sr_joint_keep_ratio    -- Z_t, the share of the actor's mass the teacher left
 #       standing. The continuous version of the above, and it sees what fallback cannot:
 #       keep_ratio 0.2 with zero fallback means the constraint bites hard at every single
 #       step without ever failing outright.
-#   actor/off_ratio_ess          -- as always. The denominator is now a truncated
-#       distribution, so watch it from step 1.
+#   actor/off_ratio_ess          -- as always. The denominator is a truncated distribution,
+#       so watch it from step 1.
 #
-# SANITY CHECK BEFORE TRUSTING ANY OF IT. Set STUDENT_PATH to $MODEL_PATH, plus
-#   AGREE_TEACHER_TOP_K=200000 AGREE_TEACHER_MIN_PROB=0 AGREE_STUDENT_TOP_K=200000
-# so the intersection is the whole vocabulary and Z_t = 1. Numerator and denominator are
-# then the same model under the same prompt at the same temperature, so BEFORE the first
-# optimizer step actor/off_ratio must sit at 1.0 and off_ratio_ess near its maximum. Any
-# drift there is a bug -- a token misalignment or a temperature mismatch -- not a property
-# of the method. Nothing else in the pipeline would report it.
+# THE CHECK THAT VALIDATES EVERYTHING, and it needs no special configuration. Because the
+# student IS the actor, the loss's numerator and the recorded denominator are the same model,
+# same prompt, same temperature -- so before the first optimizer step they differ only by the
+# truncation:
+#
+#     off_ratio = exp(log pi_theta - log mu_t) = Z_t
+#
+# So actor/off_ratio on the off rows must EQUAL batch/sr_joint_keep_ratio (exactly, at
+# temperature 1). Check that on step 1. A mismatch means a token misalignment, a temperature
+# mismatch, or a wrong normaliser -- nothing else in the pipeline would report any of them.
 #
 # Usage:
-#   STUDENT_PATH=/home/data/shared/Qwen3-4b-base \
 #   TEACHER_PATH=/home/data/shared/<sft-teacher> \
 #       bash train_hype_summarize_joint.sh Qwen3-4b-base
 #
-#   # 4 reasoner GPUs + 2 for the joint decoder; GPU_DEVICES lists all six
-#   GPU_DEVICES=0,1,2,3,4,5 JOINT_GPUS=2 STUDENT_PATH=... TEACHER_PATH=... \
-#       bash train_hype_summarize_joint.sh
+#   # all four GPUs go to the reasoner; joint decoding shares them
+#   GPU_DEVICES=0,1,2,3 TEACHER_PATH=... bash train_hype_summarize_joint.sh
 #
 # Sweep the agreement settings OFFLINE first -- examples/custom/run_joint_decode.sh scores
 # them against a val set for a fraction of a training run's cost. Bring one setting here.
 # ---------------------------------------------------------------------------
 
-# ALL GPUs across BOTH pools. The reasoner takes N_REASONER_GPUS and the joint decoder the
-# rest; Ray does the actual placement.
-GPU_DEVICES=${GPU_DEVICES:-${CUDA_VISIBLE_DEVICES:-0,1,2,3,4}}
+# The GPUs the reasoner gets. Joint decoding shares them -- there is no second pool.
+GPU_DEVICES=${GPU_DEVICES:-${CUDA_VISIBLE_DEVICES:-0,1,2,3}}
 export CUDA_VISIBLE_DEVICES=$GPU_DEVICES
 
 echo $HOME
@@ -108,54 +115,33 @@ val_files="['$test3_path']"
 
 MODEL_PATH=$MODEL_DIR/${1:-"Qwen3-4b-base"}
 
-# The two frozen joint-decoding models.
+# The frozen teacher. The student needs no path -- it IS the actor at $MODEL_PATH.
 #
-# Both MUST share one tokenizer, and the requirement is STRICTER than elsewhere in this
-# repo. The rephraser path only needs matching token IDs, because it exchanges ids. Here
-# the two models' logits are intersected POSITION BY POSITION, so index i must mean the
-# same token to both. A mismatch produces fluent nonsense with no error anywhere;
-# init_model compares the vocabularies and refuses to start.
-#
-# STUDENT_PATH defaults to the reasoner's own initial checkpoint, which is also the
-# configuration the off_ratio ~= 1 sanity check above needs.
-STUDENT_PATH=${STUDENT_PATH:-$MODEL_PATH}
+# It MUST share the actor's tokenizer, and the requirement is STRICTER than elsewhere in this
+# repo. The rephraser path only needs matching token IDs, because it exchanges ids. Here the
+# two models' logits are intersected POSITION BY POSITION, so index i must mean the same token
+# to both. A mismatch produces fluent nonsense with no error anywhere; generate_joint compares
+# the vocabularies against the actor's tokenizer and refuses to start.
 TEACHER_PATH=${TEACHER_PATH:-}
 if [ -z "$TEACHER_PATH" ]; then
     echo "set TEACHER_PATH to the frozen model that should steer (e.g. an SFT checkpoint)" >&2
     echo "  TEACHER_PATH=/home/data/shared/<sft-teacher> bash $0" >&2
     exit 1
 fi
-for p in "$STUDENT_PATH" "$TEACHER_PATH"; do
-    if [ ! -d "$p" ]; then
-        echo "not a directory: $p" >&2
-        exit 1
-    fi
-done
-
-TOTAL_GPUS=$(awk -F',' '{print NF}' <<< "$GPU_DEVICES")
-JOINT_GPUS=${JOINT_GPUS:-1}
-# The reasoner keeps whatever is left. Override N_REASONER_GPUS to hold the reasoner's
-# count fixed and add the joint decoder's GPUs on top instead.
-N_REASONER_GPUS=${N_REASONER_GPUS:-$((TOTAL_GPUS - JOINT_GPUS))}
-
-if [ "$N_REASONER_GPUS" -lt 1 ]; then
-    echo "no GPUs left for the reasoner: $TOTAL_GPUS visible - $JOINT_GPUS for joint decoding" >&2
-    exit 1
-fi
-if [ $((N_REASONER_GPUS + JOINT_GPUS)) -gt "$TOTAL_GPUS" ]; then
-    echo "pools want $((N_REASONER_GPUS + JOINT_GPUS)) GPUs but only $TOTAL_GPUS are visible" >&2
-    echo "  expose more via GPU_DEVICES, or lower JOINT_GPUS / N_REASONER_GPUS" >&2
+if [ ! -d "$TEACHER_PATH" ]; then
+    echo "TEACHER_PATH is not a directory: $TEACHER_PATH" >&2
     exit 1
 fi
 
-# train_batch_size * rollout.n must be divisible by the REASONER's GPU count
-# (_validate_config). The joint decoder's batches are padded to its own world_size in the
-# trainer, so its count is unconstrained.
+N_GPUS=$(awk -F',' '{print NF}' <<< "$GPU_DEVICES")
+
+# train_batch_size * rollout.n must be divisible by the GPU count (_validate_config). Joint
+# decoding adds no constraint here: its batch is padded to the same world_size in the trainer.
 TRAIN_BSZ=${TRAIN_BSZ:-128}
 ROLLOUT_N=${ROLLOUT_N:-8}
-if [ $((TRAIN_BSZ * ROLLOUT_N % N_REASONER_GPUS)) -ne 0 ]; then
+if [ $((TRAIN_BSZ * ROLLOUT_N % N_GPUS)) -ne 0 ]; then
     echo "train_batch_size*rollout.n ($((TRAIN_BSZ * ROLLOUT_N))) is not divisible by the" >&2
-    echo "  reasoner's $N_REASONER_GPUS GPU(s); adjust TRAIN_BSZ or the split" >&2
+    echo "  $N_GPUS visible GPU(s); adjust TRAIN_BSZ or ROLLOUT_N" >&2
     exit 1
 fi
 
@@ -180,9 +166,16 @@ AGREE_STUDENT_MIN_PROB=${AGREE_STUDENT_MIN_PROB:-0.0}
 #              student decoding. Also flips how fallback_frac should be read.
 AGREE_FALLBACK=${AGREE_FALLBACK:-teacher}
 
-# Rows decoded concurrently per rank. Bounded by memory (two unsharded models + KV caches),
-# not by the question count.
+# Rows decoded concurrently per rank. Bounded by memory, not by the question count: during
+# the decode the actor's params are unsharded and the teacher is resident, and both models'
+# KV caches grow with this times MAX_NEW_TOKENS.
 JOINT_BATCH=${JOINT_BATCH:-8}
+
+# Keep the teacher on CPU between steps and move it to GPU only while decoding. ~8GB over
+# PCIe per step for a 4B model, negligible against thousands of sequential decode steps, and
+# it leaves GPU_MEM_UTIL alone. Set False to keep it resident (no transfer, but then lower
+# GPU_MEM_UTIL to make room).
+TEACHER_OFFLOAD=${TEACHER_OFFLOAD:-True}
 
 # Hard cap on questions per step, applied AFTER wrong_only narrows the set. See the cost
 # formula in the header. 0 disables it, which is only safe if you have measured a step.
@@ -211,8 +204,10 @@ LOG_PATH=${LOG_DIR}/${PROJECT_NAME}.log
 
 TENSOR_PARALLEL=1
 
-# The reasoner owns its GPUs outright -- the joint decoder is in a separate pool and takes
-# nothing from this budget.
+# vLLM's arena, reserved up front. Joint decoding runs AFTER the rollout with vLLM asleep, so
+# it works out of what this leaves plus whatever the sleeping arena releases back to the
+# caching allocator. How much of that is really reusable has not been measured -- lower this
+# first if the joint step OOMs.
 GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.7}
 
 cd "$MODEL_DIR" || exit 1
@@ -221,20 +216,18 @@ if [ -n "$1" ]; then
     shift
 fi
 
-echo "=== visible GPUs        : $GPU_DEVICES ($TOTAL_GPUS total)"
-echo "=== reasoner  (trained) : $MODEL_PATH  [$N_REASONER_GPUS GPU(s), mem_util=$GPU_MEM_UTIL]"
-echo "=== student   (frozen)  : $STUDENT_PATH  [chooses, short prompt]"
-echo "=== teacher   (frozen)  : $TEACHER_PATH  [constrains, long prompt]"
-echo "=== joint pool          : $JOINT_GPUS GPU(s), batch=$JOINT_BATCH, max_new=$MAX_NEW_TOKENS"
+echo "=== GPUs                : $GPU_DEVICES ($N_GPUS, shared by rollout/train/joint)"
+echo "=== actor  = student    : $MODEL_PATH  [trained; chooses, short prompt, mem_util=$GPU_MEM_UTIL]"
+echo "=== teacher (frozen)    : $TEACHER_PATH  [constrains, long prompt, offload=$TEACHER_OFFLOAD]"
+echo "=== joint decode        : batch=$JOINT_BATCH, max_new=$MAX_NEW_TOKENS"
 echo "=== agreement           : student_top_k=$AGREE_STUDENT_TOP_K teacher_top_k=$AGREE_TEACHER_TOP_K"
 echo "                          teacher_min_prob=$AGREE_TEACHER_MIN_PROB fallback=$AGREE_FALLBACK"
 echo "=== questions/step       : <= $MAX_QUESTIONS ($SUMMARIZE_REPLACE)"
 
 python -m verl.trainer.main_ppo_new \
     +joint_decode.enable=True \
-    +joint_decode.n_gpus_per_node=$JOINT_GPUS \
-    +joint_decode.student_model_path=$STUDENT_PATH \
     +joint_decode.teacher_model_path=$TEACHER_PATH \
+    +joint_decode.teacher_offload=$TEACHER_OFFLOAD \
     +joint_decode.fuse=agree \
     +joint_decode.agree_student_top_k=$AGREE_STUDENT_TOP_K \
     +joint_decode.agree_teacher_top_k=$AGREE_TEACHER_TOP_K \
@@ -341,7 +334,7 @@ python -m verl.trainer.main_ppo_new \
     trainer.project_name="$PROJECT_NAME" \
     trainer.experiment_name="$EXP_NAME" \
     trainer.val_before_train=False \
-    trainer.n_gpus_per_node=$N_REASONER_GPUS \
+    trainer.n_gpus_per_node=$N_GPUS \
     trainer.nnodes=1 \
     trainer.save_freq=50 \
     trainer.test_freq=10 \
