@@ -478,6 +478,35 @@ class NewRayPPOTrainer(RayPPOTrainer):
             if not joint_cfg.get(key):
                 raise ValueError(f"joint_decode.enable=True requires joint_decode.{key}")
 
+        # The density reaches the loss through exactly ONE channel: the
+        # off_old_log_probs -> old_log_probs swap. 'dynamic_clip' and 'vanilla' skip that
+        # swap, which leaves the actor's own short-prompt value in place and collapses
+        # off_ratio to ~1 -- so mu_t, the whole point of decoding jointly, would silently
+        # never be used. Same rejection _validate_rephraser_config makes for the same
+        # reason; there is a runtime backstop at the swap site too, but failing at startup
+        # costs nothing whereas discovering it a step in costs a model load.
+        reshape = self.config.actor_rollout_ref.actor.policy_loss.get("off_policy_reshape", "clip")
+        if reshape in ("dynamic_clip", "vanilla"):
+            raise ValueError(
+                f"joint_decode.enable=True is incompatible with off_policy_reshape={reshape!r}: "
+                f"the off_old_log_probs -> old_log_probs swap is skipped, so the off-policy rows "
+                f"train with an importance ratio of ~1 and the sampling density mu_t never "
+                f"reaches the loss. Use 'clip' (or p_div_p_0.1 / batch_mean_norm / "
+                f"group_ess_weight)."
+            )
+        # p_div_p_0.1 is allowed but worth saying out loud: it discards the ratio in favour
+        # of the LUFFY-style weight p/(p+0.1) (new_core_alg.py), so the 1/Z_t correction --
+        # the reason this path exists rather than scoring candidates afterwards -- has no
+        # effect on the gradient. Two models' worth of memory for a gradient a single model
+        # would produce.
+        if reshape == "p_div_p_0.1":
+            print(
+                "[joint_decode] off_policy_reshape='p_div_p_0.1' replaces the importance ratio "
+                "with p/(p+0.1), so mu_t (and its 1/Z_t renormalisation) does not affect the "
+                "gradient at all -- only target_probs and candidate selection still read it. "
+                "Use 'clip' if the corrected ratio is the point of the run."
+            )
+
         # The teacher's long prompt comes from summarize_input_ids, which the dataset only
         # builds when use_summarize is on.
         if joint_cfg.get("teacher_prompt", "long") == "long" and not self.config.data.get("use_summarize", False):
@@ -3524,15 +3553,20 @@ class NewRayPPOTrainer(RayPPOTrainer):
                 # 被跳过时 off 行的 old_log_probs 仍是 reasoner 的短 prompt 值，off_ratio 退化
                 # 成 ≈1，IS 修正整个消失 —— 而且不会报错。_validate_rephraser_config 已在启动时
                 # 拒掉会导致跳过的 reshape，这里兜住配置之外的路径。
-                if (
+                #
+                # 联合解码同理，而且更严格：它的密度是 μ_t（含 1/Z_t 截断归一化），除了这条
+                # swap 之外没有任何别的通道，而 μ_t 与 p_a 的差正是这个方法的全部内容。
+                # 两个 feature 都要兜，所以条件写成两者取或。
+                _two_model = (
                     self.config.get("rephraser", {}).get("enable", False)
-                    and off_policy_mask.any()
-                    and not _swap_done
-                ):
+                    or self.config.get("joint_decode", {}).get("enable", False)
+                )
+                if _two_model and off_policy_mask.any() and not _swap_done:
                     raise RuntimeError(
-                        "rephraser.enable=True but off_old_log_probs never reached old_log_probs: "
-                        "the off-policy rows would train with an importance ratio of ~1, silently "
-                        "dropping the rephraser's proposal density. Check off_policy_reshape."
+                        "off_old_log_probs never reached old_log_probs: the off-policy rows would "
+                        "train with an importance ratio of ~1, silently dropping the proposal "
+                        "density (the rephraser's pi_phi(y|x_long), or joint decoding's mu_t). "
+                        "Check off_policy_reshape."
                     )
                 
                 batch = batch.union(old_log_prob)
