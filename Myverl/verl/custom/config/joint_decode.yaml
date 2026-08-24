@@ -14,18 +14,25 @@
 # comes out of the framework untouched. What the sampler contributes is the one quantity no
 # later forward pass can recover: Z_t = p_t / mu_t, the token-level cost of the teacher's
 # constraint (mu_t being the truncated, renormalised distribution actually sampled from).
+#
 # It multiplies the off-policy term AFTER clipping:
 #
 #     L_off = -Z_t * min( r_t * A_t , clip(r_t, 1-eps, 1+eps) * A_t )
 #
-# Keeping Z_t OUTSIDE the ratio is the point. Folded in, a Z_t of 0.2 inflates the ratio
-# fivefold and saturates the clip on nearly every token -- discarding gradient for reasons
-# unrelated to how far the policy has moved, which is all the clip is meant to police.
+# Keeping Z_t OUTSIDE the ratio is the point: folded in, the clip would fire for reasons
+# unrelated to how far the policy has moved, which is all it is meant to police. That is the
+# 'clip_without_z' setting of actor_rollout_ref.actor.policy_loss.off_policy_reshape ('clip'
+# is the same thing). 'clip_with_z' folds Z_t into the denominator instead (r = pi_theta/mu_t,
+# the textbook IS ratio) so the clip sees it -- the A/B this knob exists for.
 #
 # THE CHECK: before the first optimizer step, numerator and denominator are the same model
 # under the same prompt at the same temperature, so actor/off_ratio on the off rows must sit
 # at 1.0, with Z_t reported separately as actor/off_z_mean. A frozen student would instead
 # add a model gap that widens as training proceeds -- silently decaying ESS.
+#
+# off_old_log_probs is never written on this path, and the swap that would overwrite the off
+# rows' denominator must not run -- old_log_probs is already correct. Asserted at the swap
+# site, since a placeholder column there would zero the denominator and pass every other guard.
 #
 # Runs on the reasoner's OWN GPUs, as a method on the actor worker
 # (NewActorRolloutRefWorker.generate_joint), after the rollout when vLLM is asleep. There is
@@ -132,29 +139,34 @@ top_k: -1
 # ---------------------------------------------------------------------------
 
 # Cap on generated tokens. The per-step cost is
-#   ceil(W / (batch_size * n_gpus)) * max_new_tokens
+#   ceil(W / n_gpus) * max_new_tokens
 # sequential two-model forwards, where W is the number of questions this step and n_gpus is
 # the reasoner's count (this shares its pool). There is no paged attention and no CUDA graph
-# here, so that product is the whole story.
+# here, so that product is the whole story -- and max_new_tokens is a hard floor on it:
+# shrink_batch drops finished rows from the KV read but cannot end the loop before the
+# LONGEST row does.
 max_new_tokens: 4096
 
-# Rows decoded concurrently per rank. Bounded by memory, not by the question count.
+# ROWS PER RANK. generate_joint decodes every row it receives in one go, so this is the
+# single throughput/memory knob, and it is what bounds the question count:
 #
-# What is resident during a joint step, per rank: the actor's FSDP shard (as always), a FULL
-# unsharded copy of it (the student mirror -- gathered once per step so the decode costs no
-# interconnect traffic per token; see _joint_student), the teacher, and both decoding models'
-# KV caches, which grow with this number times max_new_tokens. Every rank needs to fit a whole
-# model twice over, which is the assumption this design rests on.
+#     questions per step <= batch_size * n_gpus
+#
+# The direction matters. The split runs questions -> ranks (DP_COMPUTE_PROTO hands each rank
+# ceil(W / n_gpus) rows), so the only way to control rows-per-rank is to bound W. That is
+# what select_questions does with this value; whatever it drops is logged, never silently
+# truncated.
+#
+# UPPER BOUND ONLY. Under summarize_replace=wrong_only, W is however many questions the actor
+# got entirely wrong this step -- a step with 6 failures gives 2 rows per rank on 4 GPUs no
+# matter what this says. Raising it widens coverage on bad steps; it cannot manufacture rows.
+#
+# What bounds it from above is memory. Resident per rank during a joint step: the actor's FSDP
+# shard (as always), a FULL unsharded copy of it (the student mirror -- gathered once per step
+# so the decode costs no interconnect traffic per token; see _joint_student), the teacher, and
+# both decoders' KV caches, which grow with this number times max_new_tokens. Every rank needs
+# to fit a whole model twice over, which is the assumption this design rests on.
 batch_size: 8
-
-# Hard cap on questions per step, applied AFTER wrong_only narrows the set. This exists
-# because the cost above is linear in W and W is data-dependent -- a step where most
-# rollouts failed would otherwise stall the run. What gets dropped is logged, never
-# silently truncated.
-#
-# 0 = no cap. Only sensible with wrong_only; summarize_replace=all sends every question
-# here and is not viable at these lengths.
-max_questions_per_step: 16
 
 # auto tries flash_attention_2, then sdpa, then eager, and says which it got. Pin it to
 # fail loudly instead if a specific backend is required.

@@ -486,6 +486,9 @@ class NewRayPPOTrainer(RayPPOTrainer):
         # off_policy_reshape value can silently drop it -- the swap is irrelevant here, and
         # there is a runtime backstop at the swap site checking off_log_z is present.
         #
+        # 'clip_with_z' instead folds Z_t into the ratio's denominator, so the clip sees it;
+        # 'clip_without_z' (= 'clip') keeps it outside. See compute_token_on_off_sft_loss.
+        #
         # What DOES still matter is what the reshape does to the ratio the coefficient
         # multiplies. p_div_p_0.1 replaces r_t = pi_theta/p_t outright with the LUFFY-style
         # weight p/(p+0.1), so the run becomes "Z_t-weighted LUFFY" rather than
@@ -499,15 +502,15 @@ class NewRayPPOTrainer(RayPPOTrainer):
                 "rather than Z_t * clipped PPO ratio. Z_t itself still applies. Use 'clip' for "
                 "the intended formula."
             )
-        elif reshape not in ("clip", "batch_mean_norm", "group_ess_weight") and not reshape.startswith("low_clip"):
+        elif reshape not in ("clip", "clip_without_z", "clip_with_z", "batch_mean_norm", "group_ess_weight") and not reshape.startswith("low_clip"):
             # 'clip' is the intended setting and is implemented by falling through every
             # reshape branch -- which means a typo also falls through and behaves like 'clip'
             # with no complaint. Naming the recognised values is the only way that surfaces.
             print(
                 f"[joint_decode] off_policy_reshape={reshape!r} is not one of the values this "
-                f"path was checked against (clip / p_div_p_0.1 / batch_mean_norm / "
-                f"group_ess_weight / low_clip*). If it is a typo it will behave exactly like "
-                f"'clip' and nothing else will say so."
+                f"path was checked against (clip / clip_without_z / clip_with_z / p_div_p_0.1 / "
+                f"batch_mean_norm / group_ess_weight / low_clip*). If it is a typo it will behave "
+                f"exactly like 'clip' and nothing else will say so."
             )
 
         # The teacher's long prompt comes from summarize_input_ids, which the dataset only
@@ -546,20 +549,24 @@ class NewRayPPOTrainer(RayPPOTrainer):
                 f"that is intentional."
             )
 
-        # Cost, printed because it is the number that decides whether this is viable at
-        # all. There is no paged attention and no CUDA graph here, and each token costs two
-        # forward passes, so the step time is essentially this product. The GPU count is the
-        # reasoner's -- joint decoding runs on the same pool, on the actor's own worker.
-        max_q = int(joint_cfg.get("max_questions_per_step", 0))
+        # Cost, printed because it is the number that decides whether this is viable at all.
+        # There is no paged attention and no CUDA graph here, and each token costs two forward
+        # passes. The GPU count is the reasoner's -- joint decoding runs on the same pool, on
+        # the actor's own worker.
+        #
+        # batch_size is ROWS PER RANK and is the only knob. generate_joint decodes all its rows
+        # in one wave, so the step's DURATION is just max_new_tokens regardless; what batch_size
+        # buys is COVERAGE -- how many questions fit -- at a proportional cost in per-rank
+        # memory (both decoders' KV caches scale with rows x max_new_tokens).
         batch = max(1, int(joint_cfg.get("batch_size", 8)))
         n_gpus = max(1, int(self.config.trainer.n_gpus_per_node))
         train_bsz = self.config.data.train_batch_size
-        worst_q = max_q if max_q else train_bsz
-        waves = -(-worst_q // (batch * n_gpus))
+        cap = batch * n_gpus
         print(
-            f"[joint_decode] up to {worst_q} question(s)/step over {n_gpus} GPU(s) at "
-            f"batch_size={batch} = {waves} sequential wave(s) x "
-            f"{joint_cfg.get('max_new_tokens')} tokens, two model forwards per token. "
+            f"[joint_decode] batch_size={batch} row(s)/rank x {n_gpus} GPU(s) = up to {cap} "
+            f"question(s)/step, decoded in ONE wave of {joint_cfg.get('max_new_tokens')} "
+            f"tokens, two model forwards per token. Under wrong_only the actual count is "
+            f"however many questions failed this step, so {cap} is an upper bound. "
             f"student=the actor itself, teacher={joint_cfg.get('teacher_model_path')}"
         )
         # Memory is the other constraint, and this design assumes each GPU fits a whole model
@@ -580,11 +587,9 @@ class NewRayPPOTrainer(RayPPOTrainer):
         if sr_mode == "all":
             print(
                 f"[joint_decode] WARNING: summarize_replace='all' sends every question here "
-                f"({train_bsz}/step)"
-                + (f", capped to {max_q} by max_questions_per_step -- so most questions get no "
-                   f"replacement." if max_q else
-                   " with NO cap. At these lengths that is unlikely to finish; "
-                   "'wrong_only' is what makes this path affordable.")
+                f"({train_bsz}/step), capped to {cap} by batch_size x n_gpus -- so most "
+                f"questions get no replacement. 'wrong_only' is what makes this path "
+                f"affordable."
             )
 
         # sr_logprob_prompt selects which prompt the DENSITY is computed under, but this
@@ -1703,10 +1708,15 @@ class NewRayPPOTrainer(RayPPOTrainer):
         gen_batch_output.batch['target_probs'] = torch.zeros(
             (bn, resp_width), dtype=torch.float32, device=device
         )
-        gen_batch_output.batch['off_old_log_probs'] = torch.zeros(
-            (bn, resp_width), dtype=torch.float32, device=device
-        )
-        # 联合解码额外需要的一列：逐 token 的 log Z_t，作为 off loss 的系数（clip 之后乘）。
+        # 联合解码跳过 off_old_log_probs：它的分母就是 actor 自己的 old_log_probs（student 就是
+        # actor），而下游 swap 的判据是这个 key 在不在 —— 补了占位就等于让 swap 把 off 行分母
+        # 覆写成 0，r_t 从 π_θ/p_t 退化成 π_θ，且两个守卫都拦不住（见 swap 处的断言）。
+        if not sr_joint:
+            gen_batch_output.batch['off_old_log_probs'] = torch.zeros(
+                (bn, resp_width), dtype=torch.float32, device=device
+            )
+        # 联合解码额外需要的一列：逐 token 的 log Z_t（off_policy_reshape 决定它乘在 clip 前
+        # 还是 clip 后，见 new_core_alg.compute_token_on_off_sft_loss）。
         # 全批补零而不是只给 off 行：splice 循环按 off_batch 的 key 逐个拷进来，目标张量必须
         # 先存在。0 是正确的中性值 —— exp(0)=1，on 行的系数因此是 1，何况 prefix_mask=0 已经
         # 让它们走不到 off 分支。
@@ -1795,10 +1805,22 @@ class NewRayPPOTrainer(RayPPOTrainer):
         #
         # 题数上限必须在 W 之前应用：每步成本与 W 成正比（无 paged attention、每 token 两次
         # forward），而 wrong_only 下 W 是"本步答错了几道"这个数据决定的量。
+        #
+        # 上限由 joint_decode.batch_size 定，它的含义是**每 rank 解多少行**。generate_joint
+        # 把收到的行一次解完（不再二次切分），而 joint_sr 按 world_size 切，所以每 rank 的
+        # 行数就是 ceil(W / world_size) —— 要控制它，就得反过来用 batch_size 定 W：
+        #
+        #     W <= batch_size * world_size
+        #
+        # 注意这只能是**上界**：wrong_only 下某步只错了 6 题，那每 rank 就 2 行，batch_size
+        # 设多大也变不出行来。
         if sr_joint:
             K = 1
             all_q = joint_sr.select_questions(
-                all_q, int(self.config.joint_decode.get('max_questions_per_step', 0)), metrics,
+                all_q,
+                int(self.config.joint_decode.get('batch_size', 8)),
+                self.actor_rollout_wg.world_size,
+                metrics,
             )
         W = len(all_q)
         # 展平成 [W*K, L_long]：行 r = w_idx*K + k -> 第 all_q[w_idx] 题的第 k 条候选。
@@ -3582,6 +3604,18 @@ class NewRayPPOTrainer(RayPPOTrainer):
                 # 联合解码**不走这条 swap**，而且不该走：它的 student 就是 actor，所以分母正是
                 # old_log_probs 本身。它靠 off_log_z 那一列把 Z_t 带给 loss，所以那一列缺失才是
                 # 它的同类静默失败 —— Z_t 悄悄变成 1、截断代价整个消失、不报错。守卫因此分成两个。
+                #
+                # 联合解码下 swap 必须没跑过。跑了就说明有人给整批补了 off_old_log_probs 占位，
+                # 那 off 行分母会被覆写成 0 → r_t 从 π_θ/p_t 退化成 π_θ；而 _swap_done=True 让下面
+                # 的 rephraser 守卫满意、off_log_z 在场让 joint 守卫满意，两个都拦不住。
+                _joint_on = self.config.get("joint_decode", {}).get("enable", False)
+                if _joint_on and _swap_done:
+                    raise RuntimeError(
+                        "joint_decode.enable=True but the off_old_log_probs -> old_log_probs swap "
+                        "ran: the off rows' denominator was overwritten, so the importance ratio "
+                        "pi_theta/p_t degenerates to pi_theta. Under joint decoding the student IS "
+                        "the actor, so old_log_probs is already the right denominator."
+                    )
                 if (
                     self.config.get("rephraser", {}).get("enable", False)
                     and off_policy_mask.any()
@@ -3593,7 +3627,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
                         "dropping the proposal density pi_phi(y|x_long). Check off_policy_reshape."
                     )
                 if (
-                    self.config.get("joint_decode", {}).get("enable", False)
+                    _joint_on
                     and off_policy_mask.any()
                     and "off_log_z" not in batch.batch
                 ):
