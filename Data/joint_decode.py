@@ -478,12 +478,12 @@ def main() -> int:
             stop = min(begin + args.batch_size, len(shard))
             batch_a = render(tok_a, chats_a[begin:stop], args.prompt_length)
             batch_b = render(tok_b, chats_b[begin:stop], args.prompt_length)
-            # logq is the per-token sampling density. Offline evaluation has no use for
-            # it -- it exists for the training path, where it becomes the importance
-            # ratio's denominator (verl/custom/joint_sr.py). Discarded here rather than
-            # written out: a [rows, 14336] float column would dominate the parquet, and
-            # nothing downstream of a sweep reads it.
-            responses, lengths, fb_row, logp_row, z_row, _logq, n_narrow = joint_generate(
+            # log_z is the per-token log Z_t. Offline evaluation has no use for it -- it
+            # exists for the training path, where it weights the off-policy loss
+            # (verl/custom/joint_sr.py). Discarded here rather than written out: a
+            # [rows, 14336] float column would dominate the parquet, and nothing downstream
+            # of a sweep reads it. The row-mean Z_t is still reported as teacher_keep_ratio.
+            responses, lengths, fb_row, logp_row, z_row, _log_z, n_narrow = joint_generate(
                 model_a, model_b, batch_a, batch_b, eos_ids=eos_ids, pad_id=pad_id, args=args,
             )
             narrow_steps += n_narrow

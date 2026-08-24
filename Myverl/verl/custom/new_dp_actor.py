@@ -140,6 +140,11 @@ class NewDataParallelPPOActor(DataParallelPPOActor):
             select_keys.append('on_logprobs_std')
         if self.config.use_off_policy_loss and self.config.use_off_policy_probs:
             select_keys.append('target_probs')
+        # 联合解码的逐 token log Z_t。「存在才 select」：只有 joint_decode.enable=True 的
+        # normal-step batch 带它，recycle / extra step 和另两条候选来源都没有，硬加会让
+        # data.select 因缺 key 报错。
+        if 'off_log_z' in data.batch.keys():
+            select_keys.append('off_log_z')
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 
@@ -372,6 +377,9 @@ class NewDataParallelPPOActor(DataParallelPPOActor):
                         reward_mask = data['reward_mask'] if 'reward_mask' in data else None
                         se_mask = data['se_mask'] if 'se_mask' in data else None
                         off_policy_reshape = self.config.policy_loss.get("off_policy_reshape", "p_div_p_0.1")
+                        # 联合解码带来的逐 token log Z_t（teacher 约束代价）。不在时为 None，
+                        # loss 里就不乘系数 —— 由数据在不在决定，不需要新的配置开关。
+                        off_log_z = data['off_log_z'] if 'off_log_z' in data else None
                         ret_dict = loss_fn(old_log_prob=old_log_prob,
                             log_prob=log_prob,
                             advantages=advantages,
@@ -394,6 +402,7 @@ class NewDataParallelPPOActor(DataParallelPPOActor):
                             off_distill_coef=self.config.policy_loss.get('off_distill_coef', 0.0),
                             off_cliprange_high=self.config.get("off_clip_ratio_high", None),
                             off_distill_gate=self.config.policy_loss.get('off_distill_gate', False),
+                            off_log_z=off_log_z,
                         )
                         pg_loss = ret_dict['pg_loss']
                         off_pg_loss = ret_dict['off_pg_loss']
@@ -423,6 +432,11 @@ class NewDataParallelPPOActor(DataParallelPPOActor):
                             metrics_data['actor/off_ratio_min_clip_frac'] = ret_dict['off_ratio_min_clip_frac'].detach().item()
                         if 'off_ratio_scale' in ret_dict:
                             metrics_data['actor/off_ratio_scale'] = ret_dict['off_ratio_scale'].detach().item()
+                        # 联合解码：实际乘进 off loss 的 Z_t 均值。与
+                        # batch/sr_joint_keep_ratio 对照 —— 后者是采样时按 eligible mask 算的
+                        # 诊断量（fallback 步记 0），这个是真正进梯度的值。
+                        if 'off_z_mean' in ret_dict:
+                            metrics_data['actor/off_z_mean'] = ret_dict['off_z_mean'].detach().item()
                         if 'off_distill_loss' in ret_dict:
                             metrics_data['actor/off_distill_loss'] = ret_dict['off_distill_loss'].detach().item()
                         # ===== loss 组成分析:on/off 占比 + off 内 SFT/RL 占比 =====

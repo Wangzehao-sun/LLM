@@ -3,17 +3,29 @@
 # The ACTOR BEING TRAINED is the student and a frozen teacher constrains it. Every token
 # must sit in both models' top-k and clear both probability floors; among the survivors the
 # student's own distribution decides. The resulting response replaces one of the n GRPO
-# rollouts, and the density it was really sampled from becomes the importance ratio's
-# denominator.
+# rollouts.
 #
-# The student being the LIVE actor is what makes this checkable. Numerator and denominator
-# are then the same model under the same prompt at the same temperature, so before any
-# optimizer step they differ only by the truncation:
+# HOW IT REACHES THE LOSS. Because the student IS the actor, the density the candidate was
+# sampled from is the actor's own -- which compute_log_prob already produces for the whole
+# batch. So nothing is substituted for old_log_probs and the importance ratio
 #
-#     off_ratio = exp(log pi_theta - log mu_t) = Z_t
+#     r_t = pi_theta(y_t) / p_t(y_t)
 #
-# i.e. actor/off_ratio on the off rows must equal batch/sr_joint_keep_ratio. A frozen student
-# would instead add a model gap that widens as training proceeds -- silently decaying ESS.
+# comes out of the framework untouched. What the sampler contributes is the one quantity no
+# later forward pass can recover: Z_t = p_t / mu_t, the token-level cost of the teacher's
+# constraint (mu_t being the truncated, renormalised distribution actually sampled from).
+# It multiplies the off-policy term AFTER clipping:
+#
+#     L_off = -Z_t * min( r_t * A_t , clip(r_t, 1-eps, 1+eps) * A_t )
+#
+# Keeping Z_t OUTSIDE the ratio is the point. Folded in, a Z_t of 0.2 inflates the ratio
+# fivefold and saturates the clip on nearly every token -- discarding gradient for reasons
+# unrelated to how far the policy has moved, which is all the clip is meant to police.
+#
+# THE CHECK: before the first optimizer step, numerator and denominator are the same model
+# under the same prompt at the same temperature, so actor/off_ratio on the off rows must sit
+# at 1.0, with Z_t reported separately as actor/off_z_mean. A frozen student would instead
+# add a model gap that widens as training proceeds -- silently decaying ESS.
 #
 # Runs on the reasoner's OWN GPUs, as a method on the actor worker
 # (NewActorRolloutRefWorker.generate_joint), after the rollout when vLLM is asleep. There is
@@ -166,8 +178,9 @@ shrink_batch: True
 # The default pairing is the method: the teacher steers from the information-richer long
 # prompt while the student decodes under the short one the gradient will be taken at.
 #
-# Leave student_prompt at 'short'. It is what makes the off_ratio == Z_t identity hold, since
-# the loss recomputes the numerator under the short prompt; setting it to 'long' would put a
-# prompt shift back into the ratio and give up the only end-to-end check this path has.
+# Leave student_prompt at 'short'. It is what makes actor/off_ratio come out at 1.0 before the
+# first update, since the loss recomputes the numerator under the short prompt; setting it to
+# 'long' would put a prompt shift into the ratio and give up the only end-to-end check this
+# path has.
 student_prompt: short
 teacher_prompt: long

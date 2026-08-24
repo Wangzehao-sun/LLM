@@ -435,6 +435,7 @@ def compute_token_on_off_sft_loss(
     off_distill_coef=0.0,
     off_cliprange_high=None,
     off_distill_gate=False,
+    off_log_z=None,
 ):
     """
     """
@@ -505,6 +506,8 @@ def compute_token_on_off_sft_loss(
     # 以及 batch_mean_norm 用到的 detached 缩放因子(=整形前 off 区域 ratio 均值)。
     off_ratio_mean = torch.tensor(0.0)
     off_ratio_scale = torch.tensor(1.0)
+    # 实际乘进 off loss 的 Z_t 均值。1.0 = 没有 Z_t 系数（非联合解码路径），是中性值。
+    off_z_mean = torch.tensor(1.0)
     if off_policy_loss_type == "sft":
         if off_policy_reshape == 'vanilla':
             off_sft_losses = -log_prob
@@ -641,6 +644,28 @@ def compute_token_on_off_sft_loss(
             )
         else:
             off_rl_losses = off_pg_losses
+
+        # (3) Z_t：联合解码的 teacher 约束代价，作为**系数**乘在裁剪之后。
+        #
+        #     L_off = −Z_t · min( r_t·A_t , clip(r_t, 1−ε, 1+ε)·A_t )
+        #
+        # 位置是重点。折进 ratio（即把分母换成 μ_t）在数学上只差一个因子，但 clip 是非线性的：
+        # Z_t 可以小到 0.2，那 ratio 被系统性放大五倍、几乎每个 token 都撞上 1+ε 的上界，丢掉
+        # 的梯度与"策略偏移多远"毫无关系 —— 而那是 clip 唯一该管的事。留在外面，clip 只看策略
+        # 偏移，Z_t 独立地当置信权重。
+        #
+        # detach：Z_t 是采样时刻的历史量（由 joint_decode_core 逐 token 记下），不是 θ 的函数，
+        # 不该有梯度回流。
+        #
+        # 由**数据在不在**决定走不走这条路，不由 off_policy_reshape 的字符串决定：联合解码提供
+        # off_log_z，另两条候选来源不提供，所以它们的行为逐位不变，也不需要新的配置取值。
+        if off_log_z is not None:
+            z_t = torch.exp(off_log_z).detach()
+            off_rl_losses = off_rl_losses * z_t
+            # 实际生效的 Z_t 均值（仅 off 区域）。与 batch/sr_joint_keep_ratio 对照：后者是
+            # 采样时按 eligible mask 算的诊断量，fallback 步记 0；这里是真正乘进 loss 的值，
+            # fallback 步是 p_student/p_teacher。两者在 fallback 率高时会分开。
+            off_z_mean = verl_F.masked_mean(z_t, off_clip_region).detach()
     elif off_policy_loss_type == "none":
         pass
     else:
@@ -784,6 +809,8 @@ def compute_token_on_off_sft_loss(
         # group_ess_weight 下=被替换 off 行的平均 ESS 权重；否则=1。
         "off_ratio_mean": off_ratio_mean,
         "off_ratio_scale": off_ratio_scale,
+        # 实际乘进 off loss 的 Z_t 均值（联合解码；其他路径恒为 1.0）。
+        "off_z_mean": off_z_mean,
         # off-token distillation 项均值(仅 off 区域, detached; coef=0 时为 0)
         "off_distill_loss": off_distill_loss_log,
         # ===== loss 组成分析(同分母,绝对贡献可加) =====
