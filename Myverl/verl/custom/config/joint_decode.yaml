@@ -80,7 +80,7 @@ agree_student_top_k: 50
 
 # How much of the vocabulary the TEACHER permits at all. This is the knob that sets how
 # tightly the constraint binds.
-agree_teacher_top_k: 8
+agree_teacher_top_k: 10
 
 # Probability floors, applied on top of the top-k intersection. 0 disables a side.
 # The teacher's floor sets how wide the allowed region is; the student's only drops
