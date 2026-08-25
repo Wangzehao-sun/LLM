@@ -21,6 +21,13 @@ TENSOR_PARALLEL=1
 N_SAMPLES=${N_SAMPLES:-128}
 MAX_STEPS=${MAX_STEPS:-100}
 
+# Format screening on top of math-verify's answer check. The rule is the trainer's
+# (_trajectory_filter_reject); these word lists are the generation side's own and do not
+# affect training. Hydra list syntax: no spaces after the commas.
+TRAJ_FILTER=${TRAJ_FILTER:-False}
+TRAJ_KEYWORDS=${TRAJ_KEYWORDS:-'["the draft","based on the draft","according to the draft","from the draft","the experience","based on the experience","according to the experience","the provided reasoning","based on the reasoning above"]'}
+TRAJ_INSTR_PHRASES=${TRAJ_INSTR_PHRASES:-'["your task is","output only","do not mention","self-contained solution","no meta-talk"]'}
+
 
 cd $HOME/LLM/Train/verl/
 echo "change to dir: $PWD"
@@ -49,4 +56,7 @@ python -m verl.trainer.main_generation \
     rollout.gpu_memory_utilization=0.8 \
     +is_eval=True \
     +max_steps=$MAX_STEPS \
+    +algorithm.trajectory_filter.enable=$TRAJ_FILTER \
+    +algorithm.trajectory_filter.keywords="$TRAJ_KEYWORDS" \
+    +algorithm.trajectory_filter.instruction_phrases="$TRAJ_INSTR_PHRASES" \
     +reward_model.reward_impl_version=4 2>&1 | tee ${LOG_PATH}
