@@ -294,21 +294,28 @@ def main_task(config):
                 if tf_enable:
                     # Keep the answer-only verdict alongside: "right answer, broken format" is
                     # the case worth seeing, and overwriting in place would hide it.
-                    raw = list(score_per_response)
-                    filtered = list(score_per_response)
+                    #
+                    # Both lists are built as float64 rather than by copying and assigning
+                    # into score_per_response: reward_impl_version=4 returns numpy BOOLS, so
+                    # writing a 0 in leaves bool and int mixed and Arrow rejects the column
+                    # ("Cannot mix NumPy dtypes bool and int64") at to_parquet time. float()
+                    # loses nothing (True -> 1.0) and keeps any partial-credit value another
+                    # reward impl might return.
+                    raw = []
+                    filtered = []
                     rejected = []
                     for j, resp in enumerate(responses):
                         reject, reason = _trajectory_filter_reject(resp, tf_cfg)
                         rejected.append(bool(reject))
-                        # float() covers both the numpy bool reward_impl_version=4 returns
-                        # and the float other versions do; a missing/odd value must read as
-                        # "not correct" rather than raise.
+                        # A missing/odd value must read as "not correct" rather than raise.
                         try:
-                            answer_ok = float(raw[j]) == 1.0
+                            fval = float(score_per_response[j])
                         except (TypeError, ValueError):
-                            answer_ok = False
+                            fval = 0.0
+                        answer_ok = fval == 1.0
+                        raw.append(fval)
+                        filtered.append(0.0 if reject else fval)
                         if reject:
-                            filtered[j] = 0
                             n_format_err += 1
                             if answer_ok:
                                 n_format_err_was_correct += 1
