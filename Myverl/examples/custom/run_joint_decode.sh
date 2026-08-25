@@ -171,6 +171,14 @@ EOS_CHECK_EVERY=${EOS_CHECK_EVERY:-16}
 # context. Set to 0 to keep the full batch, which is only useful for isolating this.
 SHRINK_BATCH=${SHRINK_BATCH:-1}
 
+# Screen each response's FORMAT on top of math-verify's answer check. The rule is the
+# trainer's; these word lists are the generation side's own and do not affect training.
+# Comma-separated; unset a variable to fall back to the trainer's default list, or set it
+# empty to disable that category.
+TRAJ_FILTER=${TRAJ_FILTER:-0}
+TRAJ_KEYWORDS=${TRAJ_KEYWORDS-"the draft,based on the draft,according to the draft,from the draft,the experience,based on the experience,according to the experience,the provided reasoning,based on the reasoning above"}
+TRAJ_INSTR_PHRASES=${TRAJ_INSTR_PHRASES-"your task is,output only,do not mention,self-contained solution,no meta-talk"}
+
 CODE_DIR=${CODE_DIR:-$HOME/LLM}
 LOG_ROOT=${LOG_ROOT:-$HOME/LLM/Train/verl/logs}
 EXP_NAME=${EXP_NAME:-joint_$(date +%m%d_%H%M)}
@@ -196,7 +204,7 @@ echo "model names for labels: A=$NAME_A  B=$NAME_B"
 SWEEP_DIR=${LOG_ROOT}/${EXP_NAME}
 mkdir -p "$SWEEP_DIR"
 SUMMARY="${SWEEP_DIR}/summary.tsv"
-printf 'label\tavg_score\tmax_score\tavg_len_tokens\tlen_ok\tlen_bad\tfallback\tkeep_ratio\tstudent_prob\toutput_dir\n' > "$SUMMARY"
+printf 'label\tavg_score\tmax_score\tavg_len_tokens\tlen_ok\tlen_bad\tfallback\tkeep_ratio\tstudent_prob\tans_err\tfmt_err\tfmt_ok_ans\toutput_dir\n' > "$SUMMARY"
 
 # The swept variable depends on the mode: a mixing weight for the blending modes,
 # a min-prob floor for the selection mode.
@@ -269,6 +277,18 @@ for value in "${SWEEP_LIST[@]}"; do
                      --temperature "$TEMPERATURE" --top-p "$TOP_P" --top-k "$TOP_K")
     fi
 
+    if [ "$TRAJ_FILTER" = "1" ]; then
+        extra_args+=(--traj-filter)
+        # Passed only when set, so an unset variable inherits the trainer's default list
+        # rather than pinning a copy of it here.
+        if [ -n "${TRAJ_KEYWORDS+x}" ]; then
+            extra_args+=(--traj-keywords "$TRAJ_KEYWORDS")
+        fi
+        if [ -n "${TRAJ_INSTR_PHRASES+x}" ]; then
+            extra_args+=(--traj-instruction-phrases "$TRAJ_INSTR_PHRASES")
+        fi
+    fi
+
     echo "=== [$label] ${SWEEP_LABEL}=$value ==="
     # One process per GPU, each writing rank<N>.parquet into out_dir. The metrics
     # block below globs the directory, so no merge step is needed -- same as
@@ -329,6 +349,8 @@ files = sorted(glob.glob(f"{sys.argv[1]}/*.parquet"))
 means, maxes, lengths, fbs, logps, keeps = [], [], [], [], [], []
 len_ok, len_bad = [], []
 missing_lengths = False
+n_resp = n_answer_err = n_format_err = n_fmt_ok_ans = 0
+have_breakdown = False
 
 
 def _usable(v):
@@ -359,6 +381,21 @@ for path in files:
     for score in df["test_score"]:
         means.append(float(score["mean_score"]))
         maxes.append(float(score["max_score"]))
+        # Only present when --traj-filter ran; keyed on the data so an older parquet
+        # reports NA instead of failing.
+        rejected = score.get("format_rejected") if hasattr(score, "get") else None
+        raw = score.get("raw_scores_per_response") if hasattr(score, "get") else None
+        if rejected is None or raw is None:
+            continue
+        have_breakdown = True
+        for rej, raw_score in zip(rejected, raw):
+            n_resp += 1
+            if rej:
+                n_format_err += 1
+                if _correct(raw_score):
+                    n_fmt_ok_ans += 1
+            elif not _correct(raw_score):
+                n_answer_err += 1
     if "response_lengths" in df:
         for row in df["response_lengths"]:
             lengths.extend(int(n) for n in row)
@@ -379,7 +416,7 @@ for path in files:
         keeps.extend(v for row in df["teacher_keep_ratio"] for v in row if _usable(v))
 
 if not means:
-    print("NA\tNA\tNA\tNA\tNA\tNA\tNA\tNA")
+    print("NA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA")
 else:
     def _mean_len(vals):
         # NA rather than 0 when a bucket is empty: an all-correct run has no wrong
@@ -394,12 +431,18 @@ else:
     # exp of the mean per-token log-prob: a geometric mean, so it is not skewed by
     # response length the way a plain mean of probabilities would be.
     sp = f"{math.exp(sum(logps) / len(logps)):.4f}" if logps else "NA"
+    if have_breakdown and n_resp:
+        ans_err = f"{n_answer_err / n_resp:.4f}"
+        fmt_err = f"{n_format_err / n_resp:.4f}"
+        fmt_ok = f"{n_fmt_ok_ans / n_resp:.4f}"
+    else:
+        ans_err = fmt_err = fmt_ok = "NA"
     print(f"{sum(means) / len(means):.4f}\t{sum(maxes) / len(maxes):.4f}\t{avg_len}\t"
-          f"{ok_len}\t{bad_len}\t{fb}\t{kr}\t{sp}")
+          f"{ok_len}\t{bad_len}\t{fb}\t{kr}\t{sp}\t{ans_err}\t{fmt_err}\t{fmt_ok}")
 PYEOF
 )
     printf '%s\t%s\t%s\n' "$label" "$metrics" "$out_dir" >> "$SUMMARY"
-    echo "=== [$label] score/max/len/len_ok/len_bad/fallback/keep_ratio/student_prob: $metrics ==="
+    echo "=== [$label] score/max/len/len_ok/len_bad/fallback/keep_ratio/student_prob/ans_err/fmt_err/fmt_ok_ans: $metrics ==="
 done
 
 echo
