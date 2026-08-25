@@ -70,6 +70,13 @@ CODE_DIR=${CODE_DIR:-$HOME/LLM/Myverl}
 LOG_ROOT=${LOG_ROOT:-$HOME/LLM/Train/verl/logs}
 EXP_NAME=${EXP_NAME:-sweep_$(date +%m%d_%H%M)}
 
+# Format screening on top of math-verify's answer check. The rule is the trainer's
+# (_trajectory_filter_reject); these word lists are the generation side's own and do not
+# affect training. Hydra list syntax: no spaces after the commas.
+TRAJ_FILTER=${TRAJ_FILTER:-False}
+TRAJ_KEYWORDS=${TRAJ_KEYWORDS:-'["the draft","based on the draft","according to the draft","from the draft","the experience","based on the experience","according to the experience","the provided reasoning","based on the reasoning above"]'}
+TRAJ_INSTR_PHRASES=${TRAJ_INSTR_PHRASES:-'["your task is","output only","do not mention","self-contained solution","no meta-talk"]'}
+
 if [ -z "$CKPT_DIR" ] && [ -z "$BASE_MODEL" ]; then
     echo "set CKPT_DIR (to sweep checkpoints) or BASE_MODEL (to evaluate one model)" >&2
     exit 1
@@ -134,7 +141,7 @@ fi
 SWEEP_DIR=${LOG_ROOT}/${EXP_NAME}
 mkdir -p "$SWEEP_DIR"
 SUMMARY="${SWEEP_DIR}/summary.tsv"
-printf 'label\tavg_score\tmax_score\tavg_len_tokens\toutput_dir\n' > "$SUMMARY"
+printf 'label\tavg_score\tmax_score\tavg_len_tokens\tans_err\tfmt_err\tfmt_ok_ans\toutput_dir\n' > "$SUMMARY"
 
 echo "=== sweeping ${#TARGETS[@]} model(s) on $(basename "$EVAL_PATH"), prompt_key=$PROMPT_KEY ==="
 for target in "${TARGETS[@]}"; do
@@ -176,6 +183,9 @@ for target in "${TARGETS[@]}"; do
         rollout.gpu_memory_utilization=$GPU_MEM_UTIL \
         +is_eval=True \
         +max_steps=$MAX_STEPS \
+        +algorithm.trajectory_filter.enable=$TRAJ_FILTER \
+        +algorithm.trajectory_filter.keywords="$TRAJ_KEYWORDS" \
+        +algorithm.trajectory_filter.instruction_phrases="$TRAJ_INSTR_PHRASES" \
         +reward_model.reward_impl_version=4 2>&1 | tee "$log_path"
 
     # Recompute the metrics from the written parquets rather than scraping the log:
@@ -187,6 +197,11 @@ for target in "${TARGETS[@]}"; do
     #                rambling or truncating rather than answering. Compare it
     #                against RESPONSE_LENGTH to see whether generations are
     #                hitting the cap.
+    #   ans_err / fmt_err -- share of responses failing on the ANSWER vs on FORMAT.
+    #                Only present when TRAJ_FILTER=True wrote the raw_* columns; NA
+    #                otherwise. fmt_ok_ans is the subset rejected on format DESPITE a
+    #                correct answer, i.e. how much avg_score would rise without the
+    #                format check.
     metrics=$(python - "$out_dir" <<'PYEOF'
 import glob
 import sys
@@ -197,6 +212,20 @@ import pyarrow.parquet as pq
 files = sorted(glob.glob(f"{sys.argv[1]}/*.parquet"))
 means, maxes, lengths = [], [], []
 missing_lengths = False
+n_resp = n_answer_err = n_format_err = n_fmt_ok_ans = 0
+have_breakdown = False
+
+
+def answer_ok(score):
+    # reward_impl_version=4 returns numpy bools, others return floats. float() covers
+    # both (float(np.True_) == 1.0); the guard is for a missing/odd value, which must
+    # read as "not correct" rather than raise.
+    try:
+        return float(score) == 1.0
+    except (TypeError, ValueError):
+        return False
+
+
 for path in files:
     # response_lengths is the per-response valid token count recorded by
     # main_generation; parquets written before it existed have to be reported as
@@ -210,19 +239,42 @@ for path in files:
     for score in df["test_score"]:
         means.append(float(score["mean_score"]))
         maxes.append(float(score["max_score"]))
+        # format_rejected / raw_scores_per_response only exist when the filter ran.
+        rejected = score.get("format_rejected") if hasattr(score, "get") else None
+        raw = score.get("raw_scores_per_response") if hasattr(score, "get") else None
+        if rejected is None or raw is None:
+            continue
+        have_breakdown = True
+        for rej, raw_score in zip(rejected, raw):
+            n_resp += 1
+            if rej:
+                n_format_err += 1
+                if answer_ok(raw_score):
+                    n_fmt_ok_ans += 1
+            elif not answer_ok(raw_score):
+                n_answer_err += 1
     if "response_lengths" in df:
         for row in df["response_lengths"]:
             lengths.extend(int(n) for n in row)
 
 if not means:
-    print("NA\tNA\tNA")
+    print("NA\tNA\tNA\tNA\tNA\tNA")
 else:
     avg_len = f"{sum(lengths) / len(lengths):.0f}" if lengths and not missing_lengths else "NA"
-    print(f"{sum(means) / len(means):.4f}\t{sum(maxes) / len(maxes):.4f}\t{avg_len}")
+    if have_breakdown and n_resp:
+        ans_err = f"{n_answer_err / n_resp:.4f}"
+        fmt_err = f"{n_format_err / n_resp:.4f}"
+        fmt_ok = f"{n_fmt_ok_ans / n_resp:.4f}"
+    else:
+        ans_err = fmt_err = fmt_ok = "NA"
+    print(
+        f"{sum(means) / len(means):.4f}\t{sum(maxes) / len(maxes):.4f}\t{avg_len}\t"
+        f"{ans_err}\t{fmt_err}\t{fmt_ok}"
+    )
 PYEOF
 )
     printf '%s\t%s\t%s\n' "$label" "$metrics" "$out_dir" >> "$SUMMARY"
-    echo "=== [$label] avg_score / max_score / avg_len_tokens: $metrics ==="
+    echo "=== [$label] avg_score / max_score / avg_len_tokens / ans_err / fmt_err / fmt_ok_ans: $metrics ==="
 done
 
 echo

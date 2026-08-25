@@ -300,10 +300,13 @@ def main_task(config):
                     for j, resp in enumerate(responses):
                         reject, reason = _trajectory_filter_reject(resp, tf_cfg)
                         rejected.append(bool(reject))
-                        # reward_impl_version=4 returns numpy bools, other versions return
-                        # floats, so both have to be read -- float(np.True_) works but a
-                        # bare `== 1.0` on a non-numeric would not.
-                        answer_ok = bool(raw[j]) if isinstance(raw[j], (bool, np.bool_)) else float(raw[j]) == 1.0
+                        # float() covers both the numpy bool reward_impl_version=4 returns
+                        # and the float other versions do; a missing/odd value must read as
+                        # "not correct" rather than raise.
+                        try:
+                            answer_ok = float(raw[j]) == 1.0
+                        except (TypeError, ValueError):
+                            answer_ok = False
                         if reject:
                             filtered[j] = 0
                             n_format_err += 1
