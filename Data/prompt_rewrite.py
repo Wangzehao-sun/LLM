@@ -107,6 +107,39 @@ def _extract_problem_from_prompt(prompt):
         return None
 
 
+def _template_prefix(template: str) -> str:
+    """The literal text a user template puts BEFORE the problem.
+
+    Derived by formatting, not by slicing the raw template, so ``\\boxed{{}}``
+    unescapes to ``\\boxed{}`` -- i.e. the exact bytes ``.format()`` would emit.
+    Returns "" for a template that is nothing but the placeholder
+    (``rewrite_problem_only``), which has no prefix to duplicate.
+    """
+    for placeholder in ("{problem}", "{question}"):
+        if placeholder in template:
+            head = template.split(placeholder, 1)[0]
+            try:
+                return head.format(problem="", question="")
+            except (KeyError, IndexError, ValueError):
+                return head
+    return ""
+
+
+def _has_prefix(problem: str, prefix: str) -> bool:
+    """Whether ``problem`` already opens with the template's prefix.
+
+    Exact match first, then a whitespace-insensitive comparison: the blank line
+    between the instruction and the question is the one part that tends to differ
+    between renderers, and ``\\n`` vs ``\\n\\n`` should not read as "absent".
+    """
+    if not prefix or not isinstance(problem, str):
+        return False
+    if problem.startswith(prefix):
+        return True
+    squeeze = " ".join(prefix.split())
+    return " ".join(problem.split()).startswith(squeeze) if squeeze else False
+
+
 def _split_target_content(content: str):
     """Split a target content string into (think, solution).
 
@@ -180,6 +213,14 @@ def process_data(
     target_mode="think_only",
 ):
     processed = []
+    # The prefix this template prepends. Rows whose problem already opens with it
+    # are left as they are, so re-running the script (or running it over data some
+    # other step already rendered) does not stack the instruction twice:
+    #   "Please reason step by step ...\n\nPlease reason step by step ...\n\n<problem>"
+    # That duplicate is not a crash and not visible in a row count -- it just
+    # silently trains on a malformed prompt.
+    prefix = _template_prefix(usr_prompt)
+    n_skipped_prefix = 0
 
     for item in dataset:
         prompt = item.get("prompt")
@@ -188,10 +229,15 @@ def process_data(
         if not problem:
             continue
 
-        try:
-            new_user_content = usr_prompt.format(problem=problem, question=problem)
-        except (KeyError, IndexError, ValueError):
-            continue
+        if _has_prefix(problem, prefix):
+            # Already prefixed: reuse the text verbatim rather than re-formatting.
+            new_user_content = problem
+            n_skipped_prefix += 1
+        else:
+            try:
+                new_user_content = usr_prompt.format(problem=problem, question=problem)
+            except (KeyError, IndexError, ValueError):
+                continue
 
         # Keep role names consistent with existing data format.
         new_prompt = [
@@ -209,6 +255,12 @@ def process_data(
         item["target"] = _rewrite_target_content(item.get("target"), target_mode)
 
         processed.append(item)
+
+    if n_skipped_prefix:
+        print(
+            f"{n_skipped_prefix} item(s) already began with the template prefix; "
+            f"kept their user text as-is instead of prepending it again."
+        )
 
     return processed
 
