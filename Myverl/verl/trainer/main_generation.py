@@ -99,6 +99,12 @@ def main_task(config):
     print(f"Output directory: {output_dir}")
     output_lst = [[] for _ in range(config.data.n_samples)]
     total_avg_score = 0.0
+    # Run-wide error breakdown, accumulated across batches so the final line does not
+    # depend on scrolling back through per-batch output.
+    total_correct = 0
+    total_answer_err = 0
+    total_format_err = 0
+    total_format_err_was_correct = 0
     start_step = config.get("start_step", 0)
     for batch_idx in tqdm(range(start_step, num_batch), desc="Generating Batches"):
     #for batch_idx in tqdm(range(num_batch), desc="Generating Batches"):
@@ -258,10 +264,21 @@ def main_task(config):
 
             #compute_score = math_select_rm_score_fn
 
+            # OmegaConf.select, not config.get: a Hydra config is struct mode, where reading
+            # an undefined key raises. generation.yaml does not define `algorithm`, so scripts
+            # that pass no +algorithm.trajectory_filter.* override have no such key at all.
+            tf_cfg = OmegaConf.select(config, "algorithm.trajectory_filter", default=None) or {}
+            tf_enable = bool(tf_cfg.get("enable", False))
+            if tf_enable:
+                from verl.custom.new_ray_trainer import _trajectory_filter_reject
+
             score_lst = []
             data_sources = batch_dataset[config.data.data_source_key]
             reward_dataset = batch_dataset[config.data.reward_model_key]
             responses_lst = batch_dataset["responses"]
+            n_correct = n_answer_err = n_format_err = 0
+            n_format_err_was_correct = 0
+            reason_counts = {}
             for i in range(len(batch_dataset)):
                 data_source = data_sources.iloc[i]
                 reward_data = reward_dataset.iloc[i]
@@ -269,11 +286,44 @@ def main_task(config):
                 ground_truth = reward_data["ground_truth"]
                 compute_score = math_select_rm_score_fn(data_source, reward_impl_version=config.reward_model.reward_impl_version)
                 score_per_response = [compute_score(solution_str=r, ground_truth=ground_truth) for r in responses]
-                score_lst.append({
+                entry = {
                     "scores_per_response": score_per_response,
                     "mean_score": np.mean(score_per_response),
                     "max_score": np.max(score_per_response),
-                })
+                }
+                if tf_enable:
+                    # Keep the answer-only verdict alongside: "right answer, broken format" is
+                    # the case worth seeing, and overwriting in place would hide it.
+                    raw = list(score_per_response)
+                    filtered = list(score_per_response)
+                    rejected = []
+                    for j, resp in enumerate(responses):
+                        reject, reason = _trajectory_filter_reject(resp, tf_cfg)
+                        rejected.append(bool(reject))
+                        # reward_impl_version=4 returns numpy bools, other versions return
+                        # floats, so both have to be read -- float(np.True_) works but a
+                        # bare `== 1.0` on a non-numeric would not.
+                        answer_ok = bool(raw[j]) if isinstance(raw[j], (bool, np.bool_)) else float(raw[j]) == 1.0
+                        if reject:
+                            filtered[j] = 0
+                            n_format_err += 1
+                            if answer_ok:
+                                n_format_err_was_correct += 1
+                            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+                        elif answer_ok:
+                            n_correct += 1
+                        else:
+                            n_answer_err += 1
+                    entry = {
+                        "scores_per_response": filtered,
+                        "mean_score": np.mean(filtered),
+                        "max_score": np.max(filtered),
+                        "raw_scores_per_response": raw,
+                        "raw_mean_score": np.mean(raw),
+                        "raw_max_score": np.max(raw),
+                        "format_rejected": rejected,
+                    }
+                score_lst.append(entry)
             batch_dataset["test_score"] = score_lst
             #打印当前批次的平均分数
             batch_mean_scores = [score["mean_score"] for score in score_lst]
@@ -283,6 +333,27 @@ def main_task(config):
             total_avg_score += batch_average_score
             print(f"Batch {batch_idx} average score: {batch_average_score}",flush=True)
             print(f"Batch {batch_idx} max score: {batch_average_max_score}",flush=True)
+            if tf_enable:
+                n_resp = n_correct + n_answer_err + n_format_err
+                total_correct += n_correct
+                total_answer_err += n_answer_err
+                total_format_err += n_format_err
+                total_format_err_was_correct += n_format_err_was_correct
+                raw_avg = np.mean([score["raw_mean_score"] for score in score_lst])
+                denom = max(1, n_resp)
+                print(
+                    f"Batch {batch_idx} breakdown of {n_resp} response(s): "
+                    f"correct={n_correct} ({n_correct / denom:.1%}), "
+                    f"answer_error={n_answer_err} ({n_answer_err / denom:.1%}), "
+                    f"format_error={n_format_err} ({n_format_err / denom:.1%}, of which "
+                    f"{n_format_err_was_correct} had a CORRECT answer)",
+                    flush=True,
+                )
+                print(
+                    f"Batch {batch_idx} traj_filter reasons={reason_counts or '{}'}; "
+                    f"avg score answer-only {raw_avg:.4f} -> with format check {batch_average_score:.4f}",
+                    flush=True,
+                )
         # 5. 将当前批次的结果保存到独立文件
         batch_output_filename = f"{batch_idx}.parquet"
         batch_output_path = os.path.join(output_dir, batch_output_filename)
@@ -294,6 +365,24 @@ def main_task(config):
     print("All batches have been processed and saved.")
     total_avg_score /= num_batch
     print(f"Total average score so far: {total_avg_score}")
+    # Run-wide split of the two failure kinds. The three counts are mutually exclusive and
+    # sum to the responses scored, so accuracy = correct / total and the remainder is
+    # attributable: a wrong answer, or a right answer thrown out on format.
+    n_total = total_correct + total_answer_err + total_format_err
+    if n_total:
+        denom = float(n_total)
+        print(
+            f"Total breakdown of {n_total} response(s): "
+            f"correct={total_correct} ({total_correct / denom:.2%}), "
+            f"answer_error={total_answer_err} ({total_answer_err / denom:.2%}), "
+            f"format_error={total_format_err} ({total_format_err / denom:.2%})"
+        )
+        print(
+            f"Of the {total_format_err} format error(s), {total_format_err_was_correct} had a "
+            f"CORRECT answer -- accuracy would read "
+            f"{(total_correct + total_format_err_was_correct) / denom:.2%} without the format "
+            f"check, vs {total_correct / denom:.2%} with it."
+        )
     # if config.is_eval == True:
     #     # evaluate if needed
     #     print("Start to evaluate generated results.")
