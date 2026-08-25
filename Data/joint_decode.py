@@ -251,6 +251,22 @@ def parse_args() -> argparse.Namespace:
                         "summarize/grpo scripts use (default: %(default)s)")
     p.add_argument("--no-score", action="store_true",
                    help="Skip scoring (no test_score column). Use when the reward fn is unavailable.")
+    p.add_argument("--traj-filter", action="store_true",
+                   help="Also screen each response's FORMAT, using the trainer's own rule "
+                        "(verl/custom/new_ray_trainer.py:_trajectory_filter_reject). math-verify "
+                        "only checks the answer, so a response that reaches the right number "
+                        "while degenerating into repeated noise otherwise scores as correct. A "
+                        "rejected response scores 0, and test_score gains raw_* (the answer-only "
+                        "verdict) plus format_rejected.")
+    p.add_argument("--traj-keywords", type=str, default=None,
+                   help="Comma-separated phrases that reject a response (citing material it was "
+                        "never given). Unset = the trainer's _DEFAULT_TRAJ_KEYWORDS. Pass an empty "
+                        "string to disable this category. These lists are the generation side's "
+                        "own; they do not affect training.")
+    p.add_argument("--traj-instruction-phrases", type=str, default=None,
+                   help="Comma-separated phrases that reject a response for restating an "
+                        "instruction instead of answering. Unset = the trainer's "
+                        "_DEFAULT_TRAJ_INSTR_PHRASES; empty string disables the category.")
     p.add_argument("--attn-impl", default="flash_attention_2",
                    choices=("flash_attention_2", "sdpa", "eager", "auto"),
                    help="Attention kernel. Defaults to flash_attention_2 and FAILS if it is "
@@ -583,20 +599,82 @@ def main() -> int:
         # already reaches Myverl -- the module-level insert for the decode core did it.
         from verl.custom.math_verify_reward import math_select_rm_score_fn
 
+        tf_cfg = None
+        if args.traj_filter:
+            # The RULE comes from the trainer so the matching logic lives in one place; the
+            # word lists are this script's own and do not reach training. Only keys the user
+            # actually set are put in the dict -- the filter reads cfg.get(key, default), so
+            # an unset key falls through to its default instead of pinning a copy of it.
+            from verl.custom.new_ray_trainer import _trajectory_filter_reject
+
+            tf_cfg = {}
+            if args.traj_keywords is not None:
+                tf_cfg["keywords"] = [w for w in args.traj_keywords.split(",") if w.strip()]
+            if args.traj_instruction_phrases is not None:
+                tf_cfg["instruction_phrases"] = [
+                    w for w in args.traj_instruction_phrases.split(",") if w.strip()
+                ]
+
         scores = []
+        n_resp = n_correct = n_answer_err = n_format_err = n_fmt_ok_ans = 0
+        reason_counts: dict[str, int] = {}
         for i in range(len(shard)):
             row = shard.iloc[i]
             score_fn = math_select_rm_score_fn(row["data_source"], reward_impl_version=args.reward_impl_version)
             ground_truth = row["reward_model"]["ground_truth"]
             per_response = [score_fn(solution_str=r, ground_truth=ground_truth) for r in row["responses"]]
+            if tf_cfg is None:
+                scores.append({
+                    "scores_per_response": per_response,
+                    "mean_score": float(np.mean(per_response)),
+                    "max_score": bool(np.max(per_response)),
+                })
+                continue
+            # Both lists are built as float rather than by assigning into per_response:
+            # reward_impl_version=4 returns numpy BOOLS, so writing a 0 in would leave the
+            # column mixing bool and int and Arrow rejects that at to_parquet time.
+            raw, filtered, rejected = [], [], []
+            for resp, score in zip(row["responses"], per_response):
+                reject, reason = _trajectory_filter_reject(resp, tf_cfg)
+                rejected.append(bool(reject))
+                try:
+                    fval = float(score)
+                except (TypeError, ValueError):
+                    fval = 0.0
+                answer_ok = fval == 1.0
+                raw.append(fval)
+                filtered.append(0.0 if reject else fval)
+                n_resp += 1
+                if reject:
+                    n_format_err += 1
+                    if answer_ok:
+                        n_fmt_ok_ans += 1
+                    reason_counts[reason] = reason_counts.get(reason, 0) + 1
+                elif answer_ok:
+                    n_correct += 1
+                else:
+                    n_answer_err += 1
             scores.append({
-                "scores_per_response": per_response,
-                "mean_score": float(np.mean(per_response)),
-                "max_score": bool(np.max(per_response)),
+                "scores_per_response": filtered,
+                "mean_score": float(np.mean(filtered)),
+                "max_score": bool(np.max(filtered)),
+                "raw_scores_per_response": raw,
+                "raw_mean_score": float(np.mean(raw)),
+                "raw_max_score": bool(np.max(raw)),
+                "format_rejected": rejected,
             })
         shard["test_score"] = scores
         print(f"[rank {rank}] mean_score={np.mean([s['mean_score'] for s in scores]):.4f} "
               f"pass@{args.n_samples}={np.mean([s['max_score'] for s in scores]):.4f}", flush=True)
+        if tf_cfg is not None and n_resp:
+            raw_avg = float(np.mean([s["raw_mean_score"] for s in scores]))
+            print(f"[rank {rank}] breakdown of {n_resp} response(s): "
+                  f"correct={n_correct} ({n_correct / n_resp:.1%}), "
+                  f"answer_error={n_answer_err} ({n_answer_err / n_resp:.1%}), "
+                  f"format_error={n_format_err} ({n_format_err / n_resp:.1%}, of which "
+                  f"{n_fmt_ok_ans} had a CORRECT answer); reasons={reason_counts or '{}'}; "
+                  f"mean_score answer-only {raw_avg:.4f} -> with format check "
+                  f"{np.mean([s['mean_score'] for s in scores]):.4f}", flush=True)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     out_path = args.output_dir / f"rank{rank}.parquet"
