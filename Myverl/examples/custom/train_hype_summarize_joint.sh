@@ -43,14 +43,18 @@ set -x
 # stores text and re-tokenises.
 #
 # WHAT IT COSTS. There is no paged attention and no CUDA graph here, and every token costs
-# two forward passes. Per step:
+# two forward passes. Each rank decodes all its rows in ONE wave, so per step:
 #
-#     ceil(W / (JOINT_BATCH * N_GPUS)) * MAX_NEW_TOKENS    sequential two-model forwards
+#     MAX_NEW_TOKENS    sequential two-model forwards
 #
-# W is data-dependent under 'wrong_only' -- it is how many questions the actor got entirely
-# wrong this step. That is why SUMMARIZE_REPLACE defaults to wrong_only here and why
-# MAX_QUESTIONS caps W: an uncapped step has no bound on its own duration. Whatever the cap
-# drops is logged (batch/sr_joint_dropped), never silently skipped.
+# JOINT_BATCH is ROWS PER RANK, so it does not change that -- it buys COVERAGE:
+#
+#     questions per step <= JOINT_BATCH * N_GPUS
+#
+# and it is what bounds the question count, because the split runs questions -> ranks. Under
+# 'wrong_only' the real count is however many questions the actor got entirely wrong this step,
+# so that product is an upper bound; a step with few failures simply decodes fewer rows.
+# Whatever the bound drops is logged (batch/sr_joint_dropped), never silently skipped.
 #
 # MEMORY -- this design assumes each GPU can hold a whole model TWICE. The actor's weights are
 # gathered once per step into an unsharded plain-HF mirror, and the decode runs against that;
@@ -177,20 +181,23 @@ AGREE_STUDENT_MIN_PROB=${AGREE_STUDENT_MIN_PROB:-0.0}
 #              student decoding. Also flips how fallback_frac should be read.
 AGREE_FALLBACK=${AGREE_FALLBACK:-teacher}
 
-# Rows decoded concurrently per rank. Bounded by memory, not by the question count: during
-# the decode the actor's params are unsharded and the teacher is resident, and both models'
-# KV caches grow with this times MAX_NEW_TOKENS.
-JOINT_BATCH=${JOINT_BATCH:-8}
+# ROWS PER RANK, and the only throughput knob. Each rank decodes all its rows in one wave, so
+# this does not change the step's duration -- it sets how many questions a step can cover:
+#
+#     questions per step <= JOINT_BATCH * N_GPUS
+#
+# 16 rows x 4 GPUs = up to 64 questions/step. Under wrong_only that is an upper bound; a step
+# where fewer questions failed decodes fewer rows.
+#
+# Bounded by memory: during the decode the actor's params are unsharded AND the teacher is
+# resident, and both models' KV caches grow with this times MAX_NEW_TOKENS.
+JOINT_BATCH=${JOINT_BATCH:-16}
 
 # Keep the teacher on CPU between steps and move it to GPU only while decoding. ~8GB over
 # PCIe per step for a 4B model, negligible against thousands of sequential decode steps, and
 # it leaves GPU_MEM_UTIL alone. Set False to keep it resident (no transfer, but then lower
 # GPU_MEM_UTIL to make room).
 TEACHER_OFFLOAD=${TEACHER_OFFLOAD:-True}
-
-# Hard cap on questions per step, applied AFTER wrong_only narrows the set. See the cost
-# formula in the header. 0 disables it, which is only safe if you have measured a step.
-MAX_QUESTIONS=${MAX_QUESTIONS:-16}
 
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-4096}
 
@@ -230,10 +237,10 @@ fi
 echo "=== GPUs                : $GPU_DEVICES ($N_GPUS, shared by rollout/train/joint)"
 echo "=== actor  = student    : $MODEL_PATH  [trained; chooses, short prompt, mem_util=$GPU_MEM_UTIL]"
 echo "=== teacher (frozen)    : $TEACHER_PATH  [constrains, long prompt, offload=$TEACHER_OFFLOAD]"
-echo "=== joint decode        : batch=$JOINT_BATCH, max_new=$MAX_NEW_TOKENS"
+echo "=== joint decode        : $JOINT_BATCH row(s)/rank, max_new=$MAX_NEW_TOKENS"
 echo "=== agreement           : student_top_k=$AGREE_STUDENT_TOP_K teacher_top_k=$AGREE_TEACHER_TOP_K"
 echo "                          teacher_min_prob=$AGREE_TEACHER_MIN_PROB fallback=$AGREE_FALLBACK"
-echo "=== questions/step       : <= $MAX_QUESTIONS ($SUMMARIZE_REPLACE)"
+echo "=== questions/step      : <= $((JOINT_BATCH * N_GPUS)) ($JOINT_BATCH x $N_GPUS, $SUMMARIZE_REPLACE)"
 
 python -m verl.trainer.main_ppo_new \
     +joint_decode.enable=True \
@@ -248,7 +255,6 @@ python -m verl.trainer.main_ppo_new \
     +joint_decode.temperature=$JOINT_TEMPERATURE \
     +joint_decode.max_new_tokens=$MAX_NEW_TOKENS \
     +joint_decode.batch_size=$JOINT_BATCH \
-    +joint_decode.max_questions_per_step=$MAX_QUESTIONS \
     +joint_decode.student_prompt=short \
     +joint_decode.teacher_prompt=long \
     algorithm.adv_estimator=grpo \

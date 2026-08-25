@@ -14,18 +14,25 @@
 # comes out of the framework untouched. What the sampler contributes is the one quantity no
 # later forward pass can recover: Z_t = p_t / mu_t, the token-level cost of the teacher's
 # constraint (mu_t being the truncated, renormalised distribution actually sampled from).
+#
 # It multiplies the off-policy term AFTER clipping:
 #
 #     L_off = -Z_t * min( r_t * A_t , clip(r_t, 1-eps, 1+eps) * A_t )
 #
-# Keeping Z_t OUTSIDE the ratio is the point. Folded in, a Z_t of 0.2 inflates the ratio
-# fivefold and saturates the clip on nearly every token -- discarding gradient for reasons
-# unrelated to how far the policy has moved, which is all the clip is meant to police.
+# Keeping Z_t OUTSIDE the ratio is the point: folded in, the clip would fire for reasons
+# unrelated to how far the policy has moved, which is all it is meant to police. That is the
+# 'clip_without_z' setting of actor_rollout_ref.actor.policy_loss.off_policy_reshape ('clip'
+# is the same thing). 'clip_with_z' folds Z_t into the denominator instead (r = pi_theta/mu_t,
+# the textbook IS ratio) so the clip sees it -- the A/B this knob exists for.
 #
 # THE CHECK: before the first optimizer step, numerator and denominator are the same model
 # under the same prompt at the same temperature, so actor/off_ratio on the off rows must sit
 # at 1.0, with Z_t reported separately as actor/off_z_mean. A frozen student would instead
 # add a model gap that widens as training proceeds -- silently decaying ESS.
+#
+# off_old_log_probs is never written on this path, and the swap that would overwrite the off
+# rows' denominator must not run -- old_log_probs is already correct. Asserted at the swap
+# site, since a placeholder column there would zero the denominator and pass every other guard.
 #
 # Runs on the reasoner's OWN GPUs, as a method on the actor worker
 # (NewActorRolloutRefWorker.generate_joint), after the rollout when vLLM is asleep. There is
@@ -132,7 +139,7 @@ top_k: -1
 # ---------------------------------------------------------------------------
 
 # Cap on generated tokens. The per-step cost is
-#   ceil(W / (batch_size * n_gpus)) * max_new_tokens
+#   ceil(W / n_gpus) * max_new_tokens
 # sequential two-model forwards, where W is the number of questions this step and n_gpus is
 # the reasoner's count (this shares its pool). There is no paged attention and no CUDA graph
 # here, so that product is the whole story.

@@ -1016,37 +1016,34 @@ class NewActorRolloutRefWorker(Worker, DistProfilerExtension):
         # actor. See _joint_student for why the alternatives do not work.
         student = self._joint_student(cfg)
 
-        micro = max(1, int(cfg.batch_size))
+        # All of this rank's rows in one decode. The rows are already a split: generate_joint
+        # is DP_COMPUTE_PROTO, so DataProto.chunk gave this rank W/world_size of the
+        # questions. joint_decode.batch_size is what that per-rank count is set against.
         n_narrow = 0
         try:
             with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
-                for begin in range(0, n_rows, micro):
-                    stop = min(begin + micro, n_rows)
-                    out_ids, out_len, fb_row, logp_row, z_row, log_z, narrow = joint_generate(
-                        student, teacher,
-                        {k: v[begin:stop] for k, v in student_batch.items()},
-                        {k: v[begin:stop] for k, v in teacher_batch.items()},
-                        eos_ids=eos_ids, pad_id=pad_id, args=cfg,
-                    )
-                    n_narrow += narrow
+                out_ids, out_len, fb_row, logp_row, z_row, log_z, n_narrow = joint_generate(
+                    student, teacher, student_batch, teacher_batch,
+                    eos_ids=eos_ids, pad_id=pad_id, args=cfg,
+                )
 
-                    # joint_generate returns only the columns it actually ran (it breaks
-                    # early once every row finished), and max_new_tokens may exceed the
-                    # trainer's width. Truncating is correct: a longer response cannot be
-                    # represented in the batch anyway.
-                    keep = min(out_ids.size(1), width)
-                    responses[begin:stop, :keep] = out_ids[:, :keep]
-                    off_log_z[begin:stop, :keep] = log_z[:, :keep]
-                    out_len = out_len.clamp(max=keep)
-                    lengths[begin:stop] = out_len
+                # joint_generate returns only the columns it actually ran (it breaks
+                # early once every row finished), and max_new_tokens may exceed the
+                # trainer's width. Truncating is correct: a longer response cannot be
+                # represented in the batch anyway.
+                keep = min(out_ids.size(1), width)
+                responses[:, :keep] = out_ids[:, :keep]
+                off_log_z[:, :keep] = log_z[:, :keep]
+                out_len = out_len.clamp(max=keep)
+                lengths[:] = out_len
 
-                    # 0 rather than NaN for an empty row: these go into a DataProto that
-                    # gets padded, chunked and concatenated, and a NaN would poison every
-                    # batch mean computed over it.
-                    denom = out_len.clamp(min=1).to(torch.float32)
-                    fallback_frac[begin:stop] = fb_row.to(torch.float32) / denom
-                    keep_ratio[begin:stop] = (z_row / denom.double()).to(torch.float32)
-                    student_logp[begin:stop] = (logp_row / denom.double()).to(torch.float32)
+                # 0 rather than NaN for an empty row: these go into a DataProto that
+                # gets padded, chunked and concatenated, and a NaN would poison every
+                # batch mean computed over it.
+                denom = out_len.clamp(min=1).to(torch.float32)
+                fallback_frac[:] = fb_row.to(torch.float32) / denom
+                keep_ratio[:] = (z_row / denom.double()).to(torch.float32)
+                student_logp[:] = (logp_row / denom.double()).to(torch.float32)
         finally:
             # The actor's own train()/eval() and gradient-checkpointing state are untouched by
             # this path -- the mirror is what decodes -- so there is nothing to restore there.

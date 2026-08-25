@@ -21,7 +21,8 @@ substituted for ``old_log_probs`` so the importance ratio picks it up:
 This path needs NO substitution. The student is the actor, so the density the candidate was
 sampled from is the actor's own -- which ``compute_log_prob`` already produces for the whole
 batch. ``ratio = pi_theta / p_t`` therefore comes out of the framework untouched, and
-``off_old_log_probs`` is deliberately NOT written here.
+``off_old_log_probs`` is deliberately NOT written here -- not even as a zero placeholder, since
+the swap site keys on the column's PRESENCE and would zero the off rows' denominator.
 
 What the sampler contributes instead is the one quantity no later forward pass can recover:
 
@@ -33,10 +34,10 @@ off-policy term by it AFTER clipping:
 
     L_off = -Z_t * min( r_t * A_t , clip(r_t, 1-eps, 1+eps) * A_t )
 
-Keeping Z_t OUTSIDE the ratio is the point. Folded in (which is what substituting mu_t for
-old_log_probs would do) a Z_t of 0.2 inflates the ratio fivefold and saturates the clip on
-nearly every token -- discarding gradient for reasons that have nothing to do with how far
-the policy has moved, which is the only thing the clip is meant to police.
+Keeping Z_t OUTSIDE the ratio is the point: folded in, the clip would fire for reasons that
+have nothing to do with how far the policy has moved, which is the only thing it is meant to
+police. ``off_policy_reshape='clip_with_z'`` selects the folded-in form (denominator = mu_t,
+the textbook IS ratio) for comparison; ``'clip_without_z'`` / ``'clip'`` is the form above.
 
 Two properties worth stating because they are what make this path auditable:
 
@@ -197,31 +198,45 @@ def generate(
     return cand_out, off_log_z
 
 
-def select_questions(all_q, max_questions_per_step, metrics):
-    """Cap the question count, and SAY what was dropped.
+def select_questions(all_q, batch_size, world_size, metrics):
+    """Cap the question count at what ``batch_size`` rows per rank can hold, and SAY what
+    was dropped.
 
-    The per-step cost is ``ceil(W / (batch_size * n_gpus)) * max_new_tokens`` sequential
-    two-model forwards, linear in W. W is data-dependent under ``wrong_only`` -- a step
-    where most rollouts failed sends far more questions here than a step where few did --
-    so an uncapped run has no bound on how long a single step takes.
+    ``batch_size`` is the per-rank row count -- the thing the user actually sets. It bounds
+    the question count rather than the other way round because the split runs in that
+    direction: ``generate_joint`` decodes every row it receives in one go, and the dispatch
+    hands each rank ``ceil(W / world_size)`` rows, so the only way to control rows-per-rank
+    is to bound W:
+
+        W <= batch_size * world_size
+
+    A cap is needed at all because the per-step cost is ``ceil(W / world_size) *
+    max_new_tokens`` sequential two-model forwards, linear in W, and W is data-dependent
+    under ``wrong_only`` -- a step where most rollouts failed would otherwise have no bound
+    on its duration.
+
+    Note the cap is an upper bound only. A step where just 6 questions failed gives 2 rows
+    per rank on 4 GPUs no matter how large ``batch_size`` is; it cannot manufacture rows.
 
     The cap is logged rather than applied quietly: a truncated set that reports nothing
     reads downstream exactly like full coverage, and ``sr_accepted`` would drop with no
     indication why.
     """
-    if not max_questions_per_step or len(all_q) <= max_questions_per_step:
+    cap = max(1, int(batch_size)) * max(1, int(world_size))
+    if len(all_q) <= cap:
         metrics["batch/sr_joint_dropped"] = 0
         return all_q
-    dropped = len(all_q) - max_questions_per_step
+    dropped = len(all_q) - cap
     metrics["batch/sr_joint_dropped"] = dropped
     # sr_target_questions was already recorded before the cap, so correct it here rather
     # than leaving a count that overstates what was actually decoded.
-    metrics["batch/sr_target_questions"] = max_questions_per_step
+    metrics["batch/sr_target_questions"] = cap
     print(
-        f"[joint_decode] {len(all_q)} questions this step, decoding the first "
-        f"{max_questions_per_step} and DROPPING {dropped}. Those questions get no "
-        f"replacement rollout this step (raise joint_decode.max_questions_per_step to "
-        f"cover them, at a proportional increase in step time).",
+        f"[joint_decode] {len(all_q)} questions this step, decoding the first {cap} "
+        f"(batch_size={batch_size} rows x {world_size} rank(s)) and DROPPING {dropped}. "
+        f"Those questions get no replacement rollout this step (raise "
+        f"joint_decode.batch_size to cover them, at a proportional increase in both step "
+        f"time and per-rank memory).",
         flush=True,
     )
-    return all_q[:max_questions_per_step]
+    return all_q[:cap]

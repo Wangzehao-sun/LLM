@@ -599,6 +599,16 @@ def compute_token_on_off_sft_loss(
             n_off_tok = off_clip_region.sum()
             if n_off_tok > 0:
                 off_ratio_scale = ((keep_mask * off_clip_region).sum() / n_off_tok).detach()
+        elif off_policy_reshape == "clip_with_z":
+            # Z_t 折进分母：off_ratio = π_θ/μ_t = Z_t·r_t，于是 clip 看到的是**含** Z_t 的比值
+            # （教科书 IS 比值）。'clip_without_z' / 'clip' 反之：off_ratio 不动，Z_t 在下面裁剪
+            # 之后当系数乘上。μ_t 在词表子集上重归一，故 Z_t ≤ 1 —— 折进去是把比值缩小，于是
+            # 负优势 token 更容易撞到 1−ε 的 pessimistic 下界而丢掉梯度。
+            # 在 log 空间相加、clamp 作用于和：先 exp 再乘会让 clamp 只管一半。
+            if off_log_z is not None:
+                off_ratio = torch.exp(
+                    torch.clamp(log_prob - old_log_prob + off_log_z.detach(), min=-20.0, max=20.0)
+                )
         elif off_policy_reshape == "p_div_p_0.1":
             # luffy 式软整形：off_ratio 的起始值取当前策略概率 prob = exp(log_prob)
             # （短 prompt 下），而非 IS ratio exp(lp_short - lp_long)，再做
@@ -649,19 +659,14 @@ def compute_token_on_off_sft_loss(
         #
         #     L_off = −Z_t · min( r_t·A_t , clip(r_t, 1−ε, 1+ε)·A_t )
         #
-        # 位置是重点。折进 ratio（即把分母换成 μ_t）在数学上只差一个因子，但 clip 是非线性的：
-        # Z_t 可以小到 0.2，那 ratio 被系统性放大五倍、几乎每个 token 都撞上 1+ε 的上界，丢掉
-        # 的梯度与"策略偏移多远"毫无关系 —— 而那是 clip 唯一该管的事。留在外面，clip 只看策略
-        # 偏移，Z_t 独立地当置信权重。
-        #
         # detach：Z_t 是采样时刻的历史量（由 joint_decode_core 逐 token 记下），不是 θ 的函数，
         # 不该有梯度回流。
         #
-        # 由**数据在不在**决定走不走这条路，不由 off_policy_reshape 的字符串决定：联合解码提供
-        # off_log_z，另两条候选来源不提供，所以它们的行为逐位不变，也不需要新的配置取值。
+        # 'clip_with_z' 已经把 Z_t 折进上面的 off_ratio，这里跳过，否则就成了 Z_t²。
         if off_log_z is not None:
             z_t = torch.exp(off_log_z).detach()
-            off_rl_losses = off_rl_losses * z_t
+            if off_policy_reshape == "clip_without_z":
+                off_rl_losses = off_rl_losses * z_t
             # 实际生效的 Z_t 均值（仅 off 区域）。与 batch/sr_joint_keep_ratio 对照：后者是
             # 采样时按 eligible mask 算的诊断量，fallback 步记 0；这里是真正乘进 loss 的值，
             # fallback 步是 p_student/p_teacher。两者在 fallback 率高时会分开。
