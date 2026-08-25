@@ -1,7 +1,7 @@
 set -x
 #!/usr/bin/env bash
 # GPU selection. Override with, for example: GPU_DEVICES=4,5,6,7
-GPU_DEVICES=${GPU_DEVICES:-${CUDA_VISIBLE_DEVICES:-0,1,2,3}}
+GPU_DEVICES=${GPU_DEVICES:-${CUDA_VISIBLE_DEVICES:-4,5,6,7}}
 
 export CUDA_VISIBLE_DEVICES=$GPU_DEVICES
 
@@ -39,11 +39,11 @@ export WANDB_MODE=offline
 # ---------------------------------------------------------------------------
 
 # Where train_sft.sh wrote the checkpoints (its trainer.default_local_dir).
-#CKPT_DIR=${CKPT_DIR:-"/home/data/zhwang_logs/sft_4b/train_sft_rephraser_Qwen3-4B-Instruct_expert_rephrase_rollout_sft/sft_0812_1e5/ckpt"}
+CKPT_DIR=${CKPT_DIR:-}
 # Evaluate this model too -- use it for the untrained baseline, which is what makes
 # the SFT numbers interpretable.
-BASE_MODEL=${BASE_MODEL:-}
-EVAL_PATH=${EVAL_PATH:-$HOME/LLM/Data/sft/rephrase_eval_flat.parquet}
+BASE_MODEL=${BASE_MODEL:-"/home/data/shared/Qwen3-4B-Instruct"}
+EVAL_PATH=${EVAL_PATH:-$HOME/LLM/Data/openr1/openr1_hard_mix64_restore_solonly_train_val128_flat.parquet}
 
 # Comma-separated global_step numbers to evaluate; empty = every checkpoint found.
 STEPS=${STEPS:-}
@@ -54,12 +54,12 @@ MODEL_NAME=${MODEL_NAME:-}
 # Which prompt column to evaluate. prepare_rephrase_eval.py writes both:
 #   prompt          -> the rephrase task (question + expert-reasoning draft)
 #   question_prompt -> the bare question, i.e. plain problem-solving ability
-PROMPT_KEY=${PROMPT_KEY:-prompt}
+PROMPT_KEY=${PROMPT_KEY:-question_prompt}
 
 N_SAMPLES=${N_SAMPLES:-4}          # samples per question; >1 to see sampling variance
 TEMPERATURE=${TEMPERATURE:-0.7}
 TOP_P=${TOP_P:-0.8}
-PROMPT_LENGTH=${PROMPT_LENGTH:-8192}     # rephrase prompts carry a draft, so longer than a bare question
+PROMPT_LENGTH=${PROMPT_LENGTH:-4086}     # rephrase prompts carry a draft, so longer than a bare question
 RESPONSE_LENGTH=${RESPONSE_LENGTH:-10240}
 BATCH_SIZE=${BATCH_SIZE:-256}
 MAX_STEPS=${MAX_STEPS:-1000}       # batch cap inside main_generation
@@ -228,3 +228,5 @@ done
 echo
 echo "=== sweep summary ($SUMMARY) ==="
 column -t "$SUMMARY" 2>/dev/null || cat "$SUMMARY"
+
+bash ~/LLM/Inferapi/api.sh
