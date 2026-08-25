@@ -83,7 +83,7 @@ export TOKENIZERS_PARALLELISM=true
 # The model being steered, and the model mixed into it.
 MODEL_A=${MODEL_A:-"/home/data/shared/Qwen3-4b-base"}
 MODEL_B=${MODEL_B:-"/home/data/shared/Qwen3-4B-Instruct"}
-EVAL_PATH=${EVAL_PATH:-$HOME/LLM/Data/deepmath/prefill15_guidance.parquet}
+EVAL_PATH=${EVAL_PATH:-$HOME/LLM/Data/openr1/openr1_hard_mix64_restore_solonly_train_val128_flat.parquet}
 
 # Fusion weights on model B, one run each. 0 must stay in the list (see header).
 # Ignored when FUSE=agree, which sweeps AGREE_TEACHER_MIN_PROBS instead.
