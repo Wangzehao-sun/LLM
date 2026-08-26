@@ -524,14 +524,37 @@ class NewRayPPOTrainer(RayPPOTrainer):
                 "question."
             )
 
-        # K is forced to 1 (one joint decode per question), so a configured K>1 is a
-        # setting that silently does nothing.
+        # K here is decided per step by joint_sr.resolve_k from the question count, not by
+        # rollout.summarize_replace_k -- the point is to fill spare rows, which only the step
+        # itself knows about. Use joint_decode.max_k / target_rows instead.
         k = int(rollout_cfg.get("summarize_replace_k", 1))
         if k > 1:
             print(
-                f"[joint_decode] summarize_replace_k={k} is ignored: this path decodes ONE "
-                f"candidate per question. Generating K would multiply an already expensive "
-                f"step by K."
+                f"[joint_decode] rollout.summarize_replace_k={k} is ignored on this path: the "
+                f"candidate count is derived per step from how many questions failed, capped "
+                f"by joint_decode.max_k (currently "
+                f"{joint_cfg.get('max_k', 1)}). Set that instead."
+            )
+        max_k = int(joint_cfg.get("max_k", 1))
+        target_rows = int(joint_cfg.get("target_rows", 0))
+        batch = max(1, int(joint_cfg.get("batch_size", 8)))
+        n_gpus_jd = max(1, int(self.config.trainer.n_gpus_per_node))
+        if max_k > 1:
+            budget = batch * n_gpus_jd
+            aim = min(target_rows, budget) if target_rows > 0 else budget
+            print(
+                f"[joint_decode] max_k={max_k}: a step with few failed questions decodes up to "
+                f"{max_k} candidates each, aiming for {aim} row(s) "
+                f"({'target_rows' if target_rows > 0 else 'batch_size x n_gpus'}). The decode is "
+                f"bandwidth-bound, so spare rows are nearly free -- but K>1 also shrinks the "
+                f"question cap to {aim}//K, so a busy step covers fewer questions. K falls back "
+                f"to 1 whenever questions >= rows, leaving those steps unchanged."
+            )
+        if target_rows > 0 and target_rows > batch * n_gpus_jd:
+            print(
+                f"[joint_decode] target_rows={target_rows} exceeds batch_size x n_gpus = "
+                f"{batch * n_gpus_jd} and is clamped to it; raise batch_size to actually decode "
+                f"more rows per step."
             )
 
         # A temperature mismatch is the one error here that produces no symptom other than
@@ -1798,30 +1821,40 @@ class NewRayPPOTrainer(RayPPOTrainer):
             K = 1
         # 联合解码：候选由**正在训练的 actor**（student，选词）与一个冻结 teacher（约束方向）
         # 逐 token 融合产出，密度在采样时就一并记下，所以下面第 4 步的 compute_log_prob 可以
-        # 整段跳过。与离线模式同理压成 K=1：一题只解一条，K>1 会让行数对不上。
+        # 整段跳过。
         #
         # 跑在 actor 自己的 worker 上（generate_joint），不是独立池：student 就是 actor，
         # 只有持有它 FSDP 模块的那个进程能逐 token 拿到它的 logits。
         #
-        # 题数上限必须在 W 之前应用：每步成本与 W 成正比（无 paged attention、每 token 两次
+        # 题数上限必须在 W 之前应用：每步成本与行数成正比（无 paged attention、每 token 两次
         # forward），而 wrong_only 下 W 是"本步答错了几道"这个数据决定的量。
         #
         # 上限由 joint_decode.batch_size 定，它的含义是**每 rank 解多少行**。generate_joint
         # 把收到的行一次解完（不再二次切分），而 joint_sr 按 world_size 切，所以每 rank 的
-        # 行数就是 ceil(W / world_size) —— 要控制它，就得反过来用 batch_size 定 W：
+        # 行数就是 ceil(W*K / world_size) —— 要控制它，就得反过来用 batch_size 定 W*K：
         #
-        #     W <= batch_size * world_size
+        #     W * K <= batch_size * world_size
         #
-        # 注意这只能是**上界**：wrong_only 下某步只错了 6 题，那每 rank 就 2 行，batch_size
-        # 设多大也变不出行来。
+        # 注意这只能是**上界**：wrong_only 下某步只错了 6 题，batch_size 设多大也变不出题来。
+        #
+        # K 是每题解几条候选。解码是带宽瓶颈——每步都要把两个模型的权重从 HBM 流一遍，与
+        # 行数几乎无关，所以 batch 16 和 32 的每步耗时相近。于是题数少于行预算时，空着的槽位
+        # 是免费的：多解几条能提高"至少一条既正确又格式合法"的概率，也就是 sr_accepted。
+        # 题数 >= 预算时 K 退回 1，行为与原来逐字一致。
         if sr_joint:
-            K = 1
-            all_q = joint_sr.select_questions(
-                all_q,
-                int(self.config.joint_decode.get('batch_size', 8)),
-                self.actor_rollout_wg.world_size,
-                metrics,
+            jd_batch = int(self.config.joint_decode.get('batch_size', 8))
+            jd_world = self.actor_rollout_wg.world_size
+            # K 先按**未截断**的题数算：题数超预算时它自然得 1，随后 select_questions 再按
+            # K=1 截断。反过来（先截断再算 K）会用截断后的题数把 K 算大，那正是行预算已经
+            # 满了的时候，反而超发。
+            K = joint_sr.resolve_k(
+                len(all_q), jd_batch, jd_world,
+                target_rows=int(self.config.joint_decode.get('target_rows', 0)),
+                max_k=int(self.config.joint_decode.get('max_k', 1)),
             )
+            all_q = joint_sr.select_questions(all_q, jd_batch, jd_world, metrics, k_per_question=K)
+            metrics['batch/sr_joint_k'] = K
+            metrics['batch/sr_joint_rows'] = len(all_q) * K
         W = len(all_q)
         # 展平成 [W*K, L_long]：行 r = w_idx*K + k -> 第 all_q[w_idx] 题的第 k 条候选。
         long_rows = []
@@ -1877,7 +1910,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
                     meta_info=cand_gen.meta_info,
                     metrics=metrics,
                 )
-            cand_resp = cand_out.batch['responses']               # [W, w]
+            cand_resp = cand_out.batch['responses']               # [W*K, w]
             sr_missing = None
         # 离线 SR：候选取自数据集列，不 generate。
         elif sr_offline:
@@ -2078,9 +2111,11 @@ class NewRayPPOTrainer(RayPPOTrainer):
         # 序列，成本接近整轮 rollout），故未实现。**离线模式下 K=1，本选择逻辑无事可做
         # （候选已在离线挑好），建议保持默认 'shortest'。**
         #
-        # 联合解码也是 K=1（一题只解一条），所以同样无事可做；而且这条路不算候选密度，
-        # cand_log_prob 是 None。给零分让 select='logp' 退化成"取唯一那条"，与 'shortest'
-        # 同结果 —— 而不是在这里崩。
+        # 联合解码不算候选密度（cand_log_prob 是 None），给零分让 select='logp' 不至于崩。
+        # 但 K>1 时 W*K 行分数全为 0，'logp' 的 `s > best_score` 只会命中第一条合格候选，
+        # 于是退化成 'shortest'。这条路要在多候选里挑，用 'shortest'（第一条合格）或
+        # 'longest'（最后一条合格）—— 二者在 K_data=1 时只是"取哪一条采样"，因为 K 条用的是
+        # 同一个 summarize prompt，靠采样随机性区分，没有"prefix 更长"之说。
         cand_valid = (cand_resp != pad_token_id).float()            # [W*K, w]
         if cand_log_prob is None:
             cand_logp_mean = torch.zeros(cand_resp.size(0), device=cand_resp.device)

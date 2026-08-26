@@ -161,6 +161,29 @@ batch_size: 16
 # here and is not viable at these lengths.
 max_questions_per_step: 0
 
+# Candidates per question, as an UPPER bound. 1 (default) keeps the old behaviour exactly.
+#
+# The decode is bandwidth-bound: every step streams both models' weights from HBM whatever
+# the row count, so a batch of 16 costs about what 32 does. A step where only 20 questions
+# failed therefore leaves most rows idle, and filling them with extra candidates is nearly
+# free -- more shots at one that is both correct and format-valid, which is what
+# batch/sr_accepted measures.
+#
+# K is derived per step as target_rows // n_questions, clamped to [1, max_k], so it is >1
+# only when questions are scarce. The trade-off when it does apply: the question cap becomes
+# target_rows // K, so a busy step covers proportionally fewer questions -- which is why this
+# defaults to 1 rather than to the row budget.
+#
+# Watch batch/sr_joint_k (the K actually used) and batch/sr_joint_rows (W*K).
+max_k: 1
+
+# Rows to aim for when deriving K. 0 = batch_size * n_gpus, the whole budget. Clamped to that
+# budget in any case, since it cannot decode rows the GPUs cannot hold.
+#
+# Set it BELOW the budget to cap the extra candidates: with batch_size=16 on 4 GPUs the budget
+# is 64, so target_rows=32 means a 16-question step gets K=2 rather than K=4.
+target_rows: 0
+
 # auto tries flash_attention_2, then sdpa, then eager, and says which it got. Pin it to
 # fail loudly instead if a specific backend is required.
 attn_impl: auto
