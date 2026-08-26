@@ -107,7 +107,7 @@ def generate(
         denominator needs no substitution on this path.
     """
     device = student_prompts.device
-    n_questions = student_prompts.size(0)
+    n_rows = student_prompts.size(0)
 
     student_attn, _ = make_masks(student_prompts, pad_token_id, attention_mask_dtype)
     teacher_attn, _ = make_masks(teacher_prompts, pad_token_id, attention_mask_dtype)
@@ -139,9 +139,10 @@ def generate(
     lengths = reply.batch["response_lengths"].to(device)
 
     # The padded rows were real decodes of duplicated prompts; dropping them is what
-    # unpad_dataproto just did. What is left must match the questions we asked about.
-    assert cand_resp.size(0) == n_questions, (
-        f"joint decoder returned {cand_resp.size(0)} rows for {n_questions} questions"
+    # unpad_dataproto just did. What is left must match the rows we asked about -- W*K when
+    # the caller asked for K candidates per question.
+    assert cand_resp.size(0) == n_rows, (
+        f"joint decoder returned {cand_resp.size(0)} rows for {n_rows} requested"
     )
     assert off_log_z.shape == cand_resp.shape, (
         f"log Z_t {tuple(off_log_z.shape)} does not align with tokens "
@@ -198,31 +199,39 @@ def generate(
     return cand_out, off_log_z
 
 
-def select_questions(all_q, batch_size, world_size, metrics):
+def select_questions(all_q, batch_size, world_size, metrics, k_per_question=1):
     """Cap the question count at what ``batch_size`` rows per rank can hold, and SAY what
     was dropped.
 
     ``batch_size`` is the per-rank row count -- the thing the user actually sets. It bounds
     the question count rather than the other way round because the split runs in that
     direction: ``generate_joint`` decodes every row it receives in one go, and the dispatch
-    hands each rank ``ceil(W / world_size)`` rows, so the only way to control rows-per-rank
-    is to bound W:
+    hands each rank ``ceil(W * K / world_size)`` rows, so the only way to control
+    rows-per-rank is to bound W:
 
-        W <= batch_size * world_size
+        W * K <= batch_size * world_size
 
-    A cap is needed at all because the per-step cost is ``ceil(W / world_size) *
-    max_new_tokens`` sequential two-model forwards, linear in W, and W is data-dependent
-    under ``wrong_only`` -- a step where most rollouts failed would otherwise have no bound
-    on its duration.
+    ``k_per_question`` is how many candidates each question gets, so the question cap
+    shrinks proportionally: asking for 2 candidates halves how many questions fit.
 
-    Note the cap is an upper bound only. A step where just 6 questions failed gives 2 rows
-    per rank on 4 GPUs no matter how large ``batch_size`` is; it cannot manufacture rows.
+    A cap is needed at all because the per-step cost is ``ceil(W * K / world_size) *
+    max_new_tokens`` sequential two-model forwards, linear in the row count, and W is
+    data-dependent under ``wrong_only`` -- a step where most rollouts failed would
+    otherwise have no bound on its duration.
+
+    Note the cap is an upper bound only. A step where just 6 questions failed gives
+    ceil(6*K / world_size) rows per rank no matter how large ``batch_size`` is; it cannot
+    manufacture questions.
 
     The cap is logged rather than applied quietly: a truncated set that reports nothing
     reads downstream exactly like full coverage, and ``sr_accepted`` would drop with no
     indication why.
     """
-    cap = max(1, int(batch_size)) * max(1, int(world_size))
+    k = max(1, int(k_per_question))
+    rows = max(1, int(batch_size)) * max(1, int(world_size))
+    # At least one question even if K exceeds the whole row budget -- returning an empty
+    # list would silently disable SR for the step rather than decode something.
+    cap = max(1, rows // k)
     if len(all_q) <= cap:
         metrics["batch/sr_joint_dropped"] = 0
         return all_q
@@ -233,10 +242,35 @@ def select_questions(all_q, batch_size, world_size, metrics):
     metrics["batch/sr_target_questions"] = cap
     print(
         f"[joint_decode] {len(all_q)} questions this step, decoding the first {cap} "
-        f"(batch_size={batch_size} rows x {world_size} rank(s)) and DROPPING {dropped}. "
-        f"Those questions get no replacement rollout this step (raise "
-        f"joint_decode.batch_size to cover them, at a proportional increase in both step "
-        f"time and per-rank memory).",
+        f"x {k} candidate(s) = {cap * k} row(s) (batch_size={batch_size} rows x "
+        f"{world_size} rank(s)) and DROPPING {dropped} question(s). Those get no "
+        f"replacement rollout this step (raise joint_decode.batch_size, or lower "
+        f"joint_decode.target_rows so K drops to 1, to cover them).",
         flush=True,
     )
     return all_q[:cap]
+
+
+def resolve_k(n_questions, batch_size, world_size, target_rows=0, max_k=1):
+    """How many candidates per question to decode, so the batch is not left half empty.
+
+    The decode is bandwidth-bound: every step streams both models' weights from HBM
+    regardless of how many rows ride along, so a batch of 16 costs about what a batch of 32
+    does. When a step has fewer failed questions than the row budget, the spare slots are
+    free -- decoding K candidates each raises the chance that one is both correct and
+    format-valid, which is what ``sr_accepted`` measures.
+
+    ``target_rows`` is the row count to aim for (0 = the whole budget,
+    ``batch_size * world_size``). K is then ``target_rows // n_questions``, clamped to
+    ``[1, max_k]``.
+
+    Returns 1 whenever there are at least as many questions as rows, so a busy step behaves
+    exactly as before and the extra candidates only appear when they cost nothing.
+    """
+    budget = max(1, int(batch_size)) * max(1, int(world_size))
+    target = int(target_rows) if target_rows and int(target_rows) > 0 else budget
+    # Never aim past what the GPUs can actually hold, however target_rows was set.
+    target = min(target, budget)
+    n_q = max(1, int(n_questions))
+    return max(1, min(int(max_k), target // n_q))
+
