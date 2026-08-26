@@ -236,6 +236,15 @@ def parse_args() -> argparse.Namespace:
                         "fallback rate means -- teacher decoding in the first case, student "
                         "decoding in the second (default: %(default)s)")
     p.add_argument("--n-samples", type=int, default=1, help="Samples per question (default: %(default)s)")
+    p.add_argument("--target-rows", type=int, default=0,
+                   help="Total decoded rows to aim for, over the WHOLE input (0 = off). When set, "
+                        "--n-samples is derived as target_rows // n_questions and clamped to at "
+                        "least 1, so a small eval set is sampled more times instead of leaving "
+                        "the run short. Capped by --max-n-samples. Each extra sample is another "
+                        "full pass over the shard, so this trades wall-clock for a tighter "
+                        "pass@k -- it does not fill spare slots (the batch is already full).")
+    p.add_argument("--max-n-samples", type=int, default=8,
+                   help="Ceiling for the --target-rows derivation (default: %(default)s)")
     p.add_argument("--temperature", type=float, default=0.6, help="0 == greedy (default: %(default)s)")
     p.add_argument("--top-p", type=float, default=0.95)
     p.add_argument("--top-k", type=int, default=-1, help="<=0 disables top-k (default: %(default)s)")
@@ -290,9 +299,6 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    if args.temperature == 0.0 and args.n_samples > 1:
-        print(f"[warn] --temperature 0 is deterministic, so --n-samples {args.n_samples} "
-              f"just repeats identical work", file=sys.stderr)
     if args.fuse == "agree":
         # Resolve the per-side k's here rather than at each use, so the rest of the run
         # (including the log lines) sees the values actually in force.
@@ -347,6 +353,21 @@ def main() -> int:
     df = pd.read_parquet(args.input)
     if args.limit:
         df = df.iloc[: args.limit]
+    # Derived AFTER --limit, since that is what sets the question count, and from the whole
+    # input rather than this rank's shard so every rank agrees on n_samples -- they each
+    # write their own parquet, and a disagreement would make pass@k differ by shard.
+    if args.target_rows and args.target_rows > 0:
+        derived = max(1, min(int(args.max_n_samples), int(args.target_rows) // max(1, len(df))))
+        if derived != args.n_samples:
+            if rank == 0:
+                print(f"[data] --target-rows {args.target_rows} over {len(df):,} question(s) "
+                      f"-> --n-samples {derived} (was {args.n_samples}, capped at "
+                      f"{args.max_n_samples}); {len(df) * derived:,} row(s) total", flush=True)
+            args.n_samples = derived
+    # Checked after the derivation, so a value target_rows produced is warned about too.
+    if args.temperature == 0.0 and args.n_samples > 1:
+        print(f"[warn] --temperature 0 is deterministic, so --n-samples {args.n_samples} "
+              f"just repeats identical work", file=sys.stderr)
     prompt_key_b = args.prompt_key_b or args.prompt_key
     for key in {args.prompt_key, prompt_key_b}:
         if key not in df.columns:
