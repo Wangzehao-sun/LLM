@@ -2171,6 +2171,53 @@ class NewRayPPOTrainer(RayPPOTrainer):
         )
         return gen_batch_output
 
+    def _validate(self) -> dict:
+        """Stock ``_validate`` plus an exact pass@k.
+
+        verl reports ``best@k/mean``, a bootstrap estimate ("sample k with replacement,
+        how often is there a hit"), which sits systematically below the pass@k usually
+        quoted in papers ("did any of the k succeed"). Both are wanted, so this adds the
+        latter without touching the former.
+
+        Implemented by intercepting ``process_validation_metrics`` for the duration of the
+        call instead of copying the 115-line parent: that function already receives exactly
+        the three arrays needed (data_sources, sample_inputs, per-response scores), and
+        re-deriving them here would mean duplicating the whole generate/score loop and
+        keeping it in step with upstream.
+        """
+        from verl.trainer.ppo import ray_trainer as _rt
+
+        from .new_metrics import compute_exact_pass_at_k
+
+        captured: dict = {}
+        original = _rt.process_validation_metrics
+
+        def _capture(data_sources, sample_inputs, infos_dict, *args, **kwargs):
+            # 'acc' when the reward manager provides it, else 'reward' -- the same choice
+            # the parent makes for core_var, so pass@k scores the same quantity as
+            # best@k rather than a different column.
+            key = "acc" if "acc" in infos_dict else "reward"
+            scores = infos_dict.get(key)
+            if scores is not None:
+                captured.update(
+                    compute_exact_pass_at_k(data_sources, sample_inputs, scores)
+                )
+            return original(data_sources, sample_inputs, infos_dict, *args, **kwargs)
+
+        _rt.process_validation_metrics = _capture
+        try:
+            metric_dict = super()._validate()
+        finally:
+            # Restored even on failure: leaving the patch in place would corrupt every
+            # later validation, and the module object is process-global.
+            _rt.process_validation_metrics = original
+
+        for data_source, metrics in captured.items():
+            for name, value in metrics.items():
+                section = "val-core" if name.startswith("pass@") else "val-aux"
+                metric_dict[f"{section}/{data_source}/acc/{name}"] = value
+        return metric_dict
+
     @torch.no_grad()
     def _validate_summarize(self) -> dict:
         """固定 summarize-val 子集上的 rephraser 准确率（口径 A：单一整体均值）。
