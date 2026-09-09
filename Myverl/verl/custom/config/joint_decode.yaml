@@ -168,14 +168,14 @@ top_k: -1
 # sequential two-model forwards, where W is the number of questions this step and n_gpus is
 # the reasoner's count (this shares its pool). There is no paged attention and no CUDA graph
 # here, so that product is the whole story.
-max_new_tokens: 8192
+max_new_tokens: 5120
 
 # Rows decoded concurrently per rank. Bounded by memory, not by the question count. What
 # binds: the actor's params are UNSHARDED for the duration (summon_full_params(recurse=True)
 # -- which is what keeps the per-token cost off the interconnect, see joint_decode_core.py),
 # the teacher sits alongside, and both models' KV caches grow with this number times
 # max_new_tokens.
-batch_size: 16
+batch_size: 32
 
 # Hard cap on questions per step, applied AFTER wrong_only narrows the set. This exists
 # because the cost above is linear in W and W is data-dependent -- a step where most
@@ -200,7 +200,7 @@ max_questions_per_step: 0
 # defaults to 1 rather than to the row budget.
 #
 # Watch batch/sr_joint_k (the K actually used) and batch/sr_joint_rows (W*K).
-max_k: 1
+max_k: 4
 
 # Rows to aim for when deriving K. 0 = batch_size * n_gpus, the whole budget. Clamped to that
 # budget in any case, since it cannot decode rows the GPUs cannot hold.
