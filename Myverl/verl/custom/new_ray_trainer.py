@@ -3455,8 +3455,12 @@ class NewRayPPOTrainer(RayPPOTrainer):
                             # normal-step（非 recycle）：含 off 注入行的组。
                             # mask_off_inject_group=True 时，把整组（on-policy 行 + off 注入行）
                             # 的 loss 全部 mask 掉——该 group 完全不参与训练。默认 False 保持旧行为。
-                            # 依赖 off_policy_masking=True（本 if 块的进入条件）。
-                            if self.config.actor_rollout_ref.actor.policy_loss.get('mask_off_inject_group', False):
+                            # 'on_only'：只 mask on-policy 行，保留 off 注入行（wrong_only 下这些
+                            # on-policy 行就是全错的负样本）。依赖 off_policy_masking=True。
+                            _mask_inject = self.config.actor_rollout_ref.actor.policy_loss.get('mask_off_inject_group', False)
+                            if _mask_inject == 'on_only':
+                                reward_mask[uid_mask & (~off_policy_mask_np), :] = False
+                            elif _mask_inject:
                                 reward_mask[uid_mask, :] = False
                             elif self.config.actor_rollout_ref.actor.policy_loss.loss_mode in ['luffy','se']:
 
