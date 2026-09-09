@@ -79,6 +79,49 @@ def fuse_logits(logits_a: torch.Tensor, logits_b: torch.Tensor, mode: str, weigh
     raise ValueError(f"unknown fuse mode {mode!r}")
 
 
+def _teacher_set_for_z(
+    log_pa: torch.Tensor,
+    log_pb: torch.Tensor,
+    student_ok: torch.Tensor,
+    *,
+    min_top_k: int,
+    max_top_k: int,
+    target_z: float,
+) -> torch.Tensor:
+    """The teacher's allowed set as the SHORTEST prefix of its ranking that leaves
+    ``target_z`` of the student's mass standing.
+
+    A fixed ``teacher_top_k`` fixes the WIDTH and lets Z_t fall where it may, so the
+    constraint's real strength swings token by token: where the models agree, 10 ranks
+    keep almost all the student's mass, and where they disagree the same 10 keep nearly
+    none -- which is where fallbacks fire and where Z_t drives the off-policy term to
+    zero. Targeting Z_t inverts that: the set widens only at the tokens that need it.
+
+    ``teacher_min_prob`` plays no part here. A probability floor caps Z_t from above, so
+    the two would fight and the target would be silently unreachable.
+
+    Z_t may still land below the target when even ``max_top_k`` ranks are not enough --
+    the set cannot grow past the cap, and an empty one still falls back.
+    """
+    vocab = log_pb.size(-1)
+    cap = min(max(int(max_top_k), int(min_top_k), 1), vocab)
+    order = log_pb.topk(cap, dim=-1).indices
+
+    # Student mass at each teacher rank, zeroed where the STUDENT itself rejects the
+    # token, so the cumsum IS Z_t as a function of k.
+    mass = log_pa.gather(-1, order).exp() * student_ok.gather(-1, order).to(log_pa.dtype)
+    reached = mass.cumsum(dim=-1) >= target_z
+    # cumsum is nondecreasing, so `reached` is a run of False then a run of True and the
+    # False count IS the first True index -- exact, unlike argmax over ties. All-False
+    # gives cap + 1, which the clamp pulls back to the cap.
+    k = ((~reached).sum(dim=-1) + 1).clamp(min=min(int(min_top_k), cap), max=cap)
+
+    ranks = torch.arange(cap, device=log_pb.device).unsqueeze(0)
+    allowed = torch.zeros_like(log_pb, dtype=torch.bool)
+    allowed.scatter_(-1, order, ranks < k.unsqueeze(-1))
+    return allowed
+
+
 def agree_select(
     logits_a: torch.Tensor,
     logits_b: torch.Tensor,
@@ -90,6 +133,9 @@ def agree_select(
     temperature: float,
     top_p: float,
     fallback: str = "teacher",
+    dynamic_top_k: bool = False,
+    target_z: float = 0.5,
+    dynamic_max_top_k: int = 200,
     narrow_counter: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Let the teacher constrain the direction and the student pick within it.
@@ -128,6 +174,12 @@ def agree_select(
     with each fallback and ``n_samples > 1`` would stop meaning anything.
     ``temperature == 0`` still gives greedy behaviour on both paths.
 
+    ``dynamic_top_k`` replaces the teacher's FIXED k with the smallest k that leaves
+    ``target_z`` of the student's mass standing, capped at ``dynamic_max_top_k``. It
+    controls the constraint by its effect (Z_t) instead of by its width, so the set
+    widens only where the two models disagree. ``teacher_min_prob`` is then ignored --
+    see ``_teacher_set_for_z``.
+
     Returns (token ids [B, 1], fell_back [B] bool, log_pa [B, vocab], z_t [B],
     log_q [B]) so the caller can report how often the agreement actually bound
     anything, reuse the student's log-probs, track how much student mass survived the
@@ -140,28 +192,32 @@ def agree_select(
     log_pb = F.log_softmax(logits_b.float(), dim=-1)
     vocab = log_pa.size(-1)
 
-    # Membership masks over the FULL vocab, so the intersection is a plain AND
-    # rather than a set-of-ids comparison (which would need a loop per row).
-    # The two k's are separate because the roles are: the teacher's sets how much of
-    # the vocabulary it is willing to permit at all, while the student's sets how far
-    # down its own ranking it is willing to look for something permitted. Raising only
-    # the student's therefore lets it reach further for an agreed token instead of
-    # falling back, without widening what the teacher allows.
-    in_a = torch.zeros_like(log_pa, dtype=torch.bool)
-    in_b = torch.zeros_like(log_pb, dtype=torch.bool)
-    in_a.scatter_(-1, log_pa.topk(min(student_top_k, vocab), dim=-1).indices, True)
-    in_b.scatter_(-1, log_pb.topk(min(teacher_top_k, vocab), dim=-1).indices, True)
-
     # Compare in log space; a floor of 0 becomes -inf, which every finite log-prob
     # clears, so it disables that side's threshold.
     def _floor(value: float) -> torch.Tensor:
         return torch.log(torch.tensor(value, device=log_pa.device, dtype=log_pa.dtype))
 
-    eligible = (
-        in_a & in_b
-        & (log_pa >= _floor(student_min_prob))
-        & (log_pb >= _floor(teacher_min_prob))
-    )
+    # The student's side is the same either way: its top-k and its own floor.
+    in_a = torch.zeros_like(log_pa, dtype=torch.bool)
+    in_a.scatter_(-1, log_pa.topk(min(student_top_k, vocab), dim=-1).indices, True)
+    student_ok = in_a & (log_pa >= _floor(student_min_prob))
+
+    if dynamic_top_k:
+        eligible = student_ok & _teacher_set_for_z(
+            log_pa, log_pb, student_ok,
+            min_top_k=teacher_top_k, max_top_k=dynamic_max_top_k, target_z=target_z,
+        )
+    else:
+        # Membership masks over the FULL vocab, so the intersection is a plain AND
+        # rather than a set-of-ids comparison (which would need a loop per row).
+        # The two k's are separate because the roles are: the teacher's sets how much of
+        # the vocabulary it is willing to permit at all, while the student's sets how far
+        # down its own ranking it is willing to look for something permitted. Raising only
+        # the student's therefore lets it reach further for an agreed token instead of
+        # falling back, without widening what the teacher allows.
+        in_b = torch.zeros_like(log_pb, dtype=torch.bool)
+        in_b.scatter_(-1, log_pb.topk(min(teacher_top_k, vocab), dim=-1).indices, True)
+        eligible = student_ok & in_b & (log_pb >= _floor(teacher_min_prob))
     fell_back = ~eligible.any(dim=-1)
 
     # Z_t: how much of the STUDENT's probability mass the teacher left standing, i.e.
@@ -434,6 +490,9 @@ def joint_generate(model_a, model_b, batch_a, batch_b, *, eos_ids, pad_id, args)
                 temperature=args.temperature,
                 top_p=args.top_p,
                 fallback=args.agree_fallback,
+                dynamic_top_k=getattr(args, "agree_dynamic_top_k", False),
+                target_z=getattr(args, "agree_target_z", 0.5),
+                dynamic_max_top_k=getattr(args, "agree_dynamic_max_top_k", 200),
                 narrow_counter=narrow,
             )
             fb_rows.index_add_(0, alive_idx, (fell_back & alive).long())

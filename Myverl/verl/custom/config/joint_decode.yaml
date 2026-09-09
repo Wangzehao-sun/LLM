@@ -98,8 +98,33 @@ fuse_weight: 0.5
 agree_student_top_k: 50
 
 # How much of the vocabulary the TEACHER permits at all. This is the knob that sets how
-# tightly the constraint binds.
+# tightly the constraint binds. Under agree_dynamic_top_k it becomes the MINIMUM width
+# instead of the fixed one.
 agree_teacher_top_k: 10
+
+# Set the teacher's k PER TOKEN, as the smallest k leaving agree_target_z of the student's
+# mass standing, instead of fixing the width and letting Z_t fall where it may.
+#
+# Fixing the width makes the constraint's strength swing token by token: where the models
+# agree, 10 teacher ranks keep nearly all the student's mass, and where they disagree the same
+# 10 keep almost none -- which is where fallbacks fire and where Z_t drives the off-policy term
+# toward zero. Targeting Z_t widens the set only at those tokens.
+#
+# agree_teacher_min_prob is IGNORED here (a floor caps Z_t from above, so the two would fight)
+# and agree_teacher_top_k becomes a floor on the width. The allowed set is therefore a superset
+# of the fixed one, so the fallback rate can only go down. The student's knobs still apply --
+# the target is measured over the mass the STUDENT accepts.
+#
+# Watch batch/sr_joint_keep_ratio: it is the realised Z_t and should sit at or just above
+# agree_target_z. Below means the cap is binding.
+agree_dynamic_top_k: False
+
+# The Z_t to aim for. Only read when agree_dynamic_top_k is on.
+agree_target_z: 0.5
+
+# Ceiling on the k the target may ask for, so outright disagreement cannot open the set to the
+# whole vocabulary. Also the cost knob: the search works over a [rows, this] slice per step.
+agree_dynamic_max_top_k: 200
 
 # Probability floors, applied on top of the top-k intersection. 0 disables a side.
 # The teacher's floor sets how wide the allowed region is; the student's only drops
