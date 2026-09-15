@@ -95,14 +95,26 @@ def parse_args():
 
 
 def _extract_problem_from_prompt(prompt):
+    """The problem text from a prompt message list.
+
+    Handles both shapes we see in the wild: ``[{system}, {user}]`` (openr1) and
+    a bare ``[{user}]``. Takes the last user message, so a multi-turn prefix
+    cannot shadow the actual question.
+    """
     if isinstance(prompt, np.ndarray):
         prompt = prompt.tolist()
 
-    if not isinstance(prompt, list) or len(prompt) < 2:
+    if not isinstance(prompt, list) or not prompt:
         return None
 
+    for msg in reversed(prompt):
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            content = msg.get("content")
+            return content if isinstance(content, str) else None
+
+    # No explicit user role: fall back to the last message's content.
     try:
-        return prompt[1]["content"]
+        return prompt[-1]["content"]
     except (TypeError, KeyError, IndexError):
         return None
 
