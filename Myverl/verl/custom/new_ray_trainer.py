@@ -920,7 +920,10 @@ class NewRayPPOTrainer(RayPPOTrainer):
                                          batch_size=val_batch_size,
                                          num_workers=self.config.data.get("dataloader_num_workers", 8),
                                          shuffle=False,
-                                         drop_last=True,
+                                         # 与上游一致（ray_trainer.py:523）：val 集必须整个评完，
+                                         # drop_last=True 会静默丢掉凑不满一个 batch 的尾巴。
+                                         # _validate 自己会 pad 到 dp_size 再 unpad，不怕零头。
+                                         drop_last=False,
                                          collate_fn=defaultcollate_fn if collate_fn is None else collate_fn,)
 
         # ---- 固定 summarize-val 子集（可选，观测 rephraser/summarize 能力漂移）----
