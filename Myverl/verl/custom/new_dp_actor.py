@@ -254,7 +254,40 @@ class NewDataParallelPPOActor(DataParallelPPOActor):
                     calculate_entropy = False
                     if entropy_coeff != 0:
                         calculate_entropy = True
+                    # Prefix-RFT keeps only the top-k% highest-entropy PREFIX tokens in the
+                    # gradient, so it needs the entropy tensor even when there is no entropy
+                    # bonus. Forcing the flag here is what upstream's dp_actor.py:644 does
+                    # ("entropy_coeff != 0 or 'entropy' in self.reshapers") -- without it the
+                    # forward returns None and the masking would silently no-op.
+                    prefix_ent_keep = float(self.config.get("prefix_entropy_keep_ratio", 0.0))
+                    if prefix_ent_keep > 0.0 and "prefix_mask" in data:
+                        calculate_entropy = True
                     entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy)
+
+                    # Zero the advantage on the low-entropy prefix tokens. The paper's reading:
+                    # a demonstration token the policy was already confident about teaches it
+                    # nothing, while the high-entropy ones are where the reference solution
+                    # actually disagrees with the policy -- so only those should carry gradient.
+                    # Ranked WITHIN the prefix region only, across the whole micro-batch, which
+                    # is how upstream does it (a global quantile over prefix tokens, not per row).
+                    if prefix_ent_keep > 0.0 and entropy is not None and "prefix_mask" in data:
+                        _pm = data["prefix_mask"].bool()
+                        _n_pref = int(_pm.sum().item())
+                        if _n_pref > 0:
+                            _ent_pref = entropy.detach()[_pm]
+                            # Drop the bottom (1 - keep) fraction. int() floors, so a keep ratio
+                            # of 0.2 keeps AT LEAST 20% -- never fewer tokens than asked for.
+                            _n_drop = int(_n_pref * (1.0 - prefix_ent_keep))
+                            if _n_drop > 0:
+                                _thr = torch.kthvalue(_ent_pref.float(), _n_drop).values
+                                # <= threshold: ties go to the dropped side, matching the
+                                # sort-and-slice upstream uses.
+                                _drop = _pm & (entropy.detach() <= _thr)
+                                advantages = advantages.clone()
+                                advantages[_drop] = 0.0
+                                append_to_dict(metrics, {
+                                    "actor/prefix_ent_dropped_frac": _n_drop / _n_pref,
+                                })
                     
                     # --- 步骤2: 在 micro_batch 循环中填充容器 ---
 

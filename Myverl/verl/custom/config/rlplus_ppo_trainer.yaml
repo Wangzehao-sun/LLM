@@ -82,6 +82,10 @@ actor_rollout_ref:
     use_target_lst: False
     loss_remove_token_mean: False
     loss_remove_clip: False
+    # Prefix-RFT: fraction of PREFIX tokens that keep their advantage, ranked by entropy
+    # (highest kept). The paper uses 0.2. 0.0 disables -- every prefix token keeps it, which
+    # is byte-identical to the behaviour before this existed.
+    prefix_entropy_keep_ratio: 0.0
     sft_loss_coef: 1.0
     use_sft_multitask_loss: False
 
@@ -135,6 +139,42 @@ actor_rollout_ref:
     # batch/prefix_ratio_scheduled. Needs n_prefix > 0 to do anything.
     # Quoted: bare `off` is a YAML boolean, which would miss the string comparison.
     prefix_ratio_schedule: "off"
+    # Prefix-RFT (arXiv:2507.01679). Set prefix_mode='beta' to switch the normal step's
+    # off-policy rows onto per-sample prefix sampling:
+    #
+    #     ratio ~ Beta(alpha, beta), mapped into [low_ctrl(step), high_ctrl(step)]
+    #
+    # The first num_empty_prefix of the n_prefix slots are forced to ratio 0 (pure
+    # on-policy); the rest each draw their own ratio per sample, so one step spans a range
+    # of prefix lengths instead of giving every row the same help. The window's bounds are
+    # separately scheduled controllers -- see verl/custom/prefix_scheduler.py.
+    #
+    # Flat keys, not the upstream recipe's nested prefix_low_ctrl.kwargs: a Hydra config is
+    # struct mode, so a nested node no script defines raises on access. That is precisely
+    # why the upstream recipe cannot be launched without rebuilding its config by hand.
+    num_empty_prefix: 0
+    min_prefix_len: 16
+    # const | linear_decay | cosine_decay. Defaults collapse the window onto min_prefix_ratio
+    # by the end of prefix_steps: the low bound sits still while the high one decays to it.
+    prefix_low_ctrl_type: const
+    prefix_high_ctrl_type: cosine_decay
+    # init/target default to min_prefix_ratio / max_prefix_ratio; override to shape the window.
+    # prefix_low_ctrl_init / prefix_low_ctrl_target / prefix_high_ctrl_init /
+    # prefix_high_ctrl_target / prefix_ctrl_warmup_ratio
+    # Optional per-bound wrapper: 'delay' holds a bound flat for N steps, then starts its
+    # schedule with the horizon SHIFTED (not compressed).
+    # prefix_{low,high}_ctrl_wrapper_type / _delay_steps / _delay_val
+    # Beta(1,1) is uniform on the window -- what the paper specifies ("l is randomly sampled
+    # from U(low, high)"). alpha>1 biases toward long prefixes, beta>1 short.
+    prefix_ctrl_alpha: 1.0
+    prefix_ctrl_beta: 1.0
+    # Fraction of PREFIX tokens that keep their advantage, ranked by entropy (highest kept).
+    # The paper uses the top 20%: a demonstration token the policy was already confident about
+    # teaches it nothing, so only the tokens where the reference disagrees carry gradient.
+    # 0.0 disables the masking entirely (every prefix token keeps its advantage).
+    # Lives under actor, not rollout -- see actor.prefix_entropy_keep_ratio below.
+    # NOTE prefix_steps below is the shared horizon for both bounds. Set it near the run's
+    # total step count -- the default outlives most runs, so the window never reaches target.
     prefix_steps: 1000
     prefix_linear_max_ratio: 0.8
     prefix_linear_max_var: 0.1

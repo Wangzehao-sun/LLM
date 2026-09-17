@@ -301,6 +301,37 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             response_length = grpo_calculation_mask.size(1)
             # This mask is the one intended for GRPO
             grpo_calculation_mask = data.batch["loss_mask"][:, -response_length:]
+        # Prefix-RFT: rows conditioned on different prefix lengths are not comparable samples,
+        # so the baseline is taken per (question, prefix slot) rather than per question. Gated
+        # on the column's PRESENCE rather than on a config flag -- only the prefix_mode='beta'
+        # path writes it, so the standard path cannot accidentally pick this up.
+        if "prefix_uid" in data.non_tensor_batch and "prefix_mask" in data.batch.keys():
+            from .new_core_alg import compute_grpo_prefix_outcome_advantage
+
+            # Slots per question, derived from the data rather than the config: compute_advantage
+            # is a module-level function with no self, and the uid column already says it --
+            # every row of one question is one slot.
+            _uids = data.non_tensor_batch["uid"]
+            _, _counts = np.unique(_uids, return_counts=True)
+            n_prefix_slots = int(_counts.max()) if len(_counts) else 1
+            advantages, returns = compute_grpo_prefix_outcome_advantage(
+                token_level_rewards=data.batch["token_level_rewards"],
+                response_mask=grpo_calculation_mask,
+                prefix_mask=data.batch["prefix_mask"],
+                index=data.non_tensor_batch["uid"],
+                prefix_index=data.non_tensor_batch["prefix_uid"],
+                # Rollouts sharing ONE prefix slot -- NOT the group size. Upstream passes
+                # rollout.n because there n_group = rollout.n * num_prefix, so rollout.n IS
+                # the per-slot count. On this path the n_prefix slots ARE the group
+                # (rollout.n == n_prefix), so each slot holds num_repeat // n_prefix rollouts
+                # -- 1 in the default setup. Passing num_repeat through would divide the prefix
+                # advantage by the whole group size on top of its own normalisation.
+                num_rollouts_per_prefix=max(1, int(num_repeat) // max(1, n_prefix_slots)),
+                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            )
+            data.batch["advantages"] = advantages
+            data.batch["returns"] = returns
+            return data
         # Call compute_grpo_outcome_advantage with parameters matching its definition
         advantages, returns = core_algos.compute_grpo_outcome_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
@@ -505,6 +536,117 @@ class NewRayPPOTrainer(RayPPOTrainer):
         ratio = min(hi, max(lo, float(ratio)))
         metrics["batch/prefix_ratio_scheduled"] = ratio
         return ratio
+
+    def _prefix_rft_rollout_prompts(self, batch, gen_batch, train_batch_size, metrics):
+        """Build the n_prefix rollout prompts per question, Prefix-RFT style.
+
+        Each question gets ``n_prefix`` prompts. The first ``num_empty_prefix`` are the bare
+        question (ratio 0, pure on-policy); the rest each draw their OWN ratio per sample from
+        ``Beta(alpha, beta)`` inside the scheduled window, so one step's batch spans a range of
+        prefix lengths rather than giving every row the same amount of help. That spread is the
+        point: it is what lets the group contrast "almost solved it alone" against "needed most
+        of the answer".
+
+        Mirrors the recycle path's prefix_mode loop (:2900 onward) -- same left-pad, same
+        interleaved stack, same ``_prepare_off_policy_from_tgt`` call -- because the downstream
+        consumers (``_build_hybrid_off_policy_output``, ``prefix_lists``) already expect that
+        exact layout. The two differences are per-SAMPLE ratios and the ``prefix_uid`` bookkeeping.
+
+        Returns ``(gen_batch, prefix_lists, prefix_uids)``:
+          * gen_batch -- repeated n_prefix-fold with the prefixed prompts written in
+          * prefix_lists -- interleaved [B*n_prefix] token lists, for the hybrid builder
+          * prefix_uids -- [B*n_prefix] object array; rows sharing a (question, slot) get the
+            same id, and zero-prefix rows get the sentinel the advantage function groups on
+        """
+        from .prefix_scheduler import build_prefix_sampler
+
+        rollout_cfg = self.config.actor_rollout_ref.rollout
+        n_prefix = int(rollout_cfg.n_prefix)
+        n_empty = min(int(rollout_cfg.get('num_empty_prefix', 0)), n_prefix)
+        min_prefix_len = int(rollout_cfg.get('min_prefix_len', 16))
+
+        # Built per step rather than cached: the controllers are stateless functions of
+        # global_step, so there is nothing to carry over, and rebuilding keeps a mid-run config
+        # change (via a resumed job) from being silently ignored.
+        sampler = build_prefix_sampler(rollout_cfg)
+
+        tgt_input_ids = batch.batch['tgt_input_ids']
+        pad_token_id = self.tokenizer.pad_token_id
+        original_input_ids = gen_batch.batch['input_ids']
+        original_attention_mask = gen_batch.batch['attention_mask']
+        original_position_ids = gen_batch.batch['position_ids']
+
+        input_ids_list, total_prefix_list, uid_cols = [], [], []
+        ratio_sum, ratio_n, win_lo, win_hi = 0.0, 0, 0.0, 0.0
+
+        for slot in range(n_prefix):
+            if slot < n_empty:
+                # Zero-prefix slot: skip the sampler AND the tgt splice entirely. Passing
+                # ratio=0 through _prepare_off_policy_from_tgt would rebuild the same prompt at
+                # the cost of a tokenize round-trip per row.
+                input_ids_list.append(original_input_ids)
+                total_prefix_list.append([[] for _ in range(train_batch_size)])
+                # Sentinel, matching upstream rl_dataset.py:378 -- the advantage function reads
+                # this exact string to find the baseline group.
+                uid_cols.append(['0000-0000-0000-0000'] * train_batch_size)
+                continue
+
+            slot_lens = []
+            for _ in range(train_batch_size):
+                ratio, lo, hi = sampler.value(global_step=self.global_steps)
+                ratio_sum += ratio
+                ratio_n += 1
+                win_lo, win_hi = lo, hi
+                # A length, not a ratio: _prepare_off_policy_from_tgt clamps per row against
+                # that row's own tgt length, so the floor is applied there rather than here.
+                slot_lens.append(max(int(min_prefix_len), int(ratio * tgt_input_ids.size(1))))
+
+            temp_batch = DataProto.from_single_dict({
+                "input_ids": original_input_ids.clone(),
+                "attention_mask": original_attention_mask.clone(),
+                "position_ids": original_position_ids.clone(),
+            })
+            processed_batch, _, prefix_list = self._prepare_off_policy_from_tgt(
+                tgt_input_ids, temp_batch, train_batch_size, 0.0, prefix_lens=slot_lens,
+            )
+            input_ids_list.append(processed_batch.batch['input_ids'])
+            total_prefix_list.append(prefix_list)
+            # One id per (question, slot): rows that share it share a baseline.
+            uid_cols.append([str(uuid.uuid4()) for _ in range(train_batch_size)])
+
+        # Left-pad to a common width, then stack on dim=1 so the flatten produces the
+        # interleaved order (S0_R0, S0_R1, ..., S1_R0, ...) the rest of the step assumes.
+        max_len = max(t.size(1) for t in input_ids_list)
+        padded = []
+        for t in input_ids_list:
+            if t.size(1) < max_len:
+                pad = torch.full((t.size(0), max_len - t.size(1)), pad_token_id,
+                                 dtype=t.dtype, device=t.device)
+                padded.append(torch.cat([pad, t], dim=1))
+            else:
+                padded.append(t)
+        input_ids_new = torch.stack(padded, dim=1).view(-1, max_len)
+        attention_mask_new, position_ids_new = generate_masks_from_input_ids(
+            input_ids_new, pad_token_id, original_attention_mask.dtype,
+        )
+
+        gen_batch = gen_batch.repeat(repeat_times=n_prefix, interleave=True)
+        gen_batch.batch['input_ids'] = input_ids_new
+        gen_batch.batch['attention_mask'] = attention_mask_new
+        gen_batch.batch['position_ids'] = position_ids_new
+
+        # zip(*) transposes slot-major -> sample-major, matching the dim=1 stack above.
+        prefix_lists = [p for per_sample in zip(*total_prefix_list) for p in per_sample]
+        prefix_uids = np.array(
+            [u for per_sample in zip(*uid_cols) for u in per_sample], dtype=object,
+        )
+
+        metrics['batch/prefix_rft_ratio_mean'] = ratio_sum / max(1, ratio_n)
+        metrics['batch/prefix_rft_window_low'] = win_lo
+        metrics['batch/prefix_rft_window_high'] = win_hi
+        metrics['batch/prefix_rft_empty_slots'] = n_empty
+        return gen_batch, prefix_lists, prefix_uids
+
 
     def _validate_joint_config(self):
         """Reject joint-decoding configurations that cannot do what they claim.
@@ -2820,6 +2962,27 @@ class NewRayPPOTrainer(RayPPOTrainer):
         # summarize 模式（explain-style loss）专用：保存替换前的原始短 prompt，
         # 在 _build_hybrid_off_policy_output 时作为 loss_prompts 传入。None 表示不走 summarize。
         loss_prompts_for_summarize = None
+        # Prefix-RFT（arXiv:2507.01679）：per-sample 前缀采样，normal step 也生效。
+        #
+        # 与 recycle 路径的 prefix_mode 机制同构（下方 :2900 起），但那条路只在
+        # is_failure_recycle_step 时走，而上游 Prefix-RFT 没有 recycle 概念 —— 它每一步都
+        # 这么采。所以这里复制那段结构：逐槽位算 ratio -> 逐样本算 prefix_len ->
+        # _prepare_off_policy_from_tgt -> 左 pad 对齐 -> interleave 展平。
+        #
+        # 与 recycle 路径的两点不同：
+        #   * ratio 逐槽位 AND 逐样本（Beta 采样），而非 np.linspace 的一列固定值；
+        #   * prefix_uid 要写进 non_tensor_batch，供 compute_grpo_prefix_outcome_advantage
+        #     的双层分组用（同一题的不同前缀长度各自算 baseline）。
+        if (not is_failure_recycle_step
+                and self.config.actor_rollout_ref.rollout.get('prefix_mode', 'sparse') == 'beta'
+                and 'tgt_input_ids' in batch.batch
+                and self.config.actor_rollout_ref.rollout.n_prefix > 0):
+            gen_batch, prefix_lists, prefix_uids = self._prefix_rft_rollout_prompts(
+                batch, gen_batch, train_batch_size, metrics,
+            )
+            n_total = self.config.actor_rollout_ref.rollout.n_prefix
+            batch.non_tensor_batch['prefix_uid'] = prefix_uids
+            manual_repeat = True
         if is_failure_recycle_step:
             if 'se_input_ids' in batch.batch and self.config.actor_rollout_ref.rollout.n_se>0:
                  print(f"Recycle Step: Using se_input_ids for generation.")

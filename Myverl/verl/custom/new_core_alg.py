@@ -10,6 +10,104 @@ def compute_sft_pure_loss(log_prob, eos_mask):
     return sft_loss
 
 
+PREFIX_UID_SENTINEL = '0000-0000-0000-0000'
+
+
+def compute_grpo_prefix_outcome_advantage(token_level_rewards: torch.Tensor,
+                                          response_mask: torch.Tensor,
+                                          prefix_mask: torch.Tensor,
+                                          index: np.ndarray,
+                                          prefix_index: np.ndarray,
+                                          num_rollouts_per_prefix: int = 1,
+                                          norm_adv_by_std_in_grpo: bool = True,
+                                          epsilon: float = 1e-6):
+    """Prefix-RFT's two-level GRPO advantage (arXiv:2507.01679).
+
+    Standard GRPO normalises within one group per question. That is wrong here because a
+    question's rollouts no longer share their conditioning: a row given 80% of the reference
+    solution and a row given nothing are not comparable samples, so pooling them puts the
+    prefix length into the baseline and the advantage stops measuring what the policy did.
+
+    So the baseline is taken per ``(question, prefix slot)`` instead -- rows sharing BOTH a
+    question and a prefix length are the ones that form a valid comparison set.
+
+    The prefix tokens then get a different quantity again:
+
+        p_score_i = normalised_score_i - mean(that question's ZERO-prefix group)
+
+    i.e. how much better this row did than the same question with no help at all, which is the
+    only signal that says whether the prefix was worth giving. Divided by
+    ``num_rollouts_per_prefix`` so a slot with more rollouts does not dominate, and written to
+    the prefix positions by REPLACEMENT (``torch.where``), not by addition -- a prefix token
+    carries the prefix advantage alone.
+
+    ``prefix_index`` entries equal to ``PREFIX_UID_SENTINEL`` mark zero-prefix rows. A question
+    whose sentinel group is absent (every slot got a prefix) leaves ``p_score = 0``, so its
+    prefix tokens contribute nothing rather than being scored against a baseline that does not
+    exist.
+
+    Args:
+        token_level_rewards: [bs, response_length]
+        response_mask: [bs, response_length]
+        prefix_mask: [bs, response_length], 1 where the token came from the reference prefix
+        index: [bs] question ids (uid)
+        prefix_index: [bs] per-(question, slot) ids, sentinel for zero-prefix rows
+        num_rollouts_per_prefix: rollouts sharing one prefix slot
+
+    Returns:
+        (advantages, returns) -- both [bs, response_length], as GRPO returns the same tensor
+        twice.
+    """
+    scores = token_level_rewards.sum(dim=-1)
+    p_scores = torch.zeros_like(scores)
+
+    id2prefix2scores = defaultdict(lambda: defaultdict(list))
+    id2prefix2mean, id2prefix2std = defaultdict(dict), defaultdict(dict)
+
+    with torch.no_grad():
+        bsz = scores.shape[0]
+        for i in range(bsz):
+            id2prefix2scores[index[i]][prefix_index[i]].append(scores[i])
+
+        for idx, prefix2scores in id2prefix2scores.items():
+            for prefix_id, group in prefix2scores.items():
+                if len(group) == 1:
+                    # A lone row has no spread to normalise against. mean 0 / std 1 leaves its
+                    # score untouched rather than sending it to 0 like (x - x) would.
+                    id2prefix2mean[idx][prefix_id] = torch.tensor(0.0)
+                    id2prefix2std[idx][prefix_id] = torch.tensor(1.0)
+                else:
+                    stacked = torch.tensor(group)
+                    id2prefix2mean[idx][prefix_id] = torch.mean(stacked)
+                    id2prefix2std[idx][prefix_id] = torch.std(stacked)
+
+        for i in range(bsz):
+            m = id2prefix2mean[index[i]][prefix_index[i]]
+            # norm_adv_by_std_in_grpo=False is Dr.GRPO -- centre only, no division. That is
+            # what the paper uses, and it is the SAME switch the standard GRPO path reads
+            # (algorithm.norm_adv_by_std_in_grpo), so the two estimators stay consistent
+            # instead of this path silently ignoring it.
+            if norm_adv_by_std_in_grpo:
+                s = id2prefix2std[index[i]][prefix_index[i]]
+                scores[i] = (scores[i] - m) / (s + epsilon)
+            else:
+                scores[i] = scores[i] - m
+
+        for i in range(bsz):
+            if prefix_index[i] != PREFIX_UID_SENTINEL:
+                # .get: a question with no zero-prefix slot has no baseline to subtract, so the
+                # prefix advantage stays 0 instead of raising on a missing key.
+                base = id2prefix2mean[index[i]].get(PREFIX_UID_SENTINEL, None)
+                if base is not None:
+                    p_scores[i] = scores[i] - base
+
+        scores = scores.unsqueeze(-1) * response_mask
+        p_scores = p_scores.unsqueeze(-1) / max(1, int(num_rollouts_per_prefix)) * prefix_mask
+        scores = torch.where(prefix_mask.bool(), p_scores, scores)
+
+    return scores, scores
+
+
 def compute_grpo_outcome_advantage_split(token_level_rewards: torch.Tensor,
                                    eos_mask: torch.Tensor,
                                    index: torch.Tensor,
