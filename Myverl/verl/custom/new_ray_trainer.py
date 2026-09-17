@@ -470,73 +470,6 @@ class NewRayPPOTrainer(RayPPOTrainer):
         self._validate_joint_config()
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
-        # Previous step's batch/on_solved, the signal prefix_ratio_schedule='score' closes the
-        # loop on. None until the first step has been scored.
-        self._prev_on_solved = None
-
-    def _resolve_prefix_ratio(self, metrics: dict) -> float:
-        """How much of the reference solution to hand the off row THIS step.
-
-        Prefix-RFT's observation: a fixed ratio is two different experiments at two points
-        in training. Early on the model cannot solve the question at all, so a long prefix
-        is the only thing that produces a usable trajectory; later the same prefix is doing
-        the work the policy should be doing itself, and the off row stops teaching anything.
-        So the ratio should move.
-
-        ``prefix_ratio_schedule`` selects the signal:
-
-        * ``off``    -- rollout.prefix_ratio verbatim, every step (the default; byte-identical
-                        to the behaviour before this existed).
-        * ``linear`` -- decay from max to min over ``prefix_steps``, on global_step alone.
-                        Predictable and reproducible, but blind to whether the model is
-                        actually keeping up.
-        * ``score``  -- close the loop on the measured on-policy accuracy:
-
-                            ratio = max - (max - min) * accuracy
-
-                        Solving more shortens the prefix; solving less lengthens it. The
-                        accuracy is the PREVIOUS step's ``batch/on_solved``, because this runs
-                        before the current step's rollouts have been scored -- there is no
-                        way to use the current one, and the lag is one step.
-
-        Clamped to [min_prefix_ratio, max_prefix_ratio] in every branch. Reported as
-        ``batch/prefix_ratio_scheduled`` next to the existing ``batch/avg_prefix_ratio`` so a
-        schedule that is not moving is visible rather than assumed.
-        """
-        rollout_cfg = self.config.actor_rollout_ref.rollout
-        mode = rollout_cfg.get("prefix_ratio_schedule", "off")
-        # .get, not attribute access: prefix_ratio is not in the yaml -- every script injects
-        # it with `+`, so a run without it would raise here in struct mode.
-        static = float(rollout_cfg.get("prefix_ratio", 1.0))
-        if mode == "off":
-            return static
-
-        lo = float(rollout_cfg.get("min_prefix_ratio", 0.0))
-        hi = float(rollout_cfg.get("max_prefix_ratio", 1.0))
-        if lo > hi:
-            raise ValueError(
-                f"min_prefix_ratio={lo} > max_prefix_ratio={hi}: the schedule has no range "
-                f"to move in."
-            )
-
-        if mode == "linear":
-            total = max(1, int(rollout_cfg.get("prefix_steps", 1000)))
-            progress = min(1.0, max(0.0, (self.global_steps - 1) / total))
-            ratio = hi - (hi - lo) * progress
-        elif mode == "score":
-            # None on step 1 (nothing scored yet) -> start at the long end, which is the
-            # conservative direction: too much help beats a trajectory the model cannot use.
-            acc = self._prev_on_solved
-            ratio = hi if acc is None else hi - (hi - lo) * min(1.0, max(0.0, float(acc)))
-        else:
-            raise ValueError(
-                f"unknown prefix_ratio_schedule {mode!r}; expected 'off', 'linear' or 'score'"
-            )
-
-        ratio = min(hi, max(lo, float(ratio)))
-        metrics["batch/prefix_ratio_scheduled"] = ratio
-        return ratio
-
     def _prefix_rft_rollout_prompts(self, batch, gen_batch, train_batch_size, metrics):
         """Build the n_prefix rollout prompts per question, Prefix-RFT style.
 
@@ -2908,7 +2841,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
         n_on = self.config.actor_rollout_ref.rollout.n - self.config.actor_rollout_ref.rollout.n_off
         n_off = self.config.actor_rollout_ref.rollout.n_off
         n_total = self.config.actor_rollout_ref.rollout.n
-        prefix_ratio = self._resolve_prefix_ratio(metrics)
+        prefix_ratio = self.config.actor_rollout_ref.rollout.prefix_ratio
         if n_off>0:
             tgt_list = None
             #提取off-policy的回复内容
@@ -3729,9 +3662,6 @@ class NewRayPPOTrainer(RayPPOTrainer):
                 off_policy_mask = prefix_mask.any(-1)
                 on_policy_mask = ~off_policy_mask
                 metrics['batch/on_solved'] = (reward_tensor[on_policy_mask].sum(-1) == success_value).sum().item() / (on_policy_mask.sum().item() + 1e-6)
-                # Fed back to _resolve_prefix_ratio on the NEXT step. Recorded here rather than
-                # read out of `metrics` later because metrics is rebuilt each step.
-                self._prev_on_solved = metrics['batch/on_solved']
                 #metrics['batch/on_failed'] = (reward_tensor[on_policy_mask].sum(-1) == fail_value).sum().item()
                 metrics['batch/off_solved'] = (reward_tensor[off_policy_mask].sum(-1) == success_value).sum().item() / (off_policy_mask.sum().item() + 1e-6)
             

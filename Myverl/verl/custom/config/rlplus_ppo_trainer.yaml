@@ -129,16 +129,6 @@ actor_rollout_ref:
     n_val: 8
     # define prefix hyperparameters
     prefix_strategy: random
-    # How much of the reference solution the off row gets, per step (Prefix-RFT).
-    #   off    -- prefix_ratio verbatim, every step. Default; byte-identical to before.
-    #   linear -- decay max -> min over prefix_steps, on global_step alone.
-    #   score  -- close the loop on the previous step's batch/on_solved:
-    #                 ratio = max - (max - min) * accuracy
-    #             Solving more shortens the prefix, solving less lengthens it.
-    # Both non-off modes clamp to [min_prefix_ratio, max_prefix_ratio] and report
-    # batch/prefix_ratio_scheduled. Needs n_prefix > 0 to do anything.
-    # Quoted: bare `off` is a YAML boolean, which would miss the string comparison.
-    prefix_ratio_schedule: "off"
     # Prefix-RFT (arXiv:2507.01679). Set prefix_mode='beta' to switch the normal step's
     # off-policy rows onto per-sample prefix sampling:
     #
