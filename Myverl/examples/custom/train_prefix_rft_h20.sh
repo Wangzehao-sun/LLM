@@ -19,8 +19,10 @@ set -x
 #
 # HOW IT REACHES THE LOSS. Two pieces, both already in this framework:
 #   * prefix tokens go through the off-policy branch of compute_token_on_off_sft_loss
-#     (new_core_alg.py), gated by prefix_mask -- with off_loss_remove_clip=True they are
-#     NOT PPO-clipped, matching upstream's enable_clip=False. That split IS the method.
+#     (new_core_alg.py), gated by prefix_mask. That split IS the method. Upstream leaves those
+#     tokens UNCLIPPED (enable_clip=False); OFF_REMOVE_CLIP here defaults to clipping them
+#     instead, because unclipped they combine badly with the prefix row's uncentred
+#     advantage -- see that knob's comment.
 #   * the advantage baseline is taken per (question, prefix slot) rather than per question,
 #     because rows conditioned on different prefix lengths are not comparable samples.
 #     See compute_grpo_prefix_outcome_advantage; it engages on the presence of prefix_uid.
@@ -70,7 +72,7 @@ N_PREFIX=${N_PREFIX:-8}
 NUM_EMPTY_PREFIX=${NUM_EMPTY_PREFIX:-7}
 # Decay horizon. The paper trains 500 steps and decays over all of them; match it to YOUR
 # run or the window never reaches its target (9004 rows / batch 128 * 3 epochs ~= 210 steps).
-PREFIX_STEPS=${PREFIX_STEPS:-500}
+PREFIX_STEPS=${PREFIX_STEPS:-200}
 # Window bounds. NOTE the direction: the paper moves the LOW bound and pins the HIGH one --
 # "l is randomly sampled from U(low, high), where high is a constant and low decreases from
 # high to near zero throughout entire training". So the window OPENS UP over training: early on
@@ -86,6 +88,16 @@ PREFIX_BETA=${PREFIX_BETA:-1.0}
 MIN_PREFIX_LEN=${MIN_PREFIX_LEN:-16}
 # Fraction of prefix tokens that keep their advantage, ranked by entropy. Paper: top 20%.
 PREFIX_ENT_KEEP=${PREFIX_ENT_KEEP:-0.2}
+# Whether to SKIP PPO clipping on the prefix tokens. Upstream's enable_clip=False maps to True
+# here, but that leaves off_ratio = exp(logp - old_logp) with no bound at all -- no symmetric
+# clip, no dual-clip floor on negative advantage, and off_policy_{max,min}_clip are -1 too.
+# That matters more than the off tokens' 1-2% share of the loss suggests, because the prefix
+# row's continuation segment gets an UNCENTRED advantage: its prefix_uid is unique, so it is a
+# one-row group, so its baseline is 0 and its advantage is the raw reward -- non-negative by
+# construction, unlike every on-policy row. An unbounded ratio multiplies that. Upstream's own
+# comment flags the same thing ("这个 1 reward 在 dr_grpo 会比其他 adv 都大, 可能影响训练").
+# Default False = clip, which bounds the ratio to [1-eps, 1+eps] and restores the dual-clip.
+OFF_REMOVE_CLIP=${OFF_REMOVE_CLIP:-False}
 
 suffix="prefix_rft_"${off_policy_reshape}
 
@@ -133,7 +145,7 @@ echo "=== actor         : $MODEL_PATH"
 echo "=== rollouts/step : $N_PREFIX per question ($NUM_EMPTY_PREFIX bare + $((N_PREFIX-NUM_EMPTY_PREFIX)) prefixed)"
 echo "=== prefix window : U(low, $PREFIX_HIGH_CONST), low: cosine $PREFIX_LOW_INIT->$PREFIX_LOW_TARGET over $PREFIX_STEPS"
 echo "=== entropy keep  : top $PREFIX_ENT_KEEP of prefix tokens carry gradient"
-echo "=== off shaping   : $off_policy_reshape"
+echo "=== off shaping   : $off_policy_reshape  (skip clip on prefix: $OFF_REMOVE_CLIP)"
 
 # Train over a single node using the GPUs exposed by *_VISIBLE_DEVICES.
 python -m verl.trainer.main_ppo_new \
@@ -208,12 +220,7 @@ python -m verl.trainer.main_ppo_new \
     +actor_rollout_ref.actor.loss_remove_token_mean=False \
     +actor_rollout_ref.actor.loss_remove_clip=False \
     +actor_rollout_ref.actor.on_loss_remove_clip=False \
-    `# enable_clip=False upstream: PREFIX tokens take the UNCLIPPED off-policy loss while` \
-    `# generated tokens keep standard PPO clipping. That split is the method` \
-    `# (core_algos.py:634 there, new_core_alg.py:358 here).` \
-    +actor_rollout_ref.actor.off_loss_remove_clip=True \
-    `# Keep only the top-20% highest-entropy PREFIX tokens in the gradient; the rest get` \
-    `# advantage 0. The paper's entropy clipping.` \
+    +actor_rollout_ref.actor.off_loss_remove_clip=$OFF_REMOVE_CLIP \
     +actor_rollout_ref.actor.prefix_entropy_keep_ratio=$PREFIX_ENT_KEEP \
     actor_rollout_ref.rollout.tensor_model_parallel_size=$TENSOR_PARALLEL \
     actor_rollout_ref.rollout.max_num_batched_tokens=81920 \
@@ -234,7 +241,6 @@ python -m verl.trainer.main_ppo_new \
     +actor_rollout_ref.rollout.num_empty_prefix=$NUM_EMPTY_PREFIX \
     +actor_rollout_ref.rollout.min_prefix_len=$MIN_PREFIX_LEN \
     +actor_rollout_ref.rollout.prefix_steps=$PREFIX_STEPS \
-    `# low: cosine 0.95 -> 0.05 over PREFIX_STEPS; high: constant. Window opens up.` \
     +actor_rollout_ref.rollout.prefix_low_ctrl_type=cosine_decay \
     +actor_rollout_ref.rollout.prefix_low_ctrl_init=$PREFIX_LOW_INIT \
     +actor_rollout_ref.rollout.prefix_low_ctrl_target=$PREFIX_LOW_TARGET \

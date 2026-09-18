@@ -71,15 +71,23 @@ def compute_grpo_prefix_outcome_advantage(token_level_rewards: torch.Tensor,
 
         for idx, prefix2scores in id2prefix2scores.items():
             for prefix_id, group in prefix2scores.items():
-                if len(group) == 1:
-                    # A lone row has no spread to normalise against. mean 0 / std 1 leaves its
-                    # score untouched rather than sending it to 0 like (x - x) would.
-                    id2prefix2mean[idx][prefix_id] = torch.tensor(0.0)
-                    id2prefix2std[idx][prefix_id] = torch.tensor(1.0)
-                else:
-                    stacked = torch.tensor(group)
-                    id2prefix2mean[idx][prefix_id] = torch.mean(stacked)
-                    id2prefix2std[idx][prefix_id] = torch.std(stacked)
+                stacked = torch.tensor(group)
+                # A one-row group's mean is its own score, so centring sends it to EXACTLY 0.
+                # That is deliberate, and it is what stops the entropy from blowing up: with
+                # num_empty_prefix = n_prefix - 1 the prefix row is always a one-row group, and
+                # giving it mean 0 instead would leave its advantage at the raw reward -- 0 or 1,
+                # never negative, unlike every on-policy row. Its continuation segment (the
+                # non-prefix positions) would then be reinforced unconditionally on every step
+                # where it answered correctly, no matter how the on-policy rows did.
+                #
+                # The prefix POSITIONS still learn: they get p_score below, which subtracts the
+                # zero-prefix group's mean and so can go either way.
+                id2prefix2mean[idx][prefix_id] = torch.mean(stacked)
+                # std of a single element is NaN, and 1.0 is the neutral divisor. Only read when
+                # norm_adv_by_std_in_grpo is on.
+                id2prefix2std[idx][prefix_id] = (
+                    torch.tensor(1.0) if len(group) == 1 else torch.std(stacked)
+                )
 
         for i in range(bsz):
             m = id2prefix2mean[index[i]][prefix_index[i]]
