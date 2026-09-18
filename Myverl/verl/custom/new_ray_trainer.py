@@ -1408,6 +1408,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
         train_batch_size: int,
         mode: str = "concat",
         loss_prompts: torch.Tensor = None,
+        keep_continuation: bool = False,
     ) -> DataProto:
         """
         根据离线目标(prefix_list)的前缀和模型生成的响应(off_responses)构建混合的off-policy输出。
@@ -1489,7 +1490,11 @@ class NewRayPPOTrainer(RayPPOTrainer):
             else:
                 # 'concat' —— 现有 prefix 续写逻辑
                 # If it is the last element in the group, only use the prefix
-                if (i + 1) % n_repeat == 0:
+                # keep_continuation=True 时不丢：prefix-rft 的前缀是**部分**的，续写才是要学的
+                # 东西。丢掉它会让那一行退化成「纯参考解答片段」，变成在 demo 上做 SFT。
+                # 默认 False 保持 sparse 模式的行为——它末槽的 ratio 就是 1.0（整条 target），
+                # 本来就没有续写可留。
+                if (i + 1) % n_repeat == 0 and not keep_continuation:
                      final_responses.append(torch.tensor(tgt_prefixes[i], dtype=dtype))
                 else:
                      final_responses.append(torch.tensor(tgt_prefixes[i]+ off_responses_list[i], dtype=dtype))
@@ -2892,6 +2897,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
         
         manual_repeat = False # Flag to skip default repeat logic
         prefix_lists = None
+        prefix_uids_pending = None
         # summarize 模式（explain-style loss）专用：保存替换前的原始短 prompt，
         # 在 _build_hybrid_off_policy_output 时作为 loss_prompts 传入。None 表示不走 summarize。
         loss_prompts_for_summarize = None
@@ -2914,7 +2920,11 @@ class NewRayPPOTrainer(RayPPOTrainer):
                 batch, gen_batch, train_batch_size, metrics,
             )
             n_total = self.config.actor_rollout_ref.rollout.n_prefix
-            batch.non_tensor_batch['prefix_uid'] = prefix_uids
+            # NOT written here: prefix_uids is already [B * n_prefix], i.e. post-flatten, while
+            # `batch` is still [B] and gets repeat(n_total)'d below -- writing it now would have
+            # it repeated a second time into [B * n_prefix^2]. Stashed and attached after that
+            # repeat instead.
+            prefix_uids_pending = prefix_uids
             manual_repeat = True
         if is_failure_recycle_step:
             if 'se_input_ids' in batch.batch and self.config.actor_rollout_ref.rollout.n_se>0:
@@ -3215,6 +3225,15 @@ class NewRayPPOTrainer(RayPPOTrainer):
                              off_responses=gen_batch_output.batch['responses'],
                              prefix_list=prefix_lists,
                              train_batch_size=train_batch_size,
+                             # prefix-rft's prefix is PARTIAL, so the continuation is the part
+                             # being learned -- dropping it on the group's last row would leave a
+                             # bare slice of the reference solution. sparse/linear keep the old
+                             # behaviour, where that row's ratio is 1.0 and there is no
+                             # continuation to keep anyway.
+                             keep_continuation=(
+                                 self.config.actor_rollout_ref.rollout.get('prefix_mode', 'sparse')
+                                 == 'beta'
+                             ),
                          )
 
                      #self.config.actor_rollout_ref.rollout.n_off = saved_n_off
@@ -3445,6 +3464,16 @@ class NewRayPPOTrainer(RayPPOTrainer):
             batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
             # repeat to align with repeated responses in rollout
             batch = batch.repeat(repeat_times=n_total, interleave=True)
+            # Attached AFTER the repeat: prefix_uids is already [B * n_prefix], so it lines up
+            # with the repeated batch directly. uid above is generated pre-repeat and repeated,
+            # which is what makes every slot of one question share a uid while each keeps its
+            # own prefix_uid -- the two-level grouping the advantage needs.
+            if prefix_uids_pending is not None:
+                assert len(prefix_uids_pending) == len(batch.batch), (
+                    f"prefix_uid length {len(prefix_uids_pending)} != batch size "
+                    f"{len(batch.batch)}"
+                )
+                batch.non_tensor_batch['prefix_uid'] = prefix_uids_pending
             batch = batch.union(gen_batch_output)
             rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
             if self.global_steps==1 and rollout_data_dir is not None and rollout_data_dir != "":
