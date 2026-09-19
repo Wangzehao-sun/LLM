@@ -301,37 +301,19 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             response_length = grpo_calculation_mask.size(1)
             # This mask is the one intended for GRPO
             grpo_calculation_mask = data.batch["loss_mask"][:, -response_length:]
-        # Prefix-RFT: rows conditioned on different prefix lengths are not comparable samples,
-        # so the baseline is taken per (question, prefix slot) rather than per question. Gated
-        # on the column's PRESENCE rather than on a config flag -- only the prefix_mode='beta'
-        # path writes it, so the standard path cannot accidentally pick this up.
-        if "prefix_uid" in data.non_tensor_batch and "prefix_mask" in data.batch.keys():
-            from .new_core_alg import compute_grpo_prefix_outcome_advantage
-
-            # Slots per question, derived from the data rather than the config: compute_advantage
-            # is a module-level function with no self, and the uid column already says it --
-            # every row of one question is one slot.
-            _uids = data.non_tensor_batch["uid"]
-            _, _counts = np.unique(_uids, return_counts=True)
-            n_prefix_slots = int(_counts.max()) if len(_counts) else 1
-            advantages, returns = compute_grpo_prefix_outcome_advantage(
-                token_level_rewards=data.batch["token_level_rewards"],
-                response_mask=grpo_calculation_mask,
-                prefix_mask=data.batch["prefix_mask"],
-                index=data.non_tensor_batch["uid"],
-                prefix_index=data.non_tensor_batch["prefix_uid"],
-                # Rollouts sharing ONE prefix slot -- NOT the group size. Upstream passes
-                # rollout.n because there n_group = rollout.n * num_prefix, so rollout.n IS
-                # the per-slot count. On this path the n_prefix slots ARE the group
-                # (rollout.n == n_prefix), so each slot holds num_repeat // n_prefix rollouts
-                # -- 1 in the default setup. Passing num_repeat through would divide the prefix
-                # advantage by the whole group size on top of its own normalisation.
-                num_rollouts_per_prefix=max(1, int(num_repeat) // max(1, n_prefix_slots)),
-                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-            )
-            data.batch["advantages"] = advantages
-            data.batch["returns"] = returns
-            return data
+        # Prefix-RFT pools its prefixed rollout with the on-policy ones into the SAME group, so
+        # the standard GRPO advantage below is what it needs -- no per-(question, prefix slot)
+        # baseline, no prefix_uid.
+        #
+        # Splitting them was tried and is wrong HERE, where num_empty_prefix = n_prefix - 1
+        # leaves the prefix row alone in its group. A one-row group has no usable baseline, and
+        # both ways out are one-directional: leaving its mean at 0 keeps the raw reward, which
+        # is never negative, so the row is reinforced on every step it answers correctly and the
+        # entropy runs away; centring it sends the row to exactly 0, and its prefix positions
+        # then get -mean(on-policy rows) -- never positive, and identical whether the prefixed
+        # rollout was right or wrong, so the gradient carries no information about it and just
+        # pushes the policy off the demonstration. Pooling gives a two-sided signal: right
+        # scores above the group mean, wrong below it.
         # Call compute_grpo_outcome_advantage with parameters matching its definition
         advantages, returns = core_algos.compute_grpo_outcome_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
