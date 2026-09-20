@@ -491,6 +491,15 @@ class NewRayPPOTrainer(RayPPOTrainer):
         original_attention_mask = gen_batch.batch['attention_mask']
         original_position_ids = gen_batch.batch['position_ids']
 
+        # Each row's REAL target length, not tgt_input_ids.size(1). That second dimension is
+        # max_prefix_len (8192-10240) -- the padded width every row is stored at -- so applying
+        # the ratio to it and letting _prepare_off_policy_from_tgt clamp per row makes almost
+        # every draw saturate to the whole reference solution: at a real length of 2000, any
+        # ratio >= 0.2 already exceeds it. The schedule would then be invisible, every prefixed
+        # row would carry the complete answer, and the continuation would have nothing left to
+        # generate. Counting non-pad tokens per row is what makes the ratio mean what it says.
+        tgt_real_lens = (tgt_input_ids != pad_token_id).sum(dim=-1).tolist()
+
         input_ids_list, total_prefix_list, uid_cols = [], [], []
         ratio_sum, ratio_n, win_lo, win_hi = 0.0, 0, 0.0, 0.0
 
@@ -507,14 +516,16 @@ class NewRayPPOTrainer(RayPPOTrainer):
                 continue
 
             slot_lens = []
-            for _ in range(train_batch_size):
+            for row in range(train_batch_size):
                 ratio, lo, hi = sampler.value(global_step=self.global_steps)
                 ratio_sum += ratio
                 ratio_n += 1
                 win_lo, win_hi = lo, hi
-                # A length, not a ratio: _prepare_off_policy_from_tgt clamps per row against
-                # that row's own tgt length, so the floor is applied there rather than here.
-                slot_lens.append(max(int(min_prefix_len), int(ratio * tgt_input_ids.size(1))))
+                real_len = int(tgt_real_lens[row])
+                want = max(int(min_prefix_len), int(ratio * real_len))
+                # Cap LAST so it wins over the floor: a prefix equal to the whole reference
+                # solution leaves the model nothing to generate, making the row pure SFT.
+                slot_lens.append(max(0, min(want, real_len - 1)))
 
             temp_batch = DataProto.from_single_dict({
                 "input_ids": original_input_ids.clone(),
