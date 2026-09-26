@@ -1,9 +1,15 @@
 set -x
 #!/usr/bin/env bash
 # GPU selection. Override with, for example: GPU_DEVICES=4,5,6,7
-GPU_DEVICES=${GPU_DEVICES:-${CUDA_VISIBLE_DEVICES:-0,1,2,3}}
-export CUDA_VISIBLE_DEVICES=$GPU_DEVICES
 
+CONDA_DIR=${CONDA_DIR:-$HOME/miniconda3}
+source "$CONDA_DIR/etc/profile.d/conda.sh"
+conda activate ${CONDA_ENV_NAME:-verl}
+
+
+
+GPU_DEVICES=${GPU_DEVICES:-${CUDA_VISIBLE_DEVICES:-0,1}}
+export CUDA_VISIBLE_DEVICES=$GPU_DEVICES
 echo $HOME
 export TOKENIZERS_PARALLELISM=true
 
@@ -70,6 +76,11 @@ export TOKENIZERS_PARALLELISM=true
 #   MODEL_A=... MODEL_B=... FUSE=agree \
 #       AGREE_STUDENT_TOP_K=50 AGREE_TEACHER_TOP_K=10 bash run_joint_decode.sh
 #
+#   # set the teacher's k per token from a target Z_t instead of fixing its width; this
+#   # sweeps AGREE_TARGET_Z rather than AGREE_TEACHER_MIN_PROBS (see that knob)
+#   MODEL_A=... MODEL_B=... FUSE=agree AGREE_DYNAMIC_TOP_K=1 \
+#       AGREE_TARGET_Z=0.3,0.5,0.7 bash run_joint_decode.sh
+#
 #   # a single weight, greedy -- the degenerate-case check
 #   MODEL_A=... MODEL_B=... WEIGHTS=0 TEMPERATURE=0 LIMIT=8 bash run_joint_decode.sh
 #
@@ -81,9 +92,9 @@ export TOKENIZERS_PARALLELISM=true
 # ---------------------------------------------------------------------------
 
 # The model being steered, and the model mixed into it.
-MODEL_A=${MODEL_A:-"/home/data/shared/Qwen3-4b-base"}
-MODEL_B=${MODEL_B:-"/home/data/shared/Qwen3-4B-Instruct"}
-EVAL_PATH=${EVAL_PATH:-$HOME/LLM/Data/openr1/openr1_hard_mix64_restore_solonly_train_val128_flat.parquet}
+MODEL_A=${MODEL_A:-"/apdcephfs_qy3/share_301372554/share_info/zenohaowang/Model/Qwen3-4B-Base"}
+MODEL_B=${MODEL_B:-"/apdcephfs_qy3/share_301372554/share_info/zenohaowang/Model/Qwen3-4B-Instruct-2507"}
+EVAL_PATH=${EVAL_PATH:-"/apdcephfs_qy3/share_301372554/share_info/zenohaowang/LLM/Data/dapo_math/dapo_en_math_solution_9k_summarize_train_val128_flat.parquet"}
 
 # Fusion weights on model B, one run each. 0 must stay in the list (see header).
 # Ignored when FUSE=agree, which sweeps AGREE_TEACHER_MIN_PROBS instead.
@@ -103,7 +114,7 @@ FUSE=${FUSE:-agree}               # linear | contrastive | max | agree
 # distributions the top-k sets overlap almost completely, so k stops mattering
 # above ~10 while the floor still moves both the fallback rate and how often the
 # student's pick differs from the teacher's. So the sweep runs over it.
-AGREE_TEACHER_MIN_PROBS=${AGREE_TEACHER_MIN_PROBS:-0.05}
+AGREE_TEACHER_MIN_PROBS=${AGREE_TEACHER_MIN_PROBS:-0.01}
 AGREE_TOP_K=${AGREE_TOP_K:-10}
 # Per-side overrides, both defaulting to AGREE_TOP_K. They mean different things: the
 # teacher's bounds how much of the vocabulary it permits at all, the student's bounds how
@@ -111,7 +122,25 @@ AGREE_TOP_K=${AGREE_TOP_K:-10}
 # student's is the cheapest way to cut the fallback rate -- it reaches further for an
 # agreed token without widening what the teacher allows.
 AGREE_STUDENT_TOP_K=${AGREE_STUDENT_TOP_K:-50}
-AGREE_TEACHER_TOP_K=${AGREE_TEACHER_TOP_K:-8}
+AGREE_TEACHER_TOP_K=${AGREE_TEACHER_TOP_K:-5}
+# Set the teacher's k PER TOKEN as the smallest k leaving AGREE_TARGET_Z of the student's
+# mass standing, instead of fixing the width and letting Z_t fall where it may. A fixed
+# width makes the constraint's strength swing token by token -- where the models agree 5
+# ranks keep nearly all the student's mass, where they disagree the same 5 keep almost
+# none, which is where fallbacks fire. This widens the set only at those tokens, so the
+# allowed set is a superset of the fixed one and the fallback rate can only go down.
+#
+# 1 also SWITCHES WHAT THIS SCRIPT SWEEPS: AGREE_TEACHER_MIN_PROBS is ignored in this mode
+# (a floor caps Z_t from above, so the two would fight), so the sweep runs over
+# AGREE_TARGET_Z instead. AGREE_TEACHER_TOP_K becomes a floor on the width.
+AGREE_DYNAMIC_TOP_K=${AGREE_DYNAMIC_TOP_K:-0}
+# Comma-separated: the sweep list when AGREE_DYNAMIC_TOP_K=1. Read the summary's keep_ratio
+# column back against it -- that is the realised Z_t, and it should sit at or just above the
+# target. Below means AGREE_DYNAMIC_MAX_TOP_K is binding.
+AGREE_TARGET_Z=${AGREE_TARGET_Z:-0.3,0.5,0.7}
+# Ceiling on the k the target may ask for, so outright disagreement cannot open the set to
+# the whole vocabulary. Also the cost knob: the search works over a [rows, this] slice.
+AGREE_DYNAMIC_MAX_TOP_K=${AGREE_DYNAMIC_MAX_TOP_K:-200}
 # Only raise this to veto tokens the student is very reluctant to emit -- it
 # already ranks the survivors, so 0 is the natural default.
 AGREE_STUDENT_MIN_PROB=${AGREE_STUDENT_MIN_PROB:-0}
@@ -133,12 +162,12 @@ AGREE_FALLBACK=${AGREE_FALLBACK:-student}
 PROMPT_KEY=${PROMPT_KEY:-question_prompt}
 PROMPT_KEY_B=${PROMPT_KEY_B:-prompt}
 
-N_SAMPLES=${N_SAMPLES:-4}          # samples per question; >1 to see sampling variance
+N_SAMPLES=${N_SAMPLES:-1}          # samples per question; >1 to see sampling variance
 TEMPERATURE=${TEMPERATURE:-1}
-TOP_P=${TOP_P:-0.95}
+TOP_P=${TOP_P:-1}
 TOP_K=${TOP_K:--1}
-PROMPT_LENGTH=${PROMPT_LENGTH:-4096}      # rephrase prompts carry a draft, so longer than a bare question
-MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-8192}
+PROMPT_LENGTH=${PROMPT_LENGTH:-2048}      # rephrase prompts carry a draft, so longer than a bare question
+MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-10240}
 # Far smaller than the vLLM path's 256: there is no request-level scheduling here,
 # so the longest row in a batch holds up every other row in it.
 #
@@ -147,7 +176,7 @@ MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-8192}
 # row for a 4B pair at prompt+response 8192. On an 80GB card that puts the limit
 # around 20; past that expect OOM. Raise it while watching nvidia-smi, and halve it
 # for a 7B pair.
-BATCH_SIZE=${BATCH_SIZE:-32}
+BATCH_SIZE=${BATCH_SIZE:-64}
 LIMIT=${LIMIT:-0}                  # 0 = all rows; small values for a smoke run
 
 # --- throughput knobs ------------------------------------------------------
@@ -179,8 +208,10 @@ TRAJ_FILTER=${TRAJ_FILTER:-0}
 TRAJ_KEYWORDS=${TRAJ_KEYWORDS-"the draft,based on the draft,according to the draft,from the draft,the experience,based on the experience,according to the experience,the provided reasoning,based on the reasoning above"}
 TRAJ_INSTR_PHRASES=${TRAJ_INSTR_PHRASES-"your task is,output only,do not mention,self-contained solution,no meta-talk"}
 
-CODE_DIR=${CODE_DIR:-$HOME/LLM}
-LOG_ROOT=${LOG_ROOT:-$HOME/LLM/Train/verl/logs}
+
+WORKER_DIR="/apdcephfs_qy3/share_301372554/share_info/zenohaowang"
+CODE_DIR=${CODE_DIR:-$WORKER_DIR/LLM/}
+LOG_ROOT=${LOG_ROOT:-$WORKER_DIR/LLM/logs/joint_decoding}
 EXP_NAME=${EXP_NAME:-joint_$(date +%m%d_%H%M)}
 
 if [ -z "$MODEL_A" ] || [ -z "$MODEL_B" ]; then
@@ -204,11 +235,15 @@ echo "model names for labels: A=$NAME_A  B=$NAME_B"
 SWEEP_DIR=${LOG_ROOT}/${EXP_NAME}
 mkdir -p "$SWEEP_DIR"
 SUMMARY="${SWEEP_DIR}/summary.tsv"
-printf 'label\tavg_score\tmax_score\tavg_len_tokens\tlen_ok\tlen_bad\tfallback\tkeep_ratio\tstudent_prob\tans_err\tfmt_err\tfmt_ok_ans\toutput_dir\n' > "$SUMMARY"
+printf 'label\tavg_score\tmax_score\tavg_len_tokens\tlen_ok\tlen_bad\tfallback\tkeep_ratio\tkeep_low20\tstudent_prob\tans_err\tfmt_err\tfmt_ok_ans\toutput_dir\n' > "$SUMMARY"
 
-# The swept variable depends on the mode: a mixing weight for the blending modes,
-# a min-prob floor for the selection mode.
-if [ "$FUSE" = "agree" ]; then
+# The swept variable depends on the mode: a mixing weight for the blending modes, a
+# min-prob floor for the selection mode -- or the Z_t target, when the dynamic path makes
+# that floor a no-op and the target the only knob that still bites.
+if [ "$FUSE" = "agree" ] && [ "$AGREE_DYNAMIC_TOP_K" = "1" ]; then
+    IFS=',' read -r -a SWEEP_LIST <<< "$AGREE_TARGET_Z"
+    SWEEP_LABEL="target_z"
+elif [ "$FUSE" = "agree" ]; then
     IFS=',' read -r -a SWEEP_LIST <<< "$AGREE_TEACHER_MIN_PROBS"
     SWEEP_LABEL="teacher_min_prob"
 else
@@ -220,7 +255,11 @@ echo "  A: $MODEL_A  (student: picks within the allowed set)"
 echo "  B: $MODEL_B  (teacher: constrains the allowed set)"
 echo "  ${SWEEP_LABEL}s: ${SWEEP_LIST[*]}   (${GPU_NUM}-way data parallel)"
 if [ "$FUSE" = "agree" ]; then
-    echo "  student_top_k=${AGREE_STUDENT_TOP_K:-$AGREE_TOP_K}, teacher_top_k=${AGREE_TEACHER_TOP_K:-$AGREE_TOP_K}, student_min_prob=$AGREE_STUDENT_MIN_PROB, temperature=$TEMPERATURE, fallback=$AGREE_FALLBACK"
+    if [ "$AGREE_DYNAMIC_TOP_K" = "1" ]; then
+        echo "  student_top_k=${AGREE_STUDENT_TOP_K:-$AGREE_TOP_K}, teacher_top_k=dynamic in [${AGREE_TEACHER_TOP_K:-$AGREE_TOP_K}, $AGREE_DYNAMIC_MAX_TOP_K], student_min_prob=$AGREE_STUDENT_MIN_PROB, temperature=$TEMPERATURE, fallback=$AGREE_FALLBACK"
+    else
+        echo "  student_top_k=${AGREE_STUDENT_TOP_K:-$AGREE_TOP_K}, teacher_top_k=${AGREE_TEACHER_TOP_K:-$AGREE_TOP_K}, student_min_prob=$AGREE_STUDENT_MIN_PROB, temperature=$TEMPERATURE, fallback=$AGREE_FALLBACK"
+    fi
 fi
 
 cd "$CODE_DIR" || exit 1
@@ -234,7 +273,14 @@ for value in "${SWEEP_LIST[@]}"; do
         # The per-side k's go in the label because two runs differing only in them would
         # otherwise share an output directory and the second would overwrite the first.
         k_tag="k${AGREE_STUDENT_TOP_K:-$AGREE_TOP_K}.${AGREE_TEACHER_TOP_K:-$AGREE_TOP_K}"
-        label="${NAME_A}-x-${NAME_B}-agree-${k_tag}-tmp${value}-fb${AGREE_FALLBACK}"
+        if [ "$AGREE_DYNAMIC_TOP_K" = "1" ]; then
+            # tz, not tmp: the swept value is a Z_t target here, and a fixed-width run and a
+            # dynamic one at the same numeric value are different experiments that must not
+            # collide in one EXP_NAME.
+            label="${NAME_A}-x-${NAME_B}-agree-dyn-${k_tag}-tz${value}-fb${AGREE_FALLBACK}"
+        else
+            label="${NAME_A}-x-${NAME_B}-agree-${k_tag}-tmp${value}-fb${AGREE_FALLBACK}"
+        fi
     else
         label="${NAME_A}-x-${NAME_B}-${FUSE}-w${value}"
     fi
@@ -260,10 +306,21 @@ for value in "${SWEEP_LIST[@]}"; do
     # both modes: agree samples too, on the student branch and the fallback alike.
     if [ "$FUSE" = "agree" ]; then
         extra_args+=(--agree-top-k "$AGREE_TOP_K"
-                     --agree-teacher-min-prob "$value"
                      --agree-student-min-prob "$AGREE_STUDENT_MIN_PROB"
                      --agree-fallback "$AGREE_FALLBACK"
                      --temperature "$TEMPERATURE" --top-p "$TOP_P")
+        if [ "$AGREE_DYNAMIC_TOP_K" = "1" ]; then
+            # The swept value is the Z_t target in this mode. --agree-teacher-min-prob is
+            # passed as 0 rather than left at its default: the mode ignores it either way,
+            # and 0 is the honest encoding of "not in use" -- a non-zero value would draw
+            # joint_decode.py's "ignored" warning on every run in the sweep.
+            extra_args+=(--agree-dynamic-top-k
+                         --agree-target-z "$value"
+                         --agree-dynamic-max-top-k "$AGREE_DYNAMIC_MAX_TOP_K"
+                         --agree-teacher-min-prob 0)
+        else
+            extra_args+=(--agree-teacher-min-prob "$value")
+        fi
         # Empty means "inherit AGREE_TOP_K"; joint_decode.py resolves that, so only pass
         # the flag when it was actually set.
         if [ -n "$AGREE_STUDENT_TOP_K" ]; then
@@ -334,6 +391,13 @@ for value in "${SWEEP_LIST[@]}"; do
     #                    constraint bites: 1.0 means the teacher permitted everything the
     #                    student cared about, near 0 means the student is being pushed
     #                    onto tokens it thought unlikely. Fallback steps count as 0.
+    #   keep_low20    -- mean Z_t over each row's WORST 20% of tokens, then averaged over
+    #                    rows. The row mean above hides exactly the steps the constraint is
+    #                    doing its damage at: a run can average 0.6 while a fifth of its
+    #                    steps sit near 0, and those are the ones that drive the off-policy
+    #                    term to zero. Read the gap between the two columns -- a wide one
+    #                    means the constraint is concentrated on a few tokens rather than
+    #                    spread evenly, which is what dynamic top-k is meant to fix.
     #   student_prob  -- geometric-mean p_student of the emitted tokens. Falls as the
     #                    constraint pushes the student off its own preferences, so read
     #                    it against avg_score to see what the accuracy cost.
@@ -346,7 +410,7 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 files = sorted(glob.glob(f"{sys.argv[1]}/*.parquet"))
-means, maxes, lengths, fbs, logps, keeps = [], [], [], [], [], []
+means, maxes, lengths, fbs, logps, keeps, keeps_low = [], [], [], [], [], [], []
 len_ok, len_bad = [], []
 missing_lengths = False
 n_resp = n_answer_err = n_format_err = n_fmt_ok_ans = 0
@@ -374,7 +438,8 @@ for path in files:
     present = set(pq.read_schema(path).names)
     columns = ["test_score"] + [c for c in ("response_lengths", "fallback_frac",
                                             "student_mean_logp",
-                                            "teacher_keep_ratio") if c in present]
+                                            "teacher_keep_ratio",
+                                            "teacher_keep_ratio_low") if c in present]
     if "response_lengths" not in present:
         missing_lengths = True
     df = pd.read_parquet(path, columns=columns)
@@ -414,9 +479,11 @@ for path in files:
         logps.extend(v for row in df["student_mean_logp"] for v in row if _usable(v))
     if "teacher_keep_ratio" in df:
         keeps.extend(v for row in df["teacher_keep_ratio"] for v in row if _usable(v))
+    if "teacher_keep_ratio_low" in df:
+        keeps_low.extend(v for row in df["teacher_keep_ratio_low"] for v in row if _usable(v))
 
 if not means:
-    print("NA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA")
+    print("NA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA")
 else:
     def _mean_len(vals):
         # NA rather than 0 when a bucket is empty: an all-correct run has no wrong
@@ -428,6 +495,7 @@ else:
     bad_len = _mean_len(len_bad)
     fb = f"{sum(fbs) / len(fbs):.4f}" if fbs else "NA"
     kr = f"{sum(keeps) / len(keeps):.4f}" if keeps else "NA"
+    krl = f"{sum(keeps_low) / len(keeps_low):.4f}" if keeps_low else "NA"
     # exp of the mean per-token log-prob: a geometric mean, so it is not skewed by
     # response length the way a plain mean of probabilities would be.
     sp = f"{math.exp(sum(logps) / len(logps)):.4f}" if logps else "NA"
@@ -438,18 +506,32 @@ else:
     else:
         ans_err = fmt_err = fmt_ok = "NA"
     print(f"{sum(means) / len(means):.4f}\t{sum(maxes) / len(maxes):.4f}\t{avg_len}\t"
-          f"{ok_len}\t{bad_len}\t{fb}\t{kr}\t{sp}\t{ans_err}\t{fmt_err}\t{fmt_ok}")
+          f"{ok_len}\t{bad_len}\t{fb}\t{kr}\t{krl}\t{sp}\t{ans_err}\t{fmt_err}\t{fmt_ok}")
 PYEOF
 )
     printf '%s\t%s\t%s\n' "$label" "$metrics" "$out_dir" >> "$SUMMARY"
-    echo "=== [$label] score/max/len/len_ok/len_bad/fallback/keep_ratio/student_prob/ans_err/fmt_err/fmt_ok_ans: $metrics ==="
+    echo "=== [$label] score/max/len/len_ok/len_bad/fallback/keep_ratio/keep_low20/student_prob/ans_err/fmt_err/fmt_ok_ans: $metrics ==="
 done
 
 echo
 echo "=== joint-decode summary ($SUMMARY) ==="
 column -t "$SUMMARY" 2>/dev/null || cat "$SUMMARY"
 echo
-if [ "$FUSE" = "agree" ]; then
+if [ "$FUSE" = "agree" ] && [ "$AGREE_DYNAMIC_TOP_K" = "1" ]; then
+    echo "reminder: read the 'keep_ratio' column above -- under AGREE_DYNAMIC_TOP_K it is the"
+    echo "  REALISED Z_t against the target that was asked for, so it should sit at or just"
+    echo "  above each row's tz value. Below means AGREE_DYNAMIC_MAX_TOP_K=$AGREE_DYNAMIC_MAX_TOP_K"
+    echo "  is binding: the teacher's set could not widen far enough to leave that much of the"
+    echo "  student's mass standing. The 'fallback' column should be LOWER than a fixed-width"
+    echo "  run at the same teacher_top_k -- the allowed set is a superset of the fixed one, so"
+    echo "  it can only go down; if it did not, the student's knobs are what is binding."
+    echo "  'keep_low20' is the mean Z_t over each row's worst 20% of tokens: the target is"
+    echo "  a per-token floor, so a keep_ratio that hits it while keep_low20 sits far below"
+    echo "  means the cap is binding on precisely the tokens the target was meant to protect."
+    echo "  'student_prob' is the geometric-mean p_student of the emitted tokens: it falls"
+    echo "  as the constraint pushes the student off its own preferences, so read it next"
+    echo "  to avg_score to see what that constraint bought or cost."
+elif [ "$FUSE" = "agree" ]; then
     echo "reminder: read the 'fallback' column above -- it is the share of tokens where the"
     echo "  constraint left no candidate and AGREE_FALLBACK=$AGREE_FALLBACK decided instead."
     echo "  Near 1.0 = the overlap was almost always empty, so the run collapsed to plain"
@@ -459,6 +541,10 @@ if [ "$FUSE" = "agree" ]; then
     echo "  AGREE_STUDENT_TOP_K to let the student reach further for an agreed token"
     echo "  without widening what the teacher permits."
     echo "  until it lands there."
+    echo "  'keep_low20' is the mean Z_t over each row's worst 20% of tokens. A wide gap"
+    echo "  between it and keep_ratio means the constraint is concentrated on a few tokens"
+    echo "  rather than spread evenly -- try AGREE_DYNAMIC_TOP_K=1, which widens the"
+    echo "  teacher's set only at those tokens."
     echo "  'student_prob' is the geometric-mean p_student of the emitted tokens: it falls"
     echo "  as the constraint pushes the student off its own preferences, so read it next"
     echo "  to avg_score to see what that constraint bought or cost."

@@ -16,7 +16,8 @@ Two families of rule, chosen with ``--fuse``:
   the teacher steers direction while the student picks the token it finds most
   natural. When nothing survives there is no agreement to honour and the step
   samples from the teacher instead. Both branches respect ``--temperature`` /
-  ``--top-p``.
+  ``--top-p``. ``--agree-dynamic-top-k`` sets the teacher's k per token from a
+  target Z_t rather than fixing its width.
 
 Data parallelism: launch under torchrun and each rank decodes its own slice of the rows
 onto its own GPU. Ranks never talk to each other, so there is no process group to
@@ -49,6 +50,12 @@ Usage:
     torchrun --standalone --nproc_per_node=4 Data/joint_decode.py \\
         --model-a ... --model-b ... --input ... --output-dir ... \\
         --fuse agree --agree-top-k 10 --agree-teacher-min-prob 0.05
+
+    # the same, with the teacher's k set per token to hold Z_t at 0.5 instead of
+    # fixing its width (--agree-teacher-min-prob is then ignored)
+    torchrun --standalone --nproc_per_node=4 Data/joint_decode.py \\
+        --model-a ... --model-b ... --input ... --output-dir ... \\
+        --fuse agree --agree-dynamic-top-k --agree-target-z 0.5
 
 ``--fuse-weight 0`` reduces exactly to model A alone; with ``--temperature 0`` it
 must reproduce A's greedy output token for token, which is the sanity check that
@@ -90,6 +97,12 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "Myverl"))
 
 from verl.custom.joint_decode_core import joint_generate, last_logit_kwargs  # noqa: E402
+
+# Tail fraction of a row's tokens that teacher_keep_ratio_low averages over. Not a flag:
+# the column has to mean the same thing in every row of a sweep's summary table to be
+# comparable, and 0.2 is wide enough to be stable on short rows while still isolating the
+# steps where the constraint actually bites.
+_LOW_Z_QUANTILE = 0.2
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +231,28 @@ def parse_args() -> argparse.Namespace:
                         "teacher allows. Defaults to --agree-top-k.")
     p.add_argument("--agree-teacher-top-k", type=int, default=None,
                    help="--fuse agree: how much of the vocabulary the TEACHER permits at all. "
-                        "This is the width of the allowed region. Defaults to --agree-top-k.")
+                        "This is the width of the allowed region. Defaults to --agree-top-k; "
+                        "under --agree-dynamic-top-k it becomes the MINIMUM width instead.")
+    p.add_argument("--agree-dynamic-top-k", action="store_true",
+                   help="--fuse agree: set the teacher's k PER TOKEN, as the smallest k leaving "
+                        "--agree-target-z of the student's mass standing, instead of fixing the "
+                        "width and letting Z_t fall where it may. A fixed width makes the "
+                        "constraint swing token by token -- where the models agree 10 ranks keep "
+                        "nearly all the student's mass, where they disagree the same 10 keep "
+                        "almost none, which is exactly where fallbacks fire. This widens the set "
+                        "only at those tokens, so the allowed set is a superset of the fixed one "
+                        "and the fallback rate can only go down. Ignores "
+                        "--agree-teacher-min-prob (a floor caps Z_t from above, so the two would "
+                        "fight); the student's knobs still apply.")
+    p.add_argument("--agree-target-z", type=float, default=0.5,
+                   help="--agree-dynamic-top-k: the Z_t to aim for. Read back as the summary's "
+                        "keep_ratio column, which should sit at or just above this -- below "
+                        "means --agree-dynamic-max-top-k is binding (default: %(default)s)")
+    p.add_argument("--agree-dynamic-max-top-k", type=int, default=200,
+                   help="--agree-dynamic-top-k: ceiling on the k the target may ask for, so "
+                        "outright disagreement cannot open the set to the whole vocabulary. Also "
+                        "the cost knob -- the search works over a [rows, this] slice per step "
+                        "(default: %(default)s)")
     p.add_argument("--agree-teacher-min-prob", type=float, default=0.05,
                    help="--fuse agree: a candidate needs p >= this under the TEACHER (model B). "
                         "This is the knob that sets how wide the allowed region is. 0 disables "
@@ -317,6 +351,25 @@ def main() -> int:
         if args.fuse_weight != 0.5:
             print(f"[warn] --fuse agree ignores --fuse-weight {args.fuse_weight}: it constrains "
                   f"and selects rather than blending", file=sys.stderr)
+        # A probability floor caps Z_t from above, so it and the Z_t target would fight and
+        # the target would be silently unreachable. The dynamic path drops the floor
+        # (_teacher_set_for_z does not read it), so say so rather than let a swept value
+        # look as if it did something.
+        if args.agree_dynamic_top_k and args.agree_teacher_min_prob > 0:
+            print(f"[warn] --agree-dynamic-top-k ignores --agree-teacher-min-prob "
+                  f"{args.agree_teacher_min_prob}: a floor caps Z_t from above, so it would "
+                  f"fight the --agree-target-z {args.agree_target_z} target", file=sys.stderr)
+        if args.agree_dynamic_top_k and not 0.0 < args.agree_target_z <= 1.0:
+            print(f"[fatal] --agree-target-z must be in (0, 1], got {args.agree_target_z}",
+                  file=sys.stderr)
+            return 2
+        if args.agree_dynamic_top_k and args.agree_dynamic_max_top_k < args.agree_teacher_top_k:
+            # The core clamps these into order, so this would run -- just not at the width the
+            # flags asked for. Fail instead of deciding which one the user meant.
+            print(f"[fatal] --agree-dynamic-max-top-k {args.agree_dynamic_max_top_k} is below "
+                  f"--agree-teacher-top-k {args.agree_teacher_top_k}, which is the MINIMUM "
+                  f"width under --agree-dynamic-top-k", file=sys.stderr)
+            return 2
         for name, value in (("--agree-teacher-min-prob", args.agree_teacher_min_prob),
                             ("--agree-student-min-prob", args.agree_student_min_prob)):
             if not 0.0 <= value <= 1.0:
@@ -488,6 +541,7 @@ def main() -> int:
     fb_frac: list[list[float]] = [[] for _ in range(len(shard))]
     mean_logp: list[list[float]] = [[] for _ in range(len(shard))]
     mean_z: list[list[float]] = [[] for _ in range(len(shard))]
+    low_z: list[list[float]] = [[] for _ in range(len(shard))]
 
     total_tokens = 0
     fallback_tokens = 0
@@ -519,8 +573,9 @@ def main() -> int:
             # exists for the training path, where it weights the off-policy loss
             # (verl/custom/joint_sr.py). Discarded here rather than written out: a
             # [rows, 14336] float column would dominate the parquet, and nothing downstream
-            # of a sweep reads it. The row-mean Z_t is still reported as teacher_keep_ratio.
-            responses, lengths, fb_row, logp_row, z_row, _log_z, n_narrow = joint_generate(
+            # of a sweep reads it. The row-mean Z_t is still reported as teacher_keep_ratio,
+            # and z_tok -- the per-token Z_t -- is reduced to a low-tail mean per row below.
+            responses, lengths, fb_row, logp_row, z_row, _log_z, n_narrow, z_tok = joint_generate(
                 model_a, model_b, batch_a, batch_b, eos_ids=eos_ids, pad_id=pad_id, args=args,
             )
             narrow_steps += n_narrow
@@ -540,6 +595,17 @@ def main() -> int:
                 mean_z[begin + row].append(
                     float(z_row[row].item()) / n_tok if n_tok else float("nan")
                 )
+                # Mean over the WORST decile-and-a-bit of the row's tokens. The row mean
+                # hides exactly the tokens the constraint is doing its damage at: a run
+                # can average 0.6 while a fifth of its steps sit near 0, and those are
+                # the steps that drive the off-policy term to zero. ceil, so a short row
+                # contributes its single worst token rather than none.
+                if n_tok:
+                    k = max(1, math.ceil(n_tok * _LOW_Z_QUANTILE))
+                    worst = torch.topk(z_tok[row, :n_tok], k, largest=False).values
+                    low_z[begin + row].append(float(worst.mean().item()))
+                else:
+                    low_z[begin + row].append(float("nan"))
                 fallback_tokens += n_fb
                 decided_tokens += n_tok
                 total_tokens += n_tok
@@ -593,11 +659,19 @@ def main() -> int:
         # response: it lets the student reach further down its own ranking for a token
         # the teacher already permits, without widening what the teacher permits.
         rate = fallback_tokens / decided_tokens
+        # The knobs in force differ by mode: under the dynamic path the teacher's k is
+        # per-token and its floor is ignored, so printing the fixed-width settings would
+        # name values that had no effect.
+        if args.agree_dynamic_top_k:
+            teacher_desc = (f"teacher_top_k=dyn[{args.agree_teacher_top_k}, "
+                            f"{args.agree_dynamic_max_top_k}]@z{args.agree_target_z}")
+        else:
+            teacher_desc = (f"teacher_top_k={args.agree_teacher_top_k}, "
+                            f"teacher_min_prob={args.agree_teacher_min_prob}")
         print(f"[rank {rank}] fallback to {args.agree_fallback} on "
               f"{fallback_tokens:,}/{decided_tokens:,} tokens = {rate:.1%} "
               f"(student_top_k={args.agree_student_top_k}, "
-              f"teacher_top_k={args.agree_teacher_top_k}, "
-              f"teacher_min_prob={args.agree_teacher_min_prob}, "
+              f"{teacher_desc}, "
               f"student_min_prob={args.agree_student_min_prob})", flush=True)
         # Z_t averaged over emitted tokens: the share of the student's probability mass
         # the teacher left standing. Near 1.0 the constraint is nominal; near 0 the
@@ -605,13 +679,30 @@ def main() -> int:
         # student_prob then pays for.
         finite_z = [v for row in mean_z for v in row if not math.isnan(v)]
         if finite_z:
-            print(f"[rank {rank}] teacher_keep_ratio (mean Z_t) = "
-                  f"{sum(finite_z) / len(finite_z):.4f}", flush=True)
+            mean_keep = sum(finite_z) / len(finite_z)
+            print(f"[rank {rank}] teacher_keep_ratio (mean Z_t) = {mean_keep:.4f}", flush=True)
+            # The low tail, which the mean hides: a run can average 0.6 while a fifth of
+            # its steps sit near 0, and those are the steps the constraint is actually
+            # costing something at.
+            finite_low = [v for row in low_z for v in row if not math.isnan(v)]
+            if finite_low:
+                pct = int(_LOW_Z_QUANTILE * 100)
+                print(f"[rank {rank}] teacher_keep_ratio_low (mean Z_t over each row's "
+                      f"worst {pct}% of tokens) = "
+                      f"{sum(finite_low) / len(finite_low):.4f}", flush=True)
+            # Under the dynamic path this is the realised value of what was asked for, so
+            # a shortfall is actionable: the only way the target is missed is the cap.
+            if args.agree_dynamic_top_k and mean_keep < args.agree_target_z - 0.02:
+                print(f"[warn] realised Z_t {mean_keep:.4f} is below the "
+                      f"--agree-target-z {args.agree_target_z}: "
+                      f"--agree-dynamic-max-top-k {args.agree_dynamic_max_top_k} is binding",
+                      file=sys.stderr, flush=True)
 
     shard["responses"] = texts
     shard["fallback_frac"] = fb_frac
     shard["student_mean_logp"] = mean_logp
     shard["teacher_keep_ratio"] = mean_z
+    shard["teacher_keep_ratio_low"] = low_z
     shard["response_lengths"] = tok_lens
 
     if not args.no_score:

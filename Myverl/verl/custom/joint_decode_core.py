@@ -376,14 +376,20 @@ def joint_generate(model_a, model_b, batch_a, batch_b, *, eos_ids, pad_id, args)
     same split the trainer's sr_logprob_prompt uses.
 
     Returns (responses [B, T] padded with pad_id, lengths [B], fb_rows [B],
-    logp_rows [B], z_rows [B], log_z [B, T], n_narrow). fb_rows counts teacher-fallback
-    tokens per row and stays 0 outside ``fuse='agree'``; logp_rows sums log p_student
-    over the emitted tokens and z_rows sums the surviving student mass, so dividing
-    either by lengths gives a per-row mean; log_z holds the PER-TOKEN
+    logp_rows [B], z_rows [B], log_z [B, T], n_narrow, z [B, T]). fb_rows counts
+    teacher-fallback tokens per row and stays 0 outside ``fuse='agree'``; logp_rows sums
+    log p_student over the emitted tokens and z_rows sums the surviving student mass, so
+    dividing either by lengths gives a per-row mean; log_z holds the PER-TOKEN
     ``log Z_t = log p_t - log mu_t``, the cost of the teacher's constraint, which the
     trainer multiplies the off-policy loss by AFTER clipping (0 past a row's end, so
     exp() gives a neutral factor of 1 there); n_narrow counts row-steps where top-p's
-    nucleus ran past sample_next's candidate cap.
+    nucleus ran past sample_next's candidate cap; z holds the per-token Z_t that z_rows
+    sums, for callers wanting a distribution over it rather than a mean.
+
+    z is NOT recoverable from log_z: they agree on an eligible step but not on a fallback
+    one, where log_z compares the student against whichever distribution decided (0 under
+    ``fallback='student'``) while z is 0 by the z_rows convention -- nothing survived, so
+    no mass did.
 
     NOTE that log_z is a coefficient, NOT the importance ratio's denominator. The
     denominator is the actor's own ``old_log_probs``, which the trainer already computes:
@@ -468,6 +474,12 @@ def joint_generate(model_a, model_b, batch_a, batch_b, *, eos_ids, pad_id, args)
     # rather than a spurious one, and the masked sums downstream ignore it anyway. Cheap:
     # 128 rows x 14336 tokens in fp32 is 7.3MB, three orders below the KV cache.
     out_log_z = torch.zeros((n_rows, args.max_new_tokens), dtype=torch.float32, device=device)
+    # Per-token Z_t, laid out the same way. Distinct from out_log_z, which is NOT a
+    # rescaling of it: on a fallback step log_z is log p_student - log mu_fallback (0 under
+    # fallback='student'), whereas Z_t is 0 there by the z_rows convention -- nothing
+    # survived, so no mass did. Only this tensor supports a quantile over the constraint's
+    # per-token strength; a row sum cannot be reduced to one after the fact.
+    out_z = torch.zeros((n_rows, args.max_new_tokens), dtype=torch.float32, device=device)
     alive_idx = torch.arange(n_rows, device=device)
     alive = torch.ones(n_rows, dtype=torch.bool, device=device)
     # batch_select_indices is a DynamicCache method (transformers uses it for
@@ -499,6 +511,9 @@ def joint_generate(model_a, model_b, batch_a, batch_b, *, eos_ids, pad_id, args)
             z_rows.index_add_(0, alive_idx,
                               torch.where(alive, z_t.double(),
                                           torch.zeros_like(z_t, dtype=torch.float64)))
+            # Same value, kept per token so a quantile can be taken over it. Written from
+            # the same `z_t` in the same branch as the row sum, so the two cannot drift.
+            out_z[alive_idx, step] = torch.where(alive, z_t, torch.zeros_like(z_t)).float()
         else:
             scores = fuse_logits(last_a, last_b, args.fuse, args.fuse_weight)
             nxt = sample_next(scores, args.temperature, args.top_p, args.top_k,
@@ -582,4 +597,4 @@ def joint_generate(model_a, model_b, batch_a, batch_b, *, eos_ids, pad_id, args)
 
     return (out_tokens[:, :steps_run].cpu(), lengths.cpu(), fb_rows.cpu(),
             logp_rows.cpu(), z_rows.cpu(), out_log_z[:, :steps_run].cpu(),
-            int(narrow.item()))
+            int(narrow.item()), out_z[:, :steps_run].cpu())

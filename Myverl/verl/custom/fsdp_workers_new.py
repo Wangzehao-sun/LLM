@@ -1022,7 +1022,9 @@ class NewActorRolloutRefWorker(Worker, DistProfilerExtension):
         n_narrow = 0
         try:
             with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
-                out_ids, out_len, fb_row, logp_row, z_row, log_z, n_narrow = joint_generate(
+                # The trailing per-token Z_t is for offline sweeps taking a quantile over it;
+                # the row mean below is all the training metrics need.
+                out_ids, out_len, fb_row, logp_row, z_row, log_z, n_narrow, _z_tok = joint_generate(
                     student, teacher, student_batch, teacher_batch,
                     eos_ids=eos_ids, pad_id=pad_id, args=cfg,
                 )
