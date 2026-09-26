@@ -9,6 +9,7 @@ unset ROCR_VISIBLE_DEVICES
 GPU_DEVICES=${GPU_DEVICES:-${CUDA_VISIBLE_DEVICES:-0,1,2,3}}
 export CUDA_VISIBLE_DEVICES=$GPU_DEVICES
 
+export RAY_ADDRESS=local
 echo $HOME
 export RAY_DEDUP_LOGS=0
 export WANDB_MODE=offline
@@ -17,7 +18,8 @@ export WANDB_MODE=offline
 
 # ---- data paths (mirrors train_hype_summarize's WORKER_DIR layout) ----
 WORKER_DIR=${WORKER_DIR:-/apdcephfs_qy3/share_301372554/share_info/zenohaowang}
-
+MODEL_DIR=${MODEL_DIR:-$WORKER_DIR/Model}
+MODEL_PATH=${MODEL_PATH:-$MODEL_DIR/Qwen3-4B-Base}
 # ---- the checkpoints to evaluate: "name:path", one per line ----
 # The name is what labels this checkpoint everywhere -- summary column, log file,
 # output dirs, tensorboard run. An optional third field ":/path/to/base_model"
@@ -25,23 +27,25 @@ WORKER_DIR=${WORKER_DIR:-/apdcephfs_qy3/share_301372554/share_info/zenohaowang}
 # model instead. Setting CKPTS in the environment replaces this list.
 CKPT_ROOT=${CKPT_ROOT:-$WORKER_DIR/LLM/zhwang_logs/train_4b}
 CKPTS=${CKPTS:-"
-  step20:$CKPT_ROOT/<project>/training_128_64/ckpt/global_step_20
-  step40:$CKPT_ROOT/<project>/training_128_64/ckpt/global_step_40
-  base:base
+  picorl-k10-step100:$CKPT_ROOT/train_rl-rl_hype_summarize_mix_rl-rl_clip_with_z_Qwen3-4B-Base_dapo_en_math_solution_9k_random_summarize_train/training_128_64/ckpt/global_step_100
 "}
 
 # The train dataloader is built even for a val-only run, and RLHFDatasetWithTarget
-# needs the summarize columns, so this has to stay a real training parquet.
+# needs the summarize columns, so this has to stay8a real training parquet.
 # train_batch_size cannot be shrunk to speed up that construction either --
 # ray_trainer.py:439 asserts train_batch_size >= ppo_mini_batch_size.
 TRAIN_FILES=${TRAIN_FILES:-$WORKER_DIR/LLM/Data/dapo_math/dapo_en_math_solution_9k_random_summarize_train.parquet}
 
-test1_path=$WORKER_DIR/LLM/Data/test/aime24_nothink_repeat16.parquet
+test1_path=$WORKER_DIR/LLM/Data/test/aime26_nothink_repeat16.parquet
 test2_path=$WORKER_DIR/LLM/Data/test/aime25_nothink_repeat16.parquet
 test3_path=$WORKER_DIR/LLM/Data/test/amc_nothink.parquet
 test4_path=$WORKER_DIR/LLM/Data/test/math500_nothink.parquet
 test5_path=$WORKER_DIR/LLM/Data/test/hmmt26_nothink_repeat16.parquet
-VAL_FILES=${VAL_FILES:-"$test2_path,$test3_path,$test5_path"}
+test6_path=$WORKER_DIR/LLM/Data/test/gpqa_diamond_nothink.parquet
+test7_path=$WORKER_DIR/LLM/Data/test/hle_nothink.parquet
+#VAL_FILES=${VAL_FILES:-"$test6_path,$test7_path"}
+
+VAL_FILES=${VAL_FILES:-"$test1_path,$test2_path,$test4_path,$test5_path"}
 
 # Optional: leave empty to skip the rephraser metric entirely. _validate_summarize
 # returns {} when data.summarize_val_files is unset (new_ray_trainer.py:2282).
@@ -62,8 +66,6 @@ name="vanilla"
 # while its huggingface/ subdir holds only config and tokenizer, no weights
 # (fsdp_checkpoint_manager.py:236-248, since save_contents has no 'hf_model').
 # Override here, via the environment, or per entry with an entry's third field.
-MODEL_DIR=${MODEL_DIR:-$WORKER_DIR/Model}
-MODEL_PATH=${MODEL_PATH:-$MODEL_DIR/Qwen3-4B-Base}
 
 PROJECT_NAME=${PROJECT_NAME:-"eval_$(date +%m%d_%H%M)"}
 LOG_DIR=${LOG_DIR:-$WORKER_DIR/LLM/zhwang_logs/eval_4b/${PROJECT_NAME}}
@@ -79,7 +81,7 @@ TENSOR_PARALLEL=${TENSOR_PARALLEL:-1}
 # it may exceed the row count. It cannot be left unset though: with
 # data.val_batch_size=null, _create_dataloader reads len(self.val_dataset) one
 # line before that attribute is assigned (new_ray_trainer.py:913-916) and dies.
-VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-256}
+VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-512}
 
 # ---------------------------------------------------------------------------
 # Parse the checkpoint map into LABELS / CKPT_PATHS / CKPT_MODELS.
@@ -184,7 +186,7 @@ for i in "${!LABELS[@]}"; do
         data.train_batch_size=128 \
         data.val_batch_size=$VAL_BATCH_SIZE \
         data.max_prompt_length=2048 \
-        data.max_response_length=20480 \
+        data.max_response_length=16384 \
         data.return_full_prompt=True \
         data.filter_overlong_prompts=True \
         data.filter_overlong_prompts_workers=4 \
@@ -218,7 +220,7 @@ for i in "${!LABELS[@]}"; do
         actor_rollout_ref.rollout.temperature=1.0 \
         actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
         actor_rollout_ref.rollout.val_kwargs.do_sample=True \
-        actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
+        actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
         actor_rollout_ref.rollout.n=8 \
         actor_rollout_ref.rollout.prompt_length=8192 \
         +actor_rollout_ref.rollout.prefix_mode=summarize \

@@ -120,11 +120,11 @@ agree_teacher_top_k: 10
 agree_dynamic_top_k: False
 
 # The Z_t to aim for. Only read when agree_dynamic_top_k is on.
-agree_target_z: 0.5
+agree_target_z: 0.9
 
 # Ceiling on the k the target may ask for, so outright disagreement cannot open the set to the
 # whole vocabulary. Also the cost knob: the search works over a [rows, this] slice per step.
-agree_dynamic_max_top_k: 200
+agree_dynamic_max_top_k: 20
 
 # Probability floors, applied on top of the top-k intersection. 0 disables a side.
 # The teacher's floor sets how wide the allowed region is; the student's only drops
@@ -200,7 +200,7 @@ max_questions_per_step: 0
 # defaults to 1 rather than to the row budget.
 #
 # Watch batch/sr_joint_k (the K actually used) and batch/sr_joint_rows (W*K).
-max_k: 4
+max_k: 2
 
 # Rows to aim for when deriving K. 0 = batch_size * n_gpus, the whole budget. Clamped to that
 # budget in any case, since it cannot decode rows the GPUs cannot hold.
