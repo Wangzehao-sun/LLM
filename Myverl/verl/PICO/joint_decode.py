@@ -1,7 +1,7 @@
 """Joint decoding: combine two models' predictions at every generated token.
 
 This is the OFFLINE EVALUATION driver -- CLI, sharding, parquet I/O, prompt rendering,
-scoring. The decoding itself lives in ``verl.custom.joint_decode_core``, which this
+scoring. The decoding itself lives in ``verl.PICO.joint_decode_core``, which this
 imports; see that module for what the fusion rules actually do and why the loop is a
 hand-written HF one rather than vLLM.
 
@@ -15,9 +15,9 @@ Two families of rule, chosen with ``--fuse``:
   probability floor. The STUDENT (model A) then samples among the survivors, so
   the teacher steers direction while the student picks the token it finds most
   natural. When nothing survives there is no agreement to honour and the step
-  samples from the teacher instead. Both branches respect ``--temperature`` /
-  ``--top-p``. ``--agree-dynamic-top-k`` sets the teacher's k per token from a
-  target Z_t rather than fixing its width.
+  falls back to ``--agree-fallback``. Both branches respect ``--temperature`` /
+  ``--top-p``. ``--agree-dynamic-top-k`` widens the teacher's k per token where the
+  fixed set keeps too little of the student's mass.
 
 Data parallelism: launch under torchrun and each rank decodes its own slice of the rows
 onto its own GPU. Ranks never talk to each other, so there is no process group to
@@ -26,34 +26,34 @@ batch. Every downstream reader (``aggregate_sr_responses.py:119``,
 ``sweep_sft_checkpoints.sh``) globs ``*.parquet``, so no merge step is needed.
 
 The same decode core also runs INSIDE training, on the actor's own worker, to produce the
-summarize-replacement candidate (``NewActorRolloutRefWorker.generate_joint`` ->
-``verl/custom/joint_sr.py``). There the student is the model being TRAINED rather than a
+summarize-replacement candidate (``PICOActorRolloutRefWorker.generate_joint`` ->
+``verl/PICO/joint_sr.py``). There the student is the model being TRAINED rather than a
 frozen checkpoint. That path is throughput-bound for the reasons the core module explains, so
 it is confined to a small number of questions per step. This script stays the way to sweep
 settings cheaply before committing one to a training run.
 
-Usage:
+Usage, from Myverl/ (examples/h20/run_joint_decode.sh wraps the sweep):
 
     # 4-way data parallel
-    torchrun --standalone --nproc_per_node=4 Data/joint_decode.py \\
+    torchrun --standalone --nproc_per_node=4 -m verl.PICO.joint_decode \\
         --model-a /home/data/shared/Qwen3-4b-base \\
         --model-b /home/data/shared/rephraser-ckpt \\
-        --input   Data/eval_rephrase_flat.parquet \\
+        --input   ../Data/eval_rephrase_flat.parquet \\
         --output-dir /tmp/joint_out \\
         --fuse linear --fuse-weight 0.5
 
     # single GPU, no torchrun needed (RANK defaults to 0, WORLD_SIZE to 1)
-    python Data/joint_decode.py --model-a ... --model-b ... \\
+    python -m verl.PICO.joint_decode --model-a ... --model-b ... \\
         --input ... --output-dir ... --fuse-weight 0
 
     # top-k agreement: teacher B constrains, student A picks
-    torchrun --standalone --nproc_per_node=4 Data/joint_decode.py \\
+    torchrun --standalone --nproc_per_node=4 -m verl.PICO.joint_decode \\
         --model-a ... --model-b ... --input ... --output-dir ... \\
         --fuse agree --agree-top-k 10 --agree-teacher-min-prob 0.05
 
-    # the same, with the teacher's k set per token to hold Z_t at 0.5 instead of
-    # fixing its width (--agree-teacher-min-prob is then ignored)
-    torchrun --standalone --nproc_per_node=4 Data/joint_decode.py \\
+    # the same, widening the teacher's k per token where the fixed set keeps less than 0.5
+    # of the student's mass; tokens still short at the cap fall back
+    torchrun --standalone --nproc_per_node=4 -m verl.PICO.joint_decode \\
         --model-a ... --model-b ... --input ... --output-dir ... \\
         --fuse agree --agree-dynamic-top-k --agree-target-z 0.5
 
@@ -80,23 +80,10 @@ import numpy as np
 import pandas as pd
 import torch
 
-
-# ---------------------------------------------------------------------------
-# The decode core -- fusion, agreement, sampling, and the KV-cache loop -- lives in the
-# verl package rather than here, because it now has a SECOND caller:
-# NewActorRolloutRefWorker.generate_joint runs the same loop on the actor's own worker to
-# produce the summarize-replacement candidate during training. One copy is what makes the
-# offline numbers and the training behaviour the same thing, instead of two
-# implementations that agree until they drift.
-#
-# The direction of the import is fixed by CLAUDE.md: reusable package code belongs under
-# Myverl/verl/, and Data/ scripts may import from verl but never the reverse. main()
-# already extends sys.path this way to reach the reward function; hoisting it here keeps
-# one rule for the whole file.
-# ---------------------------------------------------------------------------
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "Myverl"))
-
-from verl.custom.joint_decode_core import joint_generate, last_logit_kwargs  # noqa: E402
+# The decode core -- fusion, agreement, sampling, and the KV-cache loop -- is shared with
+# training: PICOActorRolloutRefWorker.generate_joint runs the same loop on the actor's own
+# worker. One copy is what makes the offline numbers and the training behaviour the same thing.
+from verl.PICO.joint_decode_core import joint_generate, last_logit_kwargs
 
 # Tail fraction of a row's tokens that teacher_keep_ratio_low averages over. Not a flag:
 # the column has to mean the same thing in every row of a sweep's summary table to be
@@ -232,27 +219,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--agree-teacher-top-k", type=int, default=None,
                    help="--fuse agree: how much of the vocabulary the TEACHER permits at all. "
                         "This is the width of the allowed region. Defaults to --agree-top-k; "
-                        "under --agree-dynamic-top-k it becomes the MINIMUM width instead.")
+                        "under --agree-dynamic-top-k it is the STARTING width, widened only "
+                        "where it keeps too little of the student's mass.")
     p.add_argument("--agree-dynamic-top-k", action="store_true",
-                   help="--fuse agree: set the teacher's k PER TOKEN, as the smallest k leaving "
-                        "--agree-target-z of the student's mass standing, instead of fixing the "
-                        "width and letting Z_t fall where it may. A fixed width makes the "
-                        "constraint swing token by token -- where the models agree 10 ranks keep "
-                        "nearly all the student's mass, where they disagree the same 10 keep "
-                        "almost none, which is exactly where fallbacks fire. This widens the set "
-                        "only at those tokens, so the allowed set is a superset of the fixed one "
-                        "and the fallback rate can only go down. Ignores "
-                        "--agree-teacher-min-prob (a floor caps Z_t from above, so the two would "
-                        "fight); the student's knobs still apply.")
+                   help="--fuse agree: widen the teacher's k per token where needed. First "
+                        "intersect as usual (--agree-teacher-top-k, --agree-teacher-min-prob) and "
+                        "compute Z_t; tokens below --agree-target-z widen the teacher's k (no "
+                        "min-prob floor) up to --agree-dynamic-max-top-k, taking the smallest k "
+                        "that reaches the target; tokens still short at the cap fall back "
+                        "(--agree-fallback). Every non-fallback token then keeps at least the "
+                        "target of the student's mass; the fallback rate can be HIGHER than at "
+                        "the fixed width, since step 3 falls back non-empty sets below target.")
     p.add_argument("--agree-target-z", type=float, default=0.5,
-                   help="--agree-dynamic-top-k: the Z_t to aim for. Read back as the summary's "
-                        "keep_ratio column, which should sit at or just above this -- below "
-                        "means --agree-dynamic-max-top-k is binding (default: %(default)s)")
+                   help="--agree-dynamic-top-k: the Z_t every non-fallback token must keep. "
+                        "Tokens the cap cannot bring up to it fall back, so read the summary's "
+                        "fallback column against it (default: %(default)s)")
     p.add_argument("--agree-dynamic-max-top-k", type=int, default=200,
-                   help="--agree-dynamic-top-k: ceiling on the k the target may ask for, so "
-                        "outright disagreement cannot open the set to the whole vocabulary. Also "
-                        "the cost knob -- the search works over a [rows, this] slice per step "
-                        "(default: %(default)s)")
+                   help="--agree-dynamic-top-k: ceiling on how far the teacher's k may widen; a "
+                        "token still below target here falls back. Also the cost knob -- the "
+                        "search works over a [rows, this] slice per step (default: %(default)s)")
     p.add_argument("--agree-teacher-min-prob", type=float, default=0.05,
                    help="--fuse agree: a candidate needs p >= this under the TEACHER (model B). "
                         "This is the knob that sets how wide the allowed region is. 0 disables "
@@ -296,7 +281,7 @@ def parse_args() -> argparse.Namespace:
                    help="Skip scoring (no test_score column). Use when the reward fn is unavailable.")
     p.add_argument("--traj-filter", action="store_true",
                    help="Also screen each response's FORMAT, using the trainer's own rule "
-                        "(verl/custom/new_ray_trainer.py:_trajectory_filter_reject). math-verify "
+                        "(verl/PICO/new_ray_trainer.py:trajectory_filter_reject). math-verify "
                         "only checks the answer, so a response that reaches the right number "
                         "while degenerating into repeated noise otherwise scores as correct. A "
                         "rejected response scores 0, and test_score gains raw_* (the answer-only "
@@ -351,24 +336,16 @@ def main() -> int:
         if args.fuse_weight != 0.5:
             print(f"[warn] --fuse agree ignores --fuse-weight {args.fuse_weight}: it constrains "
                   f"and selects rather than blending", file=sys.stderr)
-        # A probability floor caps Z_t from above, so it and the Z_t target would fight and
-        # the target would be silently unreachable. The dynamic path drops the floor
-        # (_teacher_set_for_z does not read it), so say so rather than let a swept value
-        # look as if it did something.
-        if args.agree_dynamic_top_k and args.agree_teacher_min_prob > 0:
-            print(f"[warn] --agree-dynamic-top-k ignores --agree-teacher-min-prob "
-                  f"{args.agree_teacher_min_prob}: a floor caps Z_t from above, so it would "
-                  f"fight the --agree-target-z {args.agree_target_z} target", file=sys.stderr)
         if args.agree_dynamic_top_k and not 0.0 < args.agree_target_z <= 1.0:
             print(f"[fatal] --agree-target-z must be in (0, 1], got {args.agree_target_z}",
                   file=sys.stderr)
             return 2
         if args.agree_dynamic_top_k and args.agree_dynamic_max_top_k < args.agree_teacher_top_k:
-            # The core clamps these into order, so this would run -- just not at the width the
-            # flags asked for. Fail instead of deciding which one the user meant.
+            # The widening runs from --agree-teacher-top-k up to the cap, so a cap below the
+            # start leaves nothing to widen. Fail instead of deciding which one the user meant.
             print(f"[fatal] --agree-dynamic-max-top-k {args.agree_dynamic_max_top_k} is below "
-                  f"--agree-teacher-top-k {args.agree_teacher_top_k}, which is the MINIMUM "
-                  f"width under --agree-dynamic-top-k", file=sys.stderr)
+                  f"--agree-teacher-top-k {args.agree_teacher_top_k}, the width the widening "
+                  f"starts from under --agree-dynamic-top-k", file=sys.stderr)
             return 2
         for name, value in (("--agree-teacher-min-prob", args.agree_teacher_min_prob),
                             ("--agree-student-min-prob", args.agree_student_min_prob)):
@@ -571,7 +548,7 @@ def main() -> int:
             batch_b = render(tok_b, chats_b[begin:stop], args.prompt_length)
             # log_z is the per-token log Z_t. Offline evaluation has no use for it -- it
             # exists for the training path, where it weights the off-policy loss
-            # (verl/custom/joint_sr.py). Discarded here rather than written out: a
+            # (verl/PICO/joint_sr.py). Discarded here rather than written out: a
             # [rows, 14336] float column would dominate the parquet, and nothing downstream
             # of a sweep reads it. The row-mean Z_t is still reported as teacher_keep_ratio,
             # and z_tok -- the per-token Z_t -- is reduced to a low-tail mean per row below.
@@ -659,24 +636,29 @@ def main() -> int:
         # response: it lets the student reach further down its own ranking for a token
         # the teacher already permits, without widening what the teacher permits.
         rate = fallback_tokens / decided_tokens
-        # The knobs in force differ by mode: under the dynamic path the teacher's k is
-        # per-token and its floor is ignored, so printing the fixed-width settings would
-        # name values that had no effect.
+        # Under the dynamic path the teacher's floor still applies to the fixed set, and the
+        # width then widens per token up to the cap.
+        teacher_desc = (f"teacher_top_k={args.agree_teacher_top_k}, "
+                        f"teacher_min_prob={args.agree_teacher_min_prob}")
         if args.agree_dynamic_top_k:
-            teacher_desc = (f"teacher_top_k=dyn[{args.agree_teacher_top_k}, "
-                            f"{args.agree_dynamic_max_top_k}]@z{args.agree_target_z}")
-        else:
-            teacher_desc = (f"teacher_top_k={args.agree_teacher_top_k}, "
-                            f"teacher_min_prob={args.agree_teacher_min_prob}")
+            teacher_desc += (f", widened to <={args.agree_dynamic_max_top_k} where "
+                             f"Z_t<{args.agree_target_z}")
         print(f"[rank {rank}] fallback to {args.agree_fallback} on "
               f"{fallback_tokens:,}/{decided_tokens:,} tokens = {rate:.1%} "
               f"(student_top_k={args.agree_student_top_k}, "
               f"{teacher_desc}, "
               f"student_min_prob={args.agree_student_min_prob})", flush=True)
+        # Under the dynamic path the fallbacks include tokens the cap could not bring up to
+        # the target, so a high rate here says the cap is too low for the target.
+        if args.agree_dynamic_top_k and rate > 0.2:
+            print(f"[warn] {rate:.1%} of tokens fell back: --agree-dynamic-max-top-k "
+                  f"{args.agree_dynamic_max_top_k} is often not enough to reach "
+                  f"--agree-target-z {args.agree_target_z}", file=sys.stderr, flush=True)
         # Z_t averaged over emitted tokens: the share of the student's probability mass
         # the teacher left standing. Near 1.0 the constraint is nominal; near 0 the
         # student is being pushed onto tokens it thought unlikely, which is what
-        # student_prob then pays for.
+        # student_prob then pays for. Fallback tokens count as 0, so under the dynamic path
+        # this sits below the target whenever anything fell back.
         finite_z = [v for row in mean_z for v in row if not math.isnan(v)]
         if finite_z:
             mean_keep = sum(finite_z) / len(finite_z)
@@ -690,13 +672,6 @@ def main() -> int:
                 print(f"[rank {rank}] teacher_keep_ratio_low (mean Z_t over each row's "
                       f"worst {pct}% of tokens) = "
                       f"{sum(finite_low) / len(finite_low):.4f}", flush=True)
-            # Under the dynamic path this is the realised value of what was asked for, so
-            # a shortfall is actionable: the only way the target is missed is the cap.
-            if args.agree_dynamic_top_k and mean_keep < args.agree_target_z - 0.02:
-                print(f"[warn] realised Z_t {mean_keep:.4f} is below the "
-                      f"--agree-target-z {args.agree_target_z}: "
-                      f"--agree-dynamic-max-top-k {args.agree_dynamic_max_top_k} is binding",
-                      file=sys.stderr, flush=True)
 
     shard["responses"] = texts
     shard["fallback_frac"] = fb_frac
@@ -706,10 +681,9 @@ def main() -> int:
     shard["response_lengths"] = tok_lens
 
     if not args.no_score:
-        # Same entry point main_generation.py:216 uses, so scores are comparable
-        # with everything else in the repo rather than a second opinion. sys.path
-        # already reaches Myverl -- the module-level insert for the decode core did it.
-        from verl.custom.math_verify_reward import math_select_rm_score_fn
+        # The training reward's own scorer, so scores are comparable with the training run
+        # rather than a second opinion.
+        from verl.PICO.math_reward_manager import math_select_rm_score_fn
 
         tf_cfg = None
         if args.traj_filter:
@@ -717,7 +691,7 @@ def main() -> int:
             # word lists are this script's own and do not reach training. Only keys the user
             # actually set are put in the dict -- the filter reads cfg.get(key, default), so
             # an unset key falls through to its default instead of pinning a copy of it.
-            from verl.custom.new_ray_trainer import _trajectory_filter_reject
+            from verl.PICO.new_ray_trainer import trajectory_filter_reject
 
             tf_cfg = {}
             if args.traj_keywords is not None:
@@ -747,7 +721,7 @@ def main() -> int:
             # column mixing bool and int and Arrow rejects that at to_parquet time.
             raw, filtered, rejected = [], [], []
             for resp, score in zip(row["responses"], per_response):
-                reject, reason = _trajectory_filter_reject(resp, tf_cfg)
+                reject, reason = trajectory_filter_reject(resp, tf_cfg)
                 rejected.append(bool(reject))
                 try:
                     fval = float(score)

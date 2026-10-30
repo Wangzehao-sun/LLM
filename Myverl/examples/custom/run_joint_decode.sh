@@ -16,7 +16,7 @@ export TOKENIZERS_PARALLELISM=true
 # ---------------------------------------------------------------------------
 # Sweep two-model joint decoding on a fixed eval set.
 #
-# Data/joint_decode.py combines two models' predictions at every step, which
+# verl/PICO/joint_decode.py combines two models' predictions at every step, which
 # verl's rollout cannot do: vLLM is entered once per request
 # (vllm_rollout_spmd.py:304) so there is no per-token hook, and the pinned
 # vllm<=0.8.5 runs the V1 engine, which dropped per-request logits_processors.
@@ -51,7 +51,7 @@ export TOKENIZERS_PARALLELISM=true
 # preferences, so it prices what the constraint cost.
 #
 # Parallelism: torchrun starts one process per GPU and each decodes its own stride
-# of the rows (Data/joint_decode.py shards with iloc[rank::world_size]). The ranks
+# of the rows (verl/PICO/joint_decode.py shards with iloc[rank::world_size]). The ranks
 # never talk, so this is pure data parallelism with no process group.
 #
 # Expect it to be MUCH slower than the vLLM path -- no paged attention, no CUDA
@@ -210,7 +210,7 @@ TRAJ_INSTR_PHRASES=${TRAJ_INSTR_PHRASES-"your task is,output only,do not mention
 
 
 WORKER_DIR="/apdcephfs_qy3/share_301372554/share_info/zenohaowang"
-CODE_DIR=${CODE_DIR:-$WORKER_DIR/LLM/}
+CODE_DIR=${CODE_DIR:-$WORKER_DIR/LLM/Myverl}
 LOG_ROOT=${LOG_ROOT:-$WORKER_DIR/LLM/logs/joint_decoding}
 EXP_NAME=${EXP_NAME:-joint_$(date +%m%d_%H%M)}
 
@@ -351,7 +351,7 @@ for value in "${SWEEP_LIST[@]}"; do
     # block below globs the directory, so no merge step is needed -- same as
     # main_generation writing one parquet per batch.
     torchrun --standalone --nnodes=1 --nproc_per_node="$GPU_NUM" \
-        Data/joint_decode.py \
+        -m verl.PICO.joint_decode \
         --model-a "$MODEL_A" \
         --model-b "$MODEL_B" \
         --input "$EVAL_PATH" \
